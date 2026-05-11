@@ -47,7 +47,7 @@ class IngestStatsResponse(BaseModel):
 
 
 @router.post("/move-and-process", response_model=IngestResponse)
-async def move_and_process(
+def move_and_process(
     body: IngestRequest,
     session: Session = Depends(get_session),
 ) -> IngestResponse:

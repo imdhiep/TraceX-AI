@@ -400,8 +400,19 @@ def _default_attributes() -> dict[str, Any]:
 
 
 _VLM_PROMPT = """You are analyzing a person crop from a surveillance camera.
-Describe this person's visible appearance accurately.
-Do NOT choose from a fixed label list — use free text for clothing descriptions.
+Describe this person's visible appearance accurately using ALL visible cues.
+
+GENDER INFERENCE RULES (important):
+- Infer gender from ANY combination of: clothing style (dress/skirt → woman), hair length, body silhouette, accessories, overall appearance
+- Use "man" or "woman" whenever you can make a reasonable inference — do NOT default to "unknown" if there are visible cues
+- Only use "unknown" if the person is completely obscured, facing away with no distinguishing features, or truly ambiguous
+- A person in a dress/skirt: "woman". A person in a suit/tie: likely "man". Long hair + feminine clothing: "woman". Etc.
+
+AGE INFERENCE RULES:
+- Estimate from body size, posture, hair color, clothing style
+- Use "young_adult" (18-35), "middle_aged" (35-55), "elderly" (55+), "teenager" (13-17), "child" (<13)
+- Prefer a guess with lower confidence over "unknown"
+
 Return ONLY a valid JSON object with these exact fields:
 
 {
@@ -434,7 +445,7 @@ Return ONLY a valid JSON object with these exact fields:
   "hair_style": "short or long or ponytail or tied or bald or unknown",
   "hair_color": "color or unknown",
   "hair_conf": 0.0,
-  "appearance_summary": "one concise sentence"
+  "appearance_summary": "one concise sentence describing the person"
 }
 
 IMPORTANT INSTRUCTIONS:
@@ -446,7 +457,11 @@ IMPORTANT INSTRUCTIONS:
 
 _VLM_BATCH_PROMPT_TEMPLATE = """You are analyzing {n} person crops from surveillance cameras.
 The images above show persons labeled (1) to ({n}) in order.
-Describe each person's visible appearance accurately. Use free text for clothing descriptions.
+Describe each person's visible appearance using ALL visible cues. Use free text for clothing descriptions.
+
+GENDER: infer from clothing style (dress/skirt→woman), hair, body silhouette — do NOT default to "unknown" if cues are visible.
+AGE: estimate from body, posture, hair — prefer a guess with low confidence over "unknown".
+
 Return ONLY a valid JSON array with exactly {n} objects in order (index 0 = person 1).
 Each object must have the same fields as below:
 
@@ -480,7 +495,7 @@ Each object must have the same fields as below:
   "hair_style": "short or long or ponytail or tied or bald or unknown",
   "hair_color": "color or unknown",
   "hair_conf": 0.0,
-  "appearance_summary": "one concise sentence"
+  "appearance_summary": "one concise sentence describing the person"
 }}
 
 IMPORTANT:
@@ -666,7 +681,14 @@ def _caption_crop_vlm(crop: "Image.Image") -> dict:
         return _default_attributes()
 
 
-def _caption_crops_vlm_batch(crops: list, batch_size: int = VLM_BATCH_SIZE) -> list:
+def _vlm_progress_bar(done: int, total: int, width: int = 25) -> str:
+    filled = int(width * done / total) if total else 0
+    bar = "█" * filled + "░" * (width - filled)
+    pct = int(100 * done / total) if total else 0
+    return f"[{bar}] {done}/{total} ({pct}%)"
+
+
+def _caption_crops_vlm_batch(crops: list, batch_size: int = VLM_BATCH_SIZE, tag: str = "") -> list:
     """Batch Qwen2-VL captioning — sends up to batch_size crops per call (~3-4x faster).
 
     Retries failed batches with smaller sub-batches before falling back to singles.
@@ -679,13 +701,22 @@ def _caption_crops_vlm_batch(crops: list, batch_size: int = VLM_BATCH_SIZE) -> l
     batch_size = max(1, batch_size)
     device = _get_device()
     results: list = []
+    total = len(crops)
+    log_every = max(1, total // 20)  # log every ~5%
+    _vlm_t0 = time.perf_counter()
 
-    for i in range(0, len(crops), batch_size):
+    for i in range(0, total, batch_size):
         batch = crops[i:i + batch_size]
         n = len(batch)
 
         if n == 1:
             results.append(_caption_crop_vlm(batch[0]))
+            done = len(results)
+            if done == 1 or done % log_every == 0 or done == total:
+                elapsed = time.perf_counter() - _vlm_t0
+                eta = (elapsed / done * (total - done)) if done else 0
+                logger.info("[vlm] %s %s  %.0fs elapsed  ETA %.0fs",
+                            tag, _vlm_progress_bar(done, total), elapsed, eta)
             continue
 
         try:
@@ -727,7 +758,7 @@ def _caption_crops_vlm_batch(crops: list, batch_size: int = VLM_BATCH_SIZE) -> l
                     exc,
                     next_batch_size,
                 )
-                results.extend(_caption_crops_vlm_batch(batch, batch_size=next_batch_size))
+                results.extend(_caption_crops_vlm_batch(batch, batch_size=next_batch_size, tag=tag))
                 continue
 
             logger.warning("[vlm] batch(%d) failed: %s — falling back to single crops", n, exc)
@@ -1094,6 +1125,7 @@ def _batch_caption_and_classify(
         except Exception as exc:
             logger.warning("[pipeline] SigLIP image encoding failed: %s", exc)
             img_feats = None
+    logger.info("[pipeline] %s: SigLIP done in %.1fs", video_id, time.perf_counter() - _t0)
 
     # ── Qwen2-VL-7B-Instruct: open-vocabulary attribute captioning ────────────
     logger.info(

@@ -695,7 +695,7 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                 description = f"[{tracklet_count} tracklets] {description}".strip()
             results.append({
                 "id": candidate_id,
-                "thumbnail_url": f"/candidates/{candidate_id}/preview",
+                "thumbnail_url": f"/candidates/{rep.tracklet_id}/preview",
                 "description": description,
                 "_raw": {
                     "candidate_id": candidate_id,

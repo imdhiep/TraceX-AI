@@ -10,8 +10,23 @@ Trace building is forwarded to trace-service.
 
 import logging
 import os
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+# ── Timestamp logging ──────────────────────────────────────────────────────────
+# uvicorn's dictConfig only configures uvicorn.* loggers, leaving root with no
+# handlers. Add one here (at import time, after uvicorn dictConfig) so all app
+# loggers get timestamps.
+_ts_fmt = logging.Formatter(
+    fmt="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+_ts_handler = logging.StreamHandler(sys.stdout)
+_ts_handler.setFormatter(_ts_fmt)
+logging.root.addHandler(_ts_handler)
+logging.root.setLevel(logging.INFO)
+# ──────────────────────────────────────────────────────────────────────────────
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+
     # Import here to avoid circular imports
     from .database import Base, SessionLocal, engine
     from .services.model_warmup import warmup_models

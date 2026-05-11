@@ -558,8 +558,8 @@ class TrackletFragmentMerger:
     def __init__(
         self,
         similarity_threshold: float = 0.85,
-        max_gap_seconds: float = 30.0,
-        max_gap_frames: int = 120,
+        max_gap_seconds: float = 480.0,
+        max_gap_frames: int = 1920,
     ):
         self.sim_thresh     = similarity_threshold
         self.max_gap_s      = max_gap_seconds

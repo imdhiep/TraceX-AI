@@ -322,6 +322,11 @@ def _save_tracklets_from_gpu_result(
         def _opt_float(val) -> float | None:
             return float(val) if val is not None else None
 
+        def _s(val, max_len: int, fallback: str = "unknown") -> str:
+            """str-coerce, fallback on empty, hard-truncate to column max_len."""
+            v = str(val).strip() if val is not None else ""
+            return (v or fallback)[:max_len]
+
         tracklet = Tracklet(
             tracklet_id=tracklet_id,
             video_id=video_id,
@@ -352,11 +357,11 @@ def _save_tracklets_from_gpu_result(
             shoes_desc=t.get("shoes_desc"),
             shoes_type=t.get("shoes_type"),
             bag_desc=t.get("bag_desc"),
-            bag_presence=t.get("bag_presence"),
+            bag_presence=_s(t.get("bag_presence"), 16, "unknown") if t.get("bag_presence") else None,
             bag_conf=_opt_float(t.get("bag_conf")),
             hat_desc=t.get("hat_desc"),
-            hat_presence=t.get("hat_presence"),
-            hat_type=t.get("hat_type"),
+            hat_presence=_s(t.get("hat_presence"), 16, "unknown") if t.get("hat_presence") else None,
+            hat_type=_s(t.get("hat_type"), 128) if t.get("hat_type") else None,
             hat_conf=_opt_float(t.get("hat_conf")),
             crop_url=str(t.get("crop_url") or ""),
             representative_bbox=t.get("representative_bbox") or [],

@@ -87,15 +87,7 @@ function resolveMediaUrl(url: string, apiBaseUrl: string): string {
     return raw;
   }
   if (raw.startsWith("/")) {
-    let resolved = `${apiBaseUrl}${raw}`;
-    if (typeof window !== "undefined" && raw.includes("/api/v1/candidates/") && raw.endsWith("/preview")) {
-      const token = loadAccessToken();
-      if (token) {
-        const separator = resolved.includes("?") ? "&" : "?";
-        resolved = `${resolved}${separator}access_token=${encodeURIComponent(token)}`;
-      }
-    }
-    return resolved;
+    return `${apiBaseUrl}${raw}`;
   }
   return `${apiBaseUrl}/${raw}`;
 }

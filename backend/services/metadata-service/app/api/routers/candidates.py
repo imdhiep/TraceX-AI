@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import os
 
+import httpx
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 from PIL import Image, ImageDraw, ImageFont
@@ -82,6 +84,20 @@ def candidate_preview(candidate_id: str) -> Response:
                     media_type="image/jpeg",
                     headers={"Cache-Control": "public, max-age=86400"},
                 )
+            # Local file missing — proxy to LightningAI metadata-service if configured
+            lightning_base = os.getenv("LIGHTNING_METADATA_URL", "").rstrip("/")
+            if lightning_base:
+                try:
+                    upstream = f"{lightning_base}/api/v1/candidates/{candidate_id}/preview"
+                    r = httpx.get(upstream, timeout=10.0, follow_redirects=True)
+                    if r.status_code == 200:
+                        return Response(
+                            content=r.content,
+                            media_type=r.headers.get("content-type", "image/jpeg"),
+                            headers={"Cache-Control": "public, max-age=86400"},
+                        )
+                except Exception:
+                    pass
     except Exception:
         pass
     finally:
