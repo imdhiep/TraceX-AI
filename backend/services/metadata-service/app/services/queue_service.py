@@ -519,11 +519,9 @@ def _tracklet_to_candidate_payload(tracklet) -> dict:
         "video_id": tracklet.video_id,
         "track_id": tracklet.track_id,
         "gender": tracklet.gender,
-        "top_color": tracklet.top_color,
-        "bottom_color": tracklet.bottom_color,
+        "top_color": tracklet.upper_clothing_color or "unknown",
+        "bottom_color": tracklet.lower_clothing_color or "unknown",
         "appearance_summary": tracklet.appearance_summary,
-        "bev_x": tracklet.bev_x,
-        "bev_y": tracklet.bev_y,
         "quality_score": tracklet.quality_score,
         "occlusion_score": tracklet.occlusion_score,
         "start_time": tracklet.start_time,
@@ -686,7 +684,7 @@ def _upsert_person_candidates(session: Session, people: list[dict], metadata_pat
       - candidate_id     -> tracklet_id
       - camera_id        -> camera_id
       - video_id        -> video_id
-      - raw_metadata     -> TrackletEmbedding row (if has embedding_vector)
+      - raw_metadata     -> TrackletEmbedding row (if has siglip_embedding)
     """
     from shared.models import Tracklet, TrackletEmbedding
     imported_count = 0
@@ -702,8 +700,8 @@ def _upsert_person_candidates(session: Session, people: list[dict], metadata_pat
         camera_id = str(person.get("camera_id") or "")
         video_id = str(person.get("video_id") or "")
         gender = str(person.get("gender") or "unknown")
-        top_color = str(person.get("top_color") or "unknown")
-        bottom_color = str(person.get("bottom_color") or "unknown")
+        upper_color = str(person.get("top_color") or "unknown")
+        lower_color = str(person.get("bottom_color") or "unknown")
         appearance_summary = str(person.get("appearance_summary") or "")
         raw = person.get("raw_metadata") or {}
 
@@ -711,8 +709,8 @@ def _upsert_person_candidates(session: Session, people: list[dict], metadata_pat
         if existing:
             existing.camera_id = camera_id
             existing.gender = gender
-            existing.top_color = top_color
-            existing.bottom_color = bottom_color
+            existing.upper_clothing_color = upper_color
+            existing.lower_clothing_color = lower_color
             existing.appearance_summary = appearance_summary
             updated_count += 1
         else:
@@ -727,12 +725,10 @@ def _upsert_person_candidates(session: Session, people: list[dict], metadata_pat
                 occlusion_score=float(raw.get("occlusion_score") or 0.0),
                 gender=gender,
                 age_range="unknown",
-                top_color=top_color,
-                bottom_color=bottom_color,
+                upper_clothing_color=upper_color,
+                lower_clothing_color=lower_color,
                 shoes_color="unknown",
                 appearance_summary=appearance_summary,
-                bev_x=float(raw.get("bev_x") or 0.0),
-                bev_y=float(raw.get("bev_y") or 0.0),
                 representative_bbox=raw.get("representative_bbox") or [],
                 contributing_cameras=raw.get("contributing_cameras") or [],
                 contributing_video_ids=raw.get("contributing_video_ids") or [],
@@ -741,17 +737,18 @@ def _upsert_person_candidates(session: Session, people: list[dict], metadata_pat
             session.add(row)
             imported_count += 1
 
-        # Also upsert embedding if present
-        embedding_vec = raw.get("embedding_vector") or raw.get("appearance_embedding_vector") or []
-        if embedding_vec and len(embedding_vec) > 0:
+        # Also upsert SigLIP2 embedding if present
+        siglip_vec = raw.get("siglip_embedding") or []
+        if siglip_vec and len(siglip_vec) > 0:
             emb_existing = session.scalar(select(TrackletEmbedding).where(TrackletEmbedding.tracklet_id == tracklet_id))
             if emb_existing:
-                emb_existing.embedding_vector = embedding_vec
+                emb_existing.siglip_embedding = siglip_vec
+                emb_existing.model_version = "siglip2"
             else:
                 session.add(TrackletEmbedding(
                     tracklet_id=tracklet_id,
-                    embedding_vector=embedding_vec,
-                    model_version="dinov2_vitl14+siglip2",
+                    siglip_embedding=siglip_vec,
+                    model_version="siglip2",
                 ))
 
     session.flush()

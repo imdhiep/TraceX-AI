@@ -5,9 +5,9 @@ Re-ranks using:
   - Cosine similarity of EVA-02 embeddings (1024-dim)
   - SigLIP 2 attribute match score
   - Text semantic overlap
-  - Spatiotemporal confidence (BEV position + detection score)
+  - Detection quality / coverage score
 
-Schema v3.3: embedding VECTOR(1024), pos_3d via bev_x/bev_y fields.
+Schema v3.3: image/text search relies on embeddings plus descriptive metadata.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ router = APIRouter(tags=["candidates"])
 _W_VECTOR = 0.50      # EVA-02 cosine similarity
 _W_ATTRIBUTE = 0.20   # SigLIP 2 attribute match
 _W_TEXT = 0.20        # Text token overlap
-_W_QUALITY = 0.10     # Detection confidence + BEV coverage
+_W_QUALITY = 0.10     # Detection confidence + frame coverage
 
 # Fusion weights — with camera reference (sum = 1.0)
 _W_VECTOR_CAM = 0.45
@@ -191,19 +191,14 @@ def _text_score(query_text: str, candidate: dict) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Quality score (detection confidence + BEV coverage)
+# Quality score (detection confidence + frame coverage)
 # ---------------------------------------------------------------------------
 
 def _quality_score(candidate: dict) -> float:
     vis = candidate.get("visibility_scores") or {}
     conf = float(vis.get("detection_confidence", candidate.get("score", 0.0)) or 0.0)
     coverage = float(vis.get("frame_coverage", 0.0) or 0.0)
-    # Penalize candidates with no BEV position
-    # Use 1.0 meter threshold (was 0.01 — too strict for small coordinates)
-    bev_x = float(candidate.get("bev_x", 0.0) or 0.0)
-    bev_y = float(candidate.get("bev_y", 0.0) or 0.0)
-    has_bev = 1.0 if (abs(bev_x) > 1.0 or abs(bev_y) > 1.0) else 0.0
-    return conf * 0.5 + coverage * 0.3 + has_bev * 0.2
+    return conf * 0.7 + coverage * 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +244,7 @@ def candidates_search(
         # 3. Text semantic overlap
         text_sim = _text_score(query_text, candidate) if query_text else 0.0
 
-        # 4. Detection quality + BEV coverage
+        # 4. Detection quality + coverage
         quality = _quality_score(candidate)
 
         fusion = (

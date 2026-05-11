@@ -181,7 +181,6 @@ def _send_batch_to_metadata(batch: TimestampBatch, timeout: int = 600) -> dict:
                 "video_path": v.video_path,
                 "source_filename": v.source_filename,
                 "sample_interval": 15,
-                "bev_max_dist": 1.5,
             }
             for v in batch.videos
         ],
@@ -245,11 +244,17 @@ def _save_candidates_from_batch(
         contributing_vids = tracklet.get("contributing_video_ids", [])
         summary = str(tracklet.get("appearance_summary") or "")
         gender = str(tracklet.get("gender") or "unknown")
-        top_color = str(tracklet.get("top_color") or "unknown")
-        bottom_color = str(tracklet.get("bottom_color") or "unknown")
+        upper_color = str(
+            tracklet.get("upper_clothing_color")
+            or tracklet.get("top_color")
+            or "unknown"
+        )
+        lower_color = str(
+            tracklet.get("lower_clothing_color")
+            or tracklet.get("bottom_color")
+            or "unknown"
+        )
         shoes_color = str(tracklet.get("shoes_color") or "unknown")
-        bev_x = float(tracklet.get("bev_x") or 0.0)
-        bev_y = float(tracklet.get("bev_y") or 0.0)
         quality_score = float(tracklet.get("quality_score") or 0.0)
         occlusion_score = float(tracklet.get("occlusion_score") or 0.0)
         start_time = float(tracklet.get("start_time") or 0.0)
@@ -264,11 +269,9 @@ def _save_candidates_from_batch(
             existing.camera_id = primary_cam
             existing.quality_score = quality_score
             existing.gender = gender
-            existing.top_color = top_color
-            existing.bottom_color = bottom_color
+            existing.upper_clothing_color = upper_color
+            existing.lower_clothing_color = lower_color
             existing.shoes_color = shoes_color
-            existing.bev_x = bev_x
-            existing.bev_y = bev_y
             existing.appearance_summary = summary
             existing.contributing_cameras = contributing_cams
             existing.contributing_video_ids = contributing_vids
@@ -285,12 +288,10 @@ def _save_candidates_from_batch(
                 occlusion_score=occlusion_score,
                 gender=gender,
                 age_range="unknown",
-                top_color=top_color,
-                bottom_color=bottom_color,
+                upper_clothing_color=upper_color,
+                lower_clothing_color=lower_color,
                 shoes_color=shoes_color,
                 appearance_summary=summary,
-                bev_x=bev_x,
-                bev_y=bev_y,
                 representative_bbox=rep_bbox,
                 contributing_cameras=contributing_cams,
                 contributing_video_ids=contributing_vids,
@@ -299,19 +300,20 @@ def _save_candidates_from_batch(
             session.add(row)
             imported += 1
 
-        # Upsert TrackletEmbedding (DINOv2 1024-dim)
-        embedding_vec = tracklet.get("embedding_vector") or []
-        if embedding_vec and len(embedding_vec) > 0:
+        # Upsert TrackletEmbedding (SigLIP2 1152-dim)
+        siglip_vec = tracklet.get("siglip_embedding") or []
+        if siglip_vec and len(siglip_vec) > 0:
             emb_existing = session.scalar(
                 select(TrackletEmbedding).where(TrackletEmbedding.tracklet_id == tracklet_id)
             )
             if emb_existing:
-                emb_existing.embedding_vector = embedding_vec
+                emb_existing.siglip_embedding = siglip_vec
+                emb_existing.model_version = "siglip2"
             else:
                 emb_row = TrackletEmbedding(
                     tracklet_id=tracklet_id,
-                    embedding_vector=embedding_vec,
-                    model_version="dinov2_vitl14+siglip2",
+                    siglip_embedding=siglip_vec,
+                    model_version="siglip2",
                 )
                 session.add(emb_row)
 

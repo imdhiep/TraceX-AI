@@ -29,13 +29,11 @@ def process_video(req: dict[str, Any]) -> dict[str, Any]:
 
     The metadata-service handles:
       - Grounding DINO 1.6 person detection
-      - BEV projection
-      - MCBLT Hungarian association
       - EVA-02 appearance embeddings
       - SigLIP 2 attribute tagging
       - VideoMAE V2 action classification
 
-    Returns tracklets with: embedding_vector, bev_x, bev_y, attributes, action.
+    Returns per-video tracklets with appearance metadata, SigLIP embeddings, and action labels.
     """
     url = f"{_METADATA_SERVICE_URL.rstrip('/')}/api/v1/video/process"
     try:
