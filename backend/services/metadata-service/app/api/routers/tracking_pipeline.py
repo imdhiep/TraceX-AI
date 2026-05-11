@@ -4,7 +4,7 @@ Tracking pipeline: BodyPartAdaptiveTracker + post-hoc TrackletFragmentMerger.
 BodyPartAdaptiveTracker uses head-dominant or foot-dominant cost depending on
 whether the head region is estimated to be visible in each detection bbox.
 TrackletFragmentMerger re-joins fragments of the same person after feature
-extraction using SigLIP2 / DINOv2 cosine similarity.
+extraction using SigLIP2 cosine similarity.
 """
 from __future__ import annotations
 
@@ -542,7 +542,7 @@ def _cosine_sim_matrix(embeddings: list[list[float]]) -> np.ndarray:
 
 class TrackletFragmentMerger:
     """
-    Post-hoc fragment merging using SigLIP2 or DINOv2 cosine similarity.
+    Post-hoc fragment merging using SigLIP2 cosine similarity.
 
     Fragments of the same person caused by occlusion are re-joined when:
       1. They are temporally ordered (tj starts after ti ends, overlap ≤ 1 s).

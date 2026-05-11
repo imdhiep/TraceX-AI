@@ -113,20 +113,20 @@ class TraceService:
 
             # Soft metadata filter — loại người rõ ràng khác identity
             # Tracklets có metadata "unknown"/None sẽ pass qua (không bị loại sai)
-            _gender = candidate.gender
-            _top    = candidate.top_color
-            _bottom = candidate.bottom_color
+            _gender  = candidate.gender
+            _top     = candidate.upper_clothing_color
+            _bottom  = candidate.lower_clothing_color
             _UNKNOWN = {"unknown", "", None}
 
             def _meta_ok(t: Tracklet) -> bool:
                 if _gender not in _UNKNOWN and t.gender not in _UNKNOWN:
                     if t.gender != _gender:
                         return False
-                if _top not in _UNKNOWN and t.top_color not in _UNKNOWN:
-                    if t.top_color != _top:
+                if _top not in _UNKNOWN and t.upper_clothing_color not in _UNKNOWN:
+                    if t.upper_clothing_color != _top:
                         return False
-                if _bottom not in _UNKNOWN and t.bottom_color not in _UNKNOWN:
-                    if t.bottom_color != _bottom:
+                if _bottom not in _UNKNOWN and t.lower_clothing_color not in _UNKNOWN:
+                    if t.lower_clothing_color != _bottom:
                         return False
                 return True
 
@@ -134,7 +134,7 @@ class TraceService:
             tracklets = [t for t in tracklets if _meta_ok(t)]
             logger.warning(
                 "Trace fallback (no QCT rows): %d → %d tracklets after metadata filter "
-                "(gender=%s top=%s bottom=%s)",
+                "(gender=%s upper=%s lower=%s)",
                 before, len(tracklets), _gender, _top, _bottom,
             )
 

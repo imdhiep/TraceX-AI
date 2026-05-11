@@ -1,31 +1,3 @@
-"""SQLAlchemy models — TraceX-AI v3.3 aligned with Section 20 spec.
-
-Tables (17):
-  1.  users
-  2.  cameras
-  3.  camera_zones
-  4.  camera_edges
-  5.  camera_settings
-  6.  videos
-  7.  tracklets
-  8.  tracklets_embeddings
-  9.  tracklets_actions
-  10. query_history
-  11. query_candidates
-  12. query_candidate_tracklets
-  13. query_jobs
-  14. spatiotemporal_groups
-  15. evidence_videos
-  16. evidence_tracklets
-  17. verified_objects
-  18. verified_objects_tracklets
-
-Plus internal (non-spec) staging table:
-  - queue_video_assets (VinUni Storage ingest queue)
-
-Naming follows spec exactly (Section 20.11).
-"""
-
 from __future__ import annotations
 
 import uuid
@@ -55,7 +27,6 @@ except ImportError:
 
 
 class Base(DeclarativeBase):
-    """Base class for all models."""
     pass
 
 
@@ -64,7 +35,6 @@ class Base(DeclarativeBase):
 # ============================================================================
 
 class User(Base):
-    """User model — staff members within the organization (Section 20.2, row 1)."""
     __tablename__ = "users"
     __table_args__ = (
         UniqueConstraint("email", name="uq_users_email"),
@@ -100,7 +70,6 @@ class User(Base):
 # ============================================================================
 
 class Camera(Base):
-    """Camera — global camera registry (Section 20.2, row 2)."""
     __tablename__ = "cameras"
     __table_args__ = (
         UniqueConstraint("camera_id", name="uq_cameras_camera_id"),
@@ -124,7 +93,6 @@ class Camera(Base):
 
 
 class CameraZone(Base):
-    """Camera zone — entry/exit region polygons (Section 20.2, row 2)."""
     __tablename__ = "camera_zones"
     __table_args__ = (
         UniqueConstraint("camera_id", "zone_type", name="uq_camera_zones_camera_zone"),
@@ -144,11 +112,6 @@ class CameraZone(Base):
 
 
 class CameraEdge(Base):
-    """Camera edge — temporal transition between cameras (Section 20.2, row 2).
-
-    Represents: person seen at from_camera → to_camera within [min_seconds, max_seconds].
-    Used for spatiotemporal matching in Trace (Section 20.6 Luồng 3).
-    """
     __tablename__ = "camera_edges"
     __table_args__ = (
         UniqueConstraint("from_camera_id", "to_camera_id", name="uq_camera_edges_pair"),
@@ -167,7 +130,6 @@ class CameraEdge(Base):
 
 
 class CameraSettings(Base):
-    """Per-camera settings (Section 20.2, row 2)."""
     __tablename__ = "camera_settings"
     __table_args__ = (
         UniqueConstraint("camera_id", "setting_key", name="uq_camera_settings_camera_key"),
@@ -191,7 +153,6 @@ class CameraSettings(Base):
 # ============================================================================
 
 class Video(Base):
-    """Video — uploaded video metadata (Section 20.2 row 6, Section 20.3)."""
     __tablename__ = "videos"
     __table_args__ = (
         UniqueConstraint("video_id", name="uq_videos_video_id"),
@@ -237,17 +198,11 @@ class Video(Base):
 
 
 class Tracklet(Base):
-    """Tracklet — one detected person in a video (Section 20.2 row 7, Section 20.4).
-
-    Each row = one person tracked across frames in a single video.
-    Extracted attributes: appearance (color, gender), quality, BEV position.
-    """
     __tablename__ = "tracklets"
     __table_args__ = (
         UniqueConstraint("tracklet_id", name="uq_tracklets_tracklet_id"),
         Index("ix_tracklets_video_id", "video_id"),
         Index("ix_tracklets_camera_id", "camera_id"),
-        Index("ix_tracklets_bev_xy", "bev_x", "bev_y"),
         Index("ix_tracklets_upper_color",  "upper_clothing_color"),
         Index("ix_tracklets_upper_type",   "upper_clothing_type"),
         Index("ix_tracklets_lower_color",  "lower_clothing_color"),
@@ -274,8 +229,6 @@ class Tracklet(Base):
 
     # Per-attribute confidence scores from Qwen2-VL-2B-Instruct (null = not yet extracted)
     gender_conf: Mapped[float | None] = mapped_column(Float, nullable=True)
-    top_color_conf: Mapped[float | None] = mapped_column(Float, nullable=True)
-    bottom_color_conf: Mapped[float | None] = mapped_column(Float, nullable=True)
     shoes_conf: Mapped[float | None] = mapped_column(Float, nullable=True)
     accessory_conf: Mapped[float | None] = mapped_column(Float, nullable=True)
     age_range_conf: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -288,8 +241,6 @@ class Tracklet(Base):
     # Appearance attributes
     gender: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
     age_range: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
-    top_color: Mapped[str] = mapped_column(String(64), nullable=False, default="unknown")
-    bottom_color: Mapped[str] = mapped_column(String(64), nullable=False, default="unknown")
     shoes_color: Mapped[str] = mapped_column(String(64), nullable=False, default="unknown")
     hat_color: Mapped[str] = mapped_column(String(64), nullable=False, default="unknown")
     bag_type: Mapped[str] = mapped_column(String(64), nullable=False, default="unknown")
@@ -320,10 +271,6 @@ class Tracklet(Base):
     hat_presence: Mapped[str | None] = mapped_column(String(16), nullable=True)
     hat_type:     Mapped[str | None] = mapped_column(String(128), nullable=True)
     hat_conf:     Mapped[float | None] = mapped_column(Float, nullable=True)
-
-    # Spatial (BEV)
-    bev_x: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    bev_y: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
 
     # Crop & bbox
     crop_url: Mapped[str] = mapped_column(String(2048), nullable=False, default="")
@@ -363,11 +310,6 @@ class Tracklet(Base):
 
 
 class TrackletEmbedding(Base):
-    """DINOv2 ViT-L/14 Re-ID embedding + SigLIP 2-So400m search embedding per tracklet.
-
-    embedding: 1024-dim (DINOv2 ViT-L/14) — cosine Re-ID similarity
-    siglip_embedding: 1152-dim (SigLIP 2-So400m image encoder) — text-image search
-    """
     __tablename__ = "tracklets_embeddings"
     __table_args__ = (
         UniqueConstraint("tracklet_id", name="uq_tracklets_embeddings_tracklet_id"),
@@ -378,14 +320,10 @@ class TrackletEmbedding(Base):
         String(255), ForeignKey("tracklets.tracklet_id", ondelete="CASCADE"),
         nullable=False, unique=True,
     )
-    embedding_vector: Mapped[list] = mapped_column(JSON, nullable=False)       # DINOv2 JSON (backward compat)
-    embedding: Mapped[list | None] = mapped_column(
-        PgVector(1024) if _PGVECTOR_AVAILABLE else JSON, nullable=True,
-    )                                                                           # DINOv2 vector(1024)
     siglip_embedding: Mapped[list | None] = mapped_column(
         PgVector(1152) if _PGVECTOR_AVAILABLE else JSON, nullable=True,
     )                                                                           # SigLIP2 vector(1152) — same space as text queries
-    model_version: Mapped[str] = mapped_column(String(128), nullable=False, default="dinov2_vitl14")
+    model_version: Mapped[str] = mapped_column(String(128), nullable=False, default="siglip2")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False,
     )
@@ -394,10 +332,6 @@ class TrackletEmbedding(Base):
 
 
 class TrackletAction(Base):
-    """VideoMAE V2 action classification per tracklet (Section 20.2 row 9).
-
-    Maps Kinetics-400 labels → TraceX simplified taxonomy.
-    """
     __tablename__ = "tracklets_actions"
     __table_args__ = (
         UniqueConstraint("tracklet_id", name="uq_tracklets_actions_tracklet_id"),
@@ -509,11 +443,6 @@ class QueryCandidate(Base):
     # Appearance summary (denormalized for fast display)
     appearance_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
     gender: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
-    top_color: Mapped[str] = mapped_column(String(64), nullable=False, default="unknown")
-    bottom_color: Mapped[str] = mapped_column(String(64), nullable=False, default="unknown")
-    # BEV position (representative)
-    bev_x: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    bev_y: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     # Primary camera (denormalized for fast filter & display)
     primary_camera_id: Mapped[str] = mapped_column(String(50), nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
@@ -803,17 +732,3 @@ class QueueVideoAsset(Base):
     )
 
 
-# =============================================================================
-# Backward-compatibility aliases — match old class names used in existing code.
-# The new spec-compliant class is the primary definition; these are thin aliases.
-# =============================================================================
-# OLD: VideoAsset → NEW: Video (same table "videos")
-VideoAsset = Video
-
-# OLD: VideoQuery → NEW: QueryHistory (renamed table "query_history")
-# NOTE: QueryHistory uses "query_id" as FK; VideoQuery used "video_id" as FK.
-# Existing code using VideoQuery.video foreign key needs migration.
-VideoQuery = QueryHistory
-
-# OLD: PersonCandidate → NEW: QueryCandidate (renamed table "query_candidates")
-PersonCandidate = QueryCandidate

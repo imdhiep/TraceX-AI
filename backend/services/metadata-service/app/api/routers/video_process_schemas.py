@@ -16,12 +16,6 @@ class ProcessVideoRequest(BaseModel):
     sample_interval: Optional[int] = Field(
         15, description="Frame interval for person detection sampling"
     )
-    bev_max_dist: Optional[float] = Field(
-        1.5, description="Maximum BEV distance (metres) for MCBLT association"
-    )
-    use_mtmc_calibration: bool = Field(
-        False, description="Use MTMC calibration file instead of deriving homography"
-    )
 
 
 class ProcessVideoStreamRequest(BaseModel):
@@ -33,7 +27,6 @@ class ProcessVideoStreamRequest(BaseModel):
     camera_id: Optional[str] = Field(None, description="Camera label, e.g. cam_01")
     source_filename: Optional[str] = Field(None, description="Original filename for suffix detection")
     sample_interval: Optional[int] = Field(15, description="Frame interval for person detection")
-    bev_max_dist: Optional[float] = Field(1.5, description="MCBLT max BEV distance in metres")
 
 
 class BatchVideoEntry(BaseModel):
@@ -43,21 +36,17 @@ class BatchVideoEntry(BaseModel):
     video_path: str = Field(..., description="Local filesystem path to the video file")
     source_filename: Optional[str] = Field(None, description="Original filename")
     sample_interval: int = Field(15, description="Frame interval for person detection")
-    bev_max_dist: float = Field(1.5, description="MCBLT max BEV distance in metres")
 
 
 class BatchProcessRequest(BaseModel):
     """
-    Batch cross-camera processing request.
+    Batch processing request.
 
     All videos in a batch share the same timestamp (e.g. 50 cameras at 11:00).
     The pipeline:
-      1. Load frames + detect persons in each video independently
-      2. Project all detections to BEV
-      3. MCBLT Hungarian cross-camera association (ONE call across all cameras)
-      4. DINOv2 Re-ID embeddings + Qwen2-VL metadata + VideoMAE V2 actions
-         per unified cross-camera tracklet (SigLIP2 image encoder for text-image search)
-      5. Return unified tracklets (global tracklet IDs across cameras)
+      1. Process each video independently with the per-video tracking pipeline
+      2. Aggregate all resulting tracklets into one batch response
+      3. Preserve per-tracklet SigLIP2 image embeddings for text-image search
 
     Usage:
       - queue_worker groups videos by timestamp, sends 1 batch per timestamp
@@ -84,15 +73,12 @@ class TrackletResult(BaseModel):
     quality_score: float = 0.0
     gender: str = "unknown"
     age_range: str = "unknown"
-    top_color: str = "unknown"
-    bottom_color: str = "unknown"
+    upper_clothing_color: str = "unknown"
+    lower_clothing_color: str = "unknown"
     shoes_color: str = "unknown"
     appearance_summary: str = ""
     crop_url: str = ""
     representative_bbox: list[int] = [0, 0, 0, 0]
-    bev_x: float = 0.0
-    bev_y: float = 0.0
-    embedding_vector: list[float] = Field(default_factory=list)
     action: str = "standing"
     action_confidence: float = 0.0
     kinetics_label: str = ""
@@ -104,8 +90,8 @@ class TrackletResult(BaseModel):
     hair_color: str = "unknown"
     # Per-attribute confidence scores [0, 1] (None = not yet extracted)
     gender_conf: Optional[float] = None
-    top_color_conf: Optional[float] = None
-    bottom_color_conf: Optional[float] = None
+    upper_clothing_conf: Optional[float] = None
+    lower_clothing_conf: Optional[float] = None
     shoes_conf: Optional[float] = None
     accessory_conf: Optional[float] = None
     age_range_conf: Optional[float] = None

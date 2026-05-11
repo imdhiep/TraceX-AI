@@ -1,5 +1,5 @@
 # Metadata Service Dockerfile — GPU (LightningAI A100 80GB)
-# SOTA 2026 AI: Grounding DINO 1.6, EVA-02 ViT-L/14, SigLIP 2, VideoMAE V2
+# Models: RT-DETR, SigLIP 2, VideoMAE V2, Qwen2-VL-7B
 
 FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
 

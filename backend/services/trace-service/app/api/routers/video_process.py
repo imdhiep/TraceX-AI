@@ -1,7 +1,7 @@
 """Video process router — redirects to metadata-service (GPU AI models).
 
 trace-service forwards /api/v1/video/process to metadata-service.
-GPU models (Grounding DINO 1.6, EVA-02, SigLIP 2, VideoMAE V2) live in metadata-service.
+GPU models (RT-DETR, SigLIP 2, VideoMAE V2, Qwen2-VL-7B) live in metadata-service.
 """
 
 from __future__ import annotations
@@ -28,14 +28,12 @@ def process_video(req: dict[str, Any]) -> dict[str, Any]:
     """Forward video processing request to metadata-service.
 
     The metadata-service handles:
-      - Grounding DINO 1.6 person detection
-      - BEV projection
-      - MCBLT Hungarian association
-      - EVA-02 appearance embeddings
-      - SigLIP 2 attribute tagging
+      - RT-DETR person detection
+      - SigLIP 2 appearance embeddings
+      - Qwen2-VL attribute captioning
       - VideoMAE V2 action classification
 
-    Returns tracklets with: embedding_vector, bev_x, bev_y, attributes, action.
+    Returns per-video tracklets with appearance metadata, SigLIP embeddings, and action labels.
     """
     url = f"{_METADATA_SERVICE_URL.rstrip('/')}/api/v1/video/process"
     try:

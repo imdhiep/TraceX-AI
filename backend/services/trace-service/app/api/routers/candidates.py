@@ -1,20 +1,19 @@
-"""Candidates GPU re-ranking — EVA-02 1024-dim + SigLIP 2 attribute fusion.
+"""Candidates GPU re-ranking — SigLIP 2 attribute fusion.
 
 Called by query-service with a pre-filtered shortlist.
 Re-ranks using:
-  - Cosine similarity of EVA-02 embeddings (1024-dim)
   - SigLIP 2 attribute match score
   - Text semantic overlap
-  - Spatiotemporal confidence (BEV position + detection score)
+  - Detection quality / coverage score
 
-Schema v3.3: embedding VECTOR(1024), pos_3d via bev_x/bev_y fields.
+Note: EVA-02 embedding_vector (DINOv2 1024-dim) was removed from the pipeline.
+SigLIP 2 image-text search uses siglip_embedding (1152-dim) stored in DB.
 """
 
 from __future__ import annotations
 
 import logging
 import math
-import re
 from typing import Any, Optional
 
 import numpy as np
@@ -23,51 +22,14 @@ from fastapi import APIRouter
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["candidates"])
 
-# Fusion weights — no camera reference (sum = 1.0)
-_W_VECTOR = 0.50      # EVA-02 cosine similarity
-_W_ATTRIBUTE = 0.20   # SigLIP 2 attribute match
-_W_TEXT = 0.20        # Text token overlap
-_W_QUALITY = 0.10     # Detection confidence + BEV coverage
-
-# Fusion weights — with camera reference (sum = 1.0)
-_W_VECTOR_CAM = 0.45
-_W_ATTRIBUTE_CAM = 0.15
-_W_TEXT_CAM = 0.15
-_W_QUALITY_CAM = 0.10
-_W_SPATIAL_CAM = 0.15  # camera proximity score
-
-_CAM_NEIGHBOR_RADIUS = 10  # person seen in cam_N can appear in cam_(N-R)…cam_(N+R)
-
-
-def _extract_cam_num(cam_id: str) -> int | None:
-    m = re.search(r'\d+', cam_id or "")
-    return int(m.group()) if m else None
-
-
-def _spatiotemporal_cam_score(
-    candidate: dict,
-    ref_nums: list[int],
-    radius: int = _CAM_NEIGHBOR_RADIUS,
-) -> float:
-    """Score 0–1 based on how close candidate's camera is to reference cameras.
-
-    - Same camera → 1.0
-    - Within radius → linear decay 1.0 → 0.5
-    - Outside radius → 0.0 (this candidate will be filtered before scoring)
-    """
-    cam_num = _extract_cam_num(candidate.get("camera_id", ""))
-    if cam_num is None:
-        return 0.5  # unknown cam ID: neutral
-    min_dist = min(abs(cam_num - r) for r in ref_nums)
-    if min_dist == 0:
-        return 1.0
-    if min_dist <= radius:
-        return 1.0 - (min_dist / radius) * 0.5  # 1.0 → 0.5
-    return 0.0
+# Fusion weights (sum = 1.0)
+_W_ATTRIBUTE = 0.50   # SigLIP 2 attribute match
+_W_TEXT = 0.30        # Text token overlap
+_W_QUALITY = 0.20    # Detection confidence + frame coverage
 
 
 # ---------------------------------------------------------------------------
-# Cosine similarity (1024-dim EVA-02 embeddings)
+# Cosine similarity helper
 # ---------------------------------------------------------------------------
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -83,7 +45,7 @@ def _cosine(a: list[float], b: list[float]) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Query embedding from text — EVA-02 text branch via SigLIP 2
+# Query embedding from text — SigLIP 2 text tower
 # ---------------------------------------------------------------------------
 
 def _build_query_embedding(query_text: str) -> list[float]:
@@ -131,8 +93,8 @@ def _build_query_embedding(query_text: str) -> list[float]:
 # ---------------------------------------------------------------------------
 
 _ATTRIBUTE_KEYWORDS: dict[str, list[str]] = {
-    "top_color": ["white", "black", "red", "blue", "green", "yellow", "gray", "brown", "pink", "orange"],
-    "bottom_color": ["black", "blue", "gray", "white", "brown", "red", "green", "khaki", "jeans", "pants"],
+    "upper_clothing_color": ["white", "black", "red", "blue", "green", "yellow", "gray", "brown", "pink", "orange"],
+    "lower_clothing_color": ["black", "blue", "gray", "white", "brown", "red", "green", "khaki", "jeans", "pants"],
     "gender": ["male", "man", "boy", "female", "woman", "girl"],
     "bag": ["backpack", "bag", "handbag", "luggage"],
     "hat": ["hat", "cap", "helmet", "hood"],
@@ -147,8 +109,8 @@ def _attribute_score(query_lower: str, candidate: dict) -> float:
     # Also check flat attribute fields (from video_process output)
     if not attrs:
         attrs = {
-            "top_color": candidate.get("top_color", ""),
-            "bottom_color": candidate.get("bottom_color", ""),
+            "upper_clothing_color": candidate.get("upper_clothing_color", ""),
+            "lower_clothing_color": candidate.get("lower_clothing_color", ""),
             "gender": candidate.get("gender", ""),
         }
 
@@ -191,19 +153,14 @@ def _text_score(query_text: str, candidate: dict) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Quality score (detection confidence + BEV coverage)
+# Quality score (detection confidence + frame coverage)
 # ---------------------------------------------------------------------------
 
 def _quality_score(candidate: dict) -> float:
     vis = candidate.get("visibility_scores") or {}
     conf = float(vis.get("detection_confidence", candidate.get("score", 0.0)) or 0.0)
     coverage = float(vis.get("frame_coverage", 0.0) or 0.0)
-    # Penalize candidates with no BEV position
-    # Use 1.0 meter threshold (was 0.01 — too strict for small coordinates)
-    bev_x = float(candidate.get("bev_x", 0.0) or 0.0)
-    bev_y = float(candidate.get("bev_y", 0.0) or 0.0)
-    has_bev = 1.0 if (abs(bev_x) > 1.0 or abs(bev_y) > 1.0) else 0.0
-    return conf * 0.5 + coverage * 0.3 + has_bev * 0.2
+    return conf * 0.7 + coverage * 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +177,7 @@ def candidates_search(
     time_to: Optional[str] = None,
 ) -> dict[str, Any]:
     """
-    GPU re-ranking using EVA-02 1024-dim embeddings + SigLIP 2 attributes.
+    GPU re-ranking using SigLIP 2 text-image search + attribute fusion.
 
     Called by query-service after local DB pre-filtering.
 
@@ -238,25 +195,18 @@ def candidates_search(
     scored: list[tuple[float, int, dict[str, Any]]] = []
 
     for idx, candidate in enumerate(candidates):
-        emb = candidate.get("embedding_vector") or []
-
-        # 1. EVA-02 cosine similarity (1024-dim)
+        emb = candidate.get("siglip_embedding") or []
         vec_sim = _cosine(query_emb, emb) if (query_emb and emb) else 0.0
 
-        # 2. SigLIP 2 attribute match
         attr_sim = _attribute_score(query_lower, candidate) if query_lower else 0.0
-
-        # 3. Text semantic overlap
         text_sim = _text_score(query_text, candidate) if query_text else 0.0
-
-        # 4. Detection quality + BEV coverage
         quality = _quality_score(candidate)
 
         fusion = (
-            _W_VECTOR * vec_sim
-            + _W_ATTRIBUTE * attr_sim
-            + _W_TEXT * text_sim
-            + _W_QUALITY * quality
+            0.50 * vec_sim
+            + 0.20 * attr_sim
+            + 0.20 * text_sim
+            + 0.10 * quality
         )
 
         scored.append((fusion, idx, candidate))
