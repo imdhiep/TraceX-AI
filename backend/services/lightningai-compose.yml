@@ -46,7 +46,7 @@ services:
 
   # ────────────────────────────────────────────────────────────────────
   # metadata-service — GPU Ingest (~50GB VRAM)
-  # Grounding DINO 1.6 + EVA-02 ViT-L/14 + SigLIP 2 + VideoMAE V2
+  # RT-DETR + SigLIP 2 + VideoMAE V2 + Qwen2-VL-7B
   # ────────────────────────────────────────────────────────────────────
   metadata-service:
     build:

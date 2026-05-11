@@ -85,7 +85,7 @@ async def full_pipeline(
     Phase 1 — Fine-tune models trên MTMC GT data:
       - Auto-detect tất cả scenes có sẵn trong /workspace/storage/dataset/MTMC_Tracking_2024/train/
       - Chạy MTMCFineTuningPipeline cho từng scene (num_samples=100 để nhanh)
-      - Cải thiện độ chính xác RT-DETR + DINOv2 cho môi trường VinUni
+      - Cải thiện độ chính xác RT-DETR + SigLIP 2 cho môi trường VinUni
 
     Phase 2 — Ingest 50 video:
       - Move Temp → Storage (Google Drive)

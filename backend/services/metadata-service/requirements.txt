@@ -18,9 +18,9 @@ google-auth==2.36.0
 opencv-python-headless==4.10.0.84
 python-dotenv==1.0.1
 
-# GPU model dependencies — SOTA 2026
-# transformers 4.41.0+ required for Grounding DINO 1.6
+# GPU model dependencies
 # PyTorch 2.3.1+ required
+# transformers 4.41.0+ required
 # Installed via Dockerfile for CUDA compatibility
 transformers>=4.41.0
 accelerate>=0.30.0

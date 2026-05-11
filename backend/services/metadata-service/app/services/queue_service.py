@@ -519,8 +519,8 @@ def _tracklet_to_candidate_payload(tracklet) -> dict:
         "video_id": tracklet.video_id,
         "track_id": tracklet.track_id,
         "gender": tracklet.gender,
-        "top_color": tracklet.upper_clothing_color or "unknown",
-        "bottom_color": tracklet.lower_clothing_color or "unknown",
+        "upper_color": tracklet.upper_clothing_color or "unknown",
+        "lower_color": tracklet.lower_clothing_color or "unknown",
         "appearance_summary": tracklet.appearance_summary,
         "quality_score": tracklet.quality_score,
         "occlusion_score": tracklet.occlusion_score,
@@ -700,8 +700,8 @@ def _upsert_person_candidates(session: Session, people: list[dict], metadata_pat
         camera_id = str(person.get("camera_id") or "")
         video_id = str(person.get("video_id") or "")
         gender = str(person.get("gender") or "unknown")
-        upper_color = str(person.get("top_color") or "unknown")
-        lower_color = str(person.get("bottom_color") or "unknown")
+        upper_color = str(person.get("upper_clothing_color") or "unknown")
+        lower_color = str(person.get("lower_clothing_color") or "unknown")
         appearance_summary = str(person.get("appearance_summary") or "")
         raw = person.get("raw_metadata") or {}
 

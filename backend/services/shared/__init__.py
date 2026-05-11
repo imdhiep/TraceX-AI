@@ -27,10 +27,6 @@ from .models import (
     VerifiedObjectTracklet,
     # Queue staging (non-spec)
     QueueVideoAsset,
-    # Backward-compat aliases (old class names still used in existing code)
-    PersonCandidate,  # = QueryCandidate
-    VideoAsset,      # = Video
-    VideoQuery,      # = QueryHistory
 )
 
 __all__ = [
@@ -60,8 +56,4 @@ __all__ = [
     "VerifiedObjectTracklet",
     # Queue
     "QueueVideoAsset",
-    # Aliases
-    "PersonCandidate",
-    "VideoAsset",
-    "VideoQuery",
 ]

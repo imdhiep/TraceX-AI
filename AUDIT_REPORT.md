@@ -758,18 +758,18 @@ flowchart TD
     N1 --> N2[Stage 2: _detect_persons_batch RT-DETR primary]
     N2 --> N3[Stage 3: BodyPartAdaptiveTracker]
     N3 --> N4[Stage 4: TrackletQualityScorer filter]
-    N4 --> N5[Stage 5-7: _batch_extract_features]
-    N5 --> N5a[DINOv2 batch forward]
-    N5 --> N5b[SigLIP2 image encoder batch]
-    N5 --> N5c[Qwen2-VL captioning batch]
-    N5 --> N5d[VideoMAE batch action]
-    N5a & N5b & N5c & N5d --> N6[Stage 8: TrackletFragmentMerger sim=0.85]
-    N6 --> N7[BEV projection per tracklet]
-    N7 --> N8[Save crop.jpg to /workspace/storage/crops]
+    N4 --> N5[Stage 5: _batch_siglip_embeddings]
+    N5 --> N5a[SigLIP2 multi-frame pool-avg 1152-dim (5 frames)]
+    N5 --> N5b[SigLIP2 single-crop 1152-dim (for DB)]
+    N5a --> N6[Stage 6: TrackletFragmentMerger SigLIP2 sim=0.85]
+    N6 --> N7[Stage 7: _batch_caption_and_classify]
+    N7 --> N7a[Qwen2-VL captioning on merged tracklet]
+    N7 --> N7b[VideoMAE action on merged tracklet]
+    N7a & N7b --> N8[Save crop.jpg to /workspace/storage/crops]
     N8 --> N9[Return ProcessVideoResponse]
     N9 -->|result.tracklets.model_dump| O[_save_tracklets_from_gpu_result]
     O --> P[INSERT tracklets]
-    O --> Q[INSERT tracklets_embeddings DINOv2+SigLIP2]
+    O --> Q[INSERT tracklets_embeddings SigLIP2 1152-dim]
     O --> R[INSERT tracklets_actions VideoMAE]
     P & Q & R --> S[video.processed = True]
     S --> T[session.commit]
@@ -798,7 +798,7 @@ flowchart TD
 
 | Item | Finding | Evidence (file:line) | Classification |
 |------|---------|---------------------|----------------|
-| Docstring của video_process.py | "Full 7-stage pipeline: RT-DETR, BEVProjector, MCBLT, DINOv2, Qwen2-VL-7B-Instruct, VideoMAE V2" | video_process.py:1-16 | CURRENT |
+| Docstring của video_process.py | ~~"Full 7-stage pipeline: RT-DETR, BEVProjector, MCBLT, DINOv2, Qwen2-VL-7B-Instruct, VideoMAE V2"~~ → **Đã sửa 2026-05-11** — Docstring đã cập nhật: RT-DETR, SigLIP2, Qwen2-VL, VideoMAE (DINOv2 xóa) | video_process.py:1-16 | FIXED |
 | "Grounding DINO" trong comment | ~~CÓ~~ → **Đã xóa 2026-05-11** — docstring và comment đã được cập nhật | video_process.py | FIXED |
 | "SigLIP zero-shot" trong comment | KHÔNG tìm thấy comment như vậy | — | N/A |
 | `_detect_persons_batch()` dùng gì | RT-DETR primary (`_detect_persons_rtdetr()`), GDINO fallback nếu RT-DETR trả về None | video_process.py:227-307 | CURRENT |
@@ -1107,142 +1107,110 @@ Primary path: pure tracklet IDs từ QCT junction table. Fallback path: dùng `c
 
 #### Nguyên nhân 1: Crop extraction — không có context margin
 
-File: `video_process.py`, function `_extract_crop_for_vlm`, line 1144–1164
+~~File: `video_process.py`, function `_extract_crop_for_vlm`, line 1144–1164~~ ✅ **ĐÃ FIX**
 
-```python
+~~```python
 def _extract_crop_for_vlm(frame: np.ndarray, bbox: list[float]) -> Optional[np.ndarray]:
     """Extract a square-padded 384×384 crop from frame for VLM input."""
     x1, y1, x2, y2 = map(int, bbox)
-    h, w = frame.shape[:2]
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(w, x2), min(h, y2)
-    if x2 <= x1 or y2 <= y1:
-        return None
+    ...
     crop = frame[y1:y2, x1:x2]          # RAW bbox — KHÔNG có margin
-    if crop.size == 0:
-        return None
-    max_dim = max(crop.shape[0], crop.shape[1])
-    top = (max_dim - crop.shape[0]) // 2
-    bottom = max_dim - crop.shape[0] - top
-    left = (max_dim - crop.shape[1]) // 2
-    right = max_dim - crop.shape[1] - left
-    padded = cv2.copyMakeBorder(
-        crop, top, bottom, left, right,
-        cv2.BORDER_CONSTANT, value=(0, 0, 0)  # padding đen
-    )
-    return cv2.resize(padded, (384, 384), interpolation=cv2.INTER_LINEAR)
+    ...
+    cv2.BORDER_CONSTANT, value=(0, 0, 0)  # padding đen
+```~~
+
+**Fix applied (`video_process.py:796`):**
+```python
+def _extract_crop_for_vlm(frame: np.ndarray, bbox: list[float], margin_pct: float = 0.15):
+    x1, y1, x2, y2 = bbox
+    bw, bh = x2 - x1, y2 - y1
+    mx = int(bw * margin_pct)   # expand 15% each side
+    my = int(bh * margin_pct)
+    x1_e = max(0, int(x1) - mx)
+    y1_e = max(0, int(y1) - my)
+    x2_e = min(frame.shape[1], int(x2) + mx)
+    y2_e = min(frame.shape[0], int(y2) + my)
+    ...
+    cv2.BORDER_CONSTANT, value=(114, 114, 114)  # gray thay vì đen
 ```
 
-**Vấn đề:**
-- Không có context margin: crop chính xác theo bbox detector → khi bbox chặt (bottom half cut), chân/giày/đầu bị mất.
-- Padding màu **đen** (`(0,0,0)`): khi crop người cao hơn rộng (portrait), hai bên là black bars — VLM có thể nhầm tóc/hat bị khuất là không tồn tại.
-- **Crop VLM (line 1247 path) và crop lưu `crop_url` (line 1770 path) DÙNG CÙNG function và cùng size 384×384.** Chúng GIỐNG NHAU — không phải vấn đề khác crop.
-- Trong `_batch_extract_features()` line 1416: `_extract_crop(t_frames[mid_idx], rep_bbox, 384)` — hàm `_extract_crop` nội bộ cũng KHÔNG có margin.
+**Thay đổi:**
+- Thêm margin 15% mỗi phía → head và feet được capture đầy đủ hơn
+- Padding đổi từ đen `(0,0,0)` sang xám `(114,114,114)` → VLM ít nhầm khi có black bars
+- Signature backward-compatible: `margin_pct=0.15` là default
+
+**Tác động:** Giảm `unknown` cho hat, hair, gender, age vì head/body đầy đủ hơn.
 
 ---
 
 #### Nguyên nhân 2: Prompt design — "unknown" quá dễ chọn
 
-File: `video_process.py`, line 821–861 (`_VLM_PROMPT`), line 863–903 (`_VLM_BATCH_PROMPT_TEMPLATE`)
-
-**`_VLM_PROMPT` (single crop):**
-```
-Use "unknown" for anything not clearly visible.
-Do not infer gender or age from clothing alone.
-Replace all 0.0 placeholders with your actual confidence (0.0–1.0).
-```
-
-**`_VLM_BATCH_PROMPT_TEMPLATE`:**
-```
-Use "unknown" for anything not clearly visible.
-Replace 0.0 with actual confidence (0.0–1.0).
-```
-
-**Vấn đề:**
-1. `"Use 'unknown' for anything not clearly visible"` — instruction quá rộng. VLM lazy-safe: bất cứ thứ gì không chắc chắn đều là "unknown".
-2. Confidence placeholder `0.0` trong template bị model copy-paste y nguyên thay vì tính toán thực sự. Instruction `"Replace all 0.0 placeholders"` không đủ mạnh.
-3. `"Do not infer gender or age from clothing alone"` — instruction đúng về nguyên tắc nhưng quá conservative → gender/age = "unknown" gần như mặc định khi ảnh không rõ mặt.
-4. Với hat/bag/mask: `"yes or no or unknown"` — VLM sẽ chọn "unknown" khi crop chỉ thấy nửa người. Không có instruction như `"if the person's head is not fully visible, use 'unknown' for hat_presence"` vs `"if you can see the top half clearly and there is no hat, use 'no'"`.
-5. `hair_style`/`hair_color`: cần thấy đầu rõ. Nếu đầu bị cắt bởi bbox → "unknown".
+✅ **ĐÃ FIX** (`video_process.py:476`, `video_process.py:518`)
 
 ---
 
 #### Nguyên nhân 3: Parser không repair từ summary
 
-File: `video_process.py`, function `_parse_vlm_attrs`, line 917–970
+✅ **ĐÃ FIX** (`video_process.py:572`)
+
+Thêm logic repair trong `_parse_vlm_attrs`:
 
 ```python
-def _parse_vlm_attrs(parsed: dict) -> dict:
-    def _s(key: str, fallback: str = "unknown") -> str:
-        v = parsed.get(key)
-        return str(v).strip().lower() if v not in (None, "", "null") else fallback
-    ...
-    return {
-        "gender": _norm(_s("gender"), _GENDER_NORM),
-        ...
-        "appearance_summary": parsed.get("appearance_summary") or "person",
-        "top_color": _s("upper_clothing_color"),
-        "bottom_color": _s("lower_clothing_color"),
-        ...
-    }
+summary = (parsed.get("appearance_summary") or "").lower()
+
+# Repair presence fields từ summary khi VLM trả "unknown"
+bag_raw = _s("bag_presence")
+bag_pres = _norm(bag_raw, _PRESENCE_NORM)
+if bag_pres == "unknown" and "bag" not in summary and "backpack" not in summary:
+    bag_pres = "no"
+
+hat_raw = _s("hat_presence")
+hat_pres = _norm(hat_raw, _PRESENCE_NORM)
+if hat_pres == "unknown" and "hat" not in summary and "cap" not in summary:
+    hat_pres = "no"
+
+mask_raw = _s("is_wearing_mask")
+mask_pres = _norm(mask_raw, _PRESENCE_NORM)
+if mask_pres == "unknown" and "mask" not in summary:
+    mask_pres = "no"
 ```
 
-**Không có hậu xử lý repair.** Quan sát:
-- `appearance_summary = "A person wearing a gray sweater, black pants, and white sneakers."` chứa đầy đủ thông tin.
-- Nhưng `hat_presence = "unknown"`, `bag_presence = "unknown"`, `is_wearing_mask = "unknown"`, `hair_style = "unknown"`, `hair_color = "unknown"` — không có code nào đọc lại summary để suy luận các field này.
-- Không có function `_repair_vlm_attrs_from_text()` hay `_repair_vlm_attrs_from_summary()` nào trong toàn bộ `video_process.py`.
-- Ví dụ có thể repair: summary có "sneakers" → `shoes_color = "white"` đã có, nhưng không có rule `"backpack/bag" → bag_presence="yes"` hay `"no bag visible" → bag_presence="no"`.
-
-**Field bị bỏ lỡ có thể repair từ summary:**
-- `hat_presence`: nếu summary không nhắc tới hat/cap/helmet → có thể gán `"no"` với confidence 0.72.
-- `bag_presence`: summary không nhắc tới bag/backpack → có thể gán `"no"` với confidence 0.72.
-- `is_wearing_mask`: summary không nhắc tới mask → có thể gán `"no"` với confidence 0.75.
+**Tác động:** `bag_presence`, `hat_presence`, `is_wearing_mask` sẽ được gán `"no"` khi summary không nhắc đến item tương ứng, thay vì `"unknown"`.
 
 ---
 
 #### Nguyên nhân 4: Confidence semantics bị hỏng
 
-File: `video_process.py`, function `_parse_vlm_attrs`, line 923–927:
+✅ **ĐÃ FIX** (`video_process.py:578`)
+
+Fix 1 — `_f()` giờ trả `None` cho `0.0`:
 ```python
 def _f(key: str) -> float | None:
     try:
-        return float(parsed[key])
+        val = float(parsed[key])
+        return val if val > 0.0 else None  # 0.0 = VLM placeholder → treat as missing
     except (KeyError, TypeError, ValueError):
         return None
 ```
 
-File: `video_process.py`, `_batch_extract_features()`, line 1491–1508:
+Fix 2 — Thêm confidence = `None` khi field = `"unknown"`:
 ```python
-all_attr_confs.append({
-    "gender_conf":       attrs.get("gender_conf"),
-    "age_range_conf":    attrs.get("age_range_conf"),
-    "top_color_conf":    attrs.get("upper_clothing_conf"),   # map sang upper_clothing_conf
-    "bottom_color_conf": attrs.get("lower_clothing_conf"),
-    "shoes_conf":        attrs.get("shoes_conf"),
-    "accessory_conf":    max(
-        attrs.get("bag_conf") or 0.0,
-        attrs.get("hat_conf") or 0.0,
-    ) or None,
-    "hat_color_conf":    attrs.get("hat_conf"),
-    "bag_type_conf":     attrs.get("bag_conf"),
-    "mask_conf":         attrs.get("mask_conf"),
-    "hair_style_conf":   attrs.get("hair_conf"),   # NOTE: "hair_conf" không có trong VLM JSON!
-    "hair_color_conf":   attrs.get("hair_conf"),   # Luôn là None
-})
+gender_val = _norm(_s("gender"), _GENDER_NORM)
+gender_conf = _f("gender_conf")
+if gender_val == "unknown":
+    gender_conf = None
+
+age_val = _norm(_s("age_range"), _AGE_NORM)
+age_conf = _f("age_range_conf")
+if age_val == "unknown":
+    age_conf = None
 ```
 
-**Vấn đề cụ thể:**
-1. **`top_color=gray` nhưng `top_conf=0.00`:** VLM điền `upper_clothing_color = "gray"` nhưng vẫn ghi `upper_clothing_conf = 0.0` trong JSON output (không replace placeholder). `_f("upper_clothing_conf")` parse ra `0.0` (float), không phải `None`. Giá trị `0.0` float valid được lưu vào DB thay vì `None`. Khi display, `0.0` hiện thành `0.00`.
-2. **`hair_conf` không tồn tại:** Prompt không yêu cầu field `"hair_conf"` — chỉ có `"hair_style"`, `"hair_color"` và field `"hair_conf"` không trong prompt template. `_parse_vlm_attrs()` line 963: `"hair_conf": _f("hair_conf")` — `_f()` sẽ raise `KeyError` → return `None`. Kết quả: `hair_style_conf` và `hair_color_conf` LUÔN là `None`. Đây là **bug**: code đọc key không tồn tại trong VLM JSON.
-3. **Query-service behavior khi conf=0:** `candidates.py` line 331-334:
-```python
-c1 = getattr(t1, conf_field, None) or 0.0
-c2 = getattr(t2, conf_field, None) or 0.0
-threshold = _CONF_THRESHOLDS.get(attr, _CONF_THRESHOLD)
-if c1 >= threshold and c2 >= threshold:
-    return False  # block merge
-```
-   Khi `top_color_conf = 0.0` hoặc `None`: `0.0 < threshold (0.82)` → **không block merge**. Nghĩa là `top_color=gray` với `conf=0.0` được **bỏ qua hoàn toàn** trong conflict detection — hai tracklet người mặc gray và người mặc red vẫn có thể được merge nếu VLM không tự tin.
+**Ghi chú về `hair_conf`:** VLM prompt (`_VLM_PROMPT`, `_VLM_BATCH_PROMPT_TEMPLATE`) đã có field `"hair_conf": 0.0` trong JSON schema. Code `attrs.get("hair_conf")` đọc đúng key. Kết quả `hair_conf` phụ thuộc vào VLM có replace placeholder hay không. Sau fix `_f()`, nếu VLM không replace thì `hair_conf` → `None` (thay vì `0.0` lưu vào DB).
+
+**Tác động:**
+- `conf=0.0` không còn lưu vào DB → tránh hiển thị `0.00` trên UI
+- Gender/age unknown → conf = `None` thay vì `0.0` → query merge logic không bị bypass sai
 
 ---
 
@@ -1258,7 +1226,7 @@ flowchart TD
     F -->|_batch_extract_features| G{GPU Models}
     G -->|DINOv2 ViT-L/14| H[embedding_vector 1024-dim]
     G -->|SigLIP2 image encoder| I[siglip_embedding 1152-dim]
-    G -->|_extract_crop mid_frame 384x384 NO margin| J[rep_crop PIL]
+    G -->|_extract_crop mid_frame 384x384 MARGIN_15% gray_pad| J[rep_crop PIL]
     J -->|_caption_crops_vlm_batch Qwen2-VL-7B| K[VLM JSON output]
     K -->|_parse_vlm_attrs| L[attrs dict]
     L -->|_build_appearance_summary| M[appearance_summary string]
@@ -1797,7 +1765,7 @@ Mỗi lần chuyển thế hệ, team **thêm mới thay vì xóa cũ** → tíc
 | A2 | `_detect_persons()` (single-frame GDINO) | **Đã xóa** | `video_process.py`: xóa function; `_detect_persons_batch()` nay `raise RuntimeError` thay vì return `[]` im lặng |
 | A3 | `embedding` column (pgvector DINOv2 1024) | **Đã xóa khỏi model** | `models.py`: xóa field; SQL: `ALTER TABLE tracklets_embeddings DROP COLUMN embedding` |
 | A4 | `VideoQuery = QueryHistory` alias | **Đã xóa** | `models.py`: xóa alias; `video_service.py`: đổi sang `QueryHistory` trực tiếp |
-| A5 | `PersonCandidate = QueryCandidate` alias | **Đã xóa** | `models.py`: xóa alias; `candidate_query.py`: đổi sang `QueryCandidate` trực tiếp |
+| A5 | `PersonCandidate = QueryCandidate` alias | **Đã xóa** | `models.py`: xóa alias; `candidate_query.py`: đã xóa 2026-05-11 |
 | A6 | `VideoAsset = Video` alias | **Đã xóa** | `models.py` + `shared/__init__.py`: xóa alias và export |
 
 ---
@@ -1911,7 +1879,7 @@ Mỗi lần chuyển thế hệ, team **thêm mới thay vì xóa cũ** → tíc
 | `app/queue_worker.py` | **MỚI** | Upsert `Tracklet`, `TrackletEmbedding`, `TrackletAction` via SQLAlchemy. Không có EVA-02 hay raw_metadata. | ✅ Đúng |
 | `app/api/routers/candidates.py` | **MỚI** | Phục vụ crop preview từ `/workspace/storage/crops/` via Tracklet ORM. | ✅ Đúng |
 | `app/services/ground_truth_finetune.py` | **HYBRID** | DINOv2 primary nhưng fallback EVA-02: `model = self._get_model("dinov2") or self._get_model("eva02")` — line 859. EVA-02 không cần thiết. | ⚠️ Xóa fallback EVA-02 |
-| `app/api/routers/video_process.py` | **MỚI** | RT-DETR + DINOv2 (fragment merge) + SigLIP2 + Qwen2-VL + VideoMAE. | ✅ Đúng |
+| `app/api/routers/video_process.py` | **MỚI** | RT-DETR + SigLIP2 (fragment merge) + Qwen2-VL + VideoMAE. DINOv2 đã xóa (2026-05-11). | ✅ Đúng |
 
 ---
 
@@ -1920,7 +1888,7 @@ Mỗi lần chuyển thế hệ, team **thêm mới thay vì xóa cũ** → tíc
 | File | Pipeline | Mô tả | Status |
 |------|---------|-------|--------|
 | `app/api/routers/candidates.py` | **MỚI** | `_build_search_text()` dùng `upper_clothing_color`, `lower_clothing_color`. `_tracklet_embedding()` dùng `siglip_embedding`. Insert `QueryCandidate` + `QueryCandidateTracklet`. | ✅ Đúng |
-| `app/services/candidate_query.py` | **CŨ — BỊ VỠ** | Truy cập fields không tồn tại trên `QueryCandidate`. Xem 17.3. | 🔴 CRASH |
+| ~~`app/services/candidate_query.py`~~ | ~~CŨ — BỊ VỠ~~ | ~~Truy cập fields không tồn tại trên `QueryCandidate`.~~ | ~~🟡 ĐÃ XÓA 2026-05-11~~ |
 
 ---
 
@@ -1930,49 +1898,21 @@ Mỗi lần chuyển thế hệ, team **thêm mới thay vì xóa cũ** → tíc
 |------|---------|-------|--------|
 | `app/services/trace_service.py` | **MỚI** | Đọc `QueryCandidateTracklet`, build `EvidenceVideo`/`EvidenceTracklet` via SQLAlchemy. | ✅ Đúng |
 | `app/api/routers/trace.py` | **MỚI** | Nhận `candidate_id`, gọi `trace_service`. | ✅ Đúng |
-| `app/api/routers/candidates.py` | **MỚI + comment cũ** | Docstring nói "EVA-02 1024-dim" nhưng code nhận `embedding_vector` passthrough từ upstream — không tự chạy EVA-02. Weight `_W_VECTOR = 0.50` còn label "EVA-02". Code thực tế agnostic. | ⚠️ Stale comment/label |
-| `app/services/model_warmup.py` | **CŨ — REDUNDANT** | Load EVA-02 ViT-L/14 khi startup (`_load_eva02()`) nhưng model không được gọi trong bất kỳ inference path nào. Tốn ~5GB VRAM vô ích. | 🟡 Xóa |
+| `app/api/routers/candidates.py` | **MỚI** | Re-ranking: SigLIP 2 attribute match + text overlap + quality. EVA-02 comments removed 2026-05-11. | ✅ Đúng |
+| ~~`app/services/model_warmup.py`~~ | ~~CŨ — REDUNDANT~~ | ~~Load EVA-02 ViT-L/14 + Grounding DINO 1.6 nhưng không được gọi.~~ | ~~🟡 ĐÃ XÓA 2026-05-11~~ |
 
 ---
 
-### 17.3 — CRITICAL: `query-service/app/services/candidate_query.py`
+### 17.3 — ~~CRITICAL: `query-service/app/services/candidate_query.py`~~ ✅ ĐÃ XÓA
 
-File này được viết cho schema **PersonCandidate cũ** (có `raw_metadata` JSON blob). `QueryCandidate` model mới **không có** những field này → crash `AttributeError` khi được gọi.
+**ĐÃ XÓA 2026-05-11.** File truy cập fields không tồn tại trên `QueryCandidate` (như `raw_metadata`, `human_key`, `frame_idx`, `embedding_vector`).
 
-```python
-# candidate_query.py:107-132 — tất cả các dòng này sẽ crash
-raw_metadata = candidate.raw_metadata or {}       # ❌ AttributeError — field không tồn tại
-candidate.human_key                               # ❌ field không có trong QueryCandidate
-candidate.frame_idx                               # ❌ field không có
-candidate.metadata_path                           # ❌ field không có
-candidate.search_text                             # ❌ field không có
-raw_metadata.get("attribute_embedding_vector")    # ❌ raw_metadata = None object
-raw_metadata.get("appearance_embedding_vector")   # ❌
-raw_metadata.get("embedding_vector")              # ❌
-```
 
-**Root cause:** File này chưa được migrate sang schema mới. `QueryCandidate` model hiện có các fields:
-`candidate_id`, `query_id`, `fusion_score`, `vector_score`, `text_score`, `rank_position`, `is_selected`, `appearance_summary`, `gender`, `primary_camera_id` — và relationship `tracklets` (via `QueryCandidateTracklet`).
+### 17.4 — ~~REDUNDANT: EVA-02 trong trace-service~~ ✅ ĐÃ XÓA
 
-**Fix cần làm:** Rewrite `candidate_to_payload()` để:
-1. Lấy tracklets qua relationship `candidate.tracklets` → `QueryCandidateTracklet`
-2. Join `Tracklet` từ `tracklet_id` → lấy `camera_id`, `video_id`, `crop_url`, etc.
-3. Không dùng `raw_metadata` — tất cả dữ liệu từ structured DB fields
-
----
-
-### 17.4 — REDUNDANT: EVA-02 trong trace-service
-
-`trace-service/app/services/model_warmup.py` load EVA-02 ViT-L/14 khi startup:
-
-```python
-# model_warmup.py:81-116 — _load_eva02()
-model = timm.create_model("eva02_large_patch14_224.mim_m38m_ft_in22k_in1k", ...)
-_MODELS["eva02"] = model
-_MODELS["eva02_transform"] = transform
-```
-
-Nhưng `trace-service/api/routers/candidates.py:241` chỉ đọc `embedding_vector` từ dict truyền vào (passthrough từ upstream), **không gọi EVA-02 để inference**. Model load chiếm ~5GB VRAM không có tác dụng.
+**ĐÃ XÓA 2026-05-11.** Đã xóa:
+- `_load_eva02()` function và `_load_grounding_dino_16()` function khỏi `model_warmup.py`
+- Stale comments và `_W_VECTOR` weights khỏi `trace-service/app/api/routers/candidates.py`
 
 ---
 
@@ -1984,72 +1924,79 @@ Nhưng `trace-service/api/routers/candidates.py:241` chỉ đọc `embedding_vec
 | `queue_worker.py` | metadata | MỚI | ✅ | — |
 | `ground_truth_finetune.py` | metadata | HYBRID | ✅ (unnecessary fallback) | Xóa fallback EVA-02 (line 859) |
 | `candidates.py` (metadata router) | metadata | MỚI | ✅ | — |
-| `video_process.py` | metadata | MỚI | ✅ | — |
+| `video_process.py` | metadata | MỚI | ✅ (DINOv2 xóa 2026-05-11) | — |
 | `candidates.py` (query router) | query | MỚI | ✅ | — |
-| **`candidate_query.py`** | **query** | **CŨ** | **🔴 CRASH** | **Rewrite dùng QueryCandidate relationships** |
+| **`candidate_query.py`** | **query** | **CŨ** | ~~🔴 CRASH~~ ✅ ĐÃ XÓA | — |
 | `trace_service.py` | trace | MỚI | ✅ | — |
 | `trace.py` (router) | trace | MỚI | ✅ | — |
-| `candidates.py` (trace router) | trace | MỚI+comment cũ | ✅ | Xóa stale comment "EVA-02" |
-| **`model_warmup.py`** (trace) | **trace** | **CŨ** | **🟡 Redundant** | **Xóa `_load_eva02()`** |
+| `candidates.py` (trace router) | trace | ~~MỚI+comment cũ~~ ✅ | — |
+| **`model_warmup.py`** (trace) | **trace** | ~~CŨ~~ ✅ ĐÃ XÓA | — |
 
 ---
 
 ### 17.6 — Ưu tiên xử lý
 
-| Priority | Action | File | Effort |
-|----------|--------|------|--------|
-| **P0 — Sau DB wipe** | Xóa `_upsert_person_candidates()` và JSON fallback trong `load_queue_video_metadata()` | `metadata-service/app/services/queue_service.py` | 30 phút |
-| **P0** | Rewrite `candidate_to_payload()` và `candidate_to_ranking_payload()` | `query-service/app/services/candidate_query.py` | 2h |
-| **P1** | Xóa `_load_eva02()` khỏi warmup | `trace-service/app/services/model_warmup.py` | 15 phút |
-| **P2** | Xóa fallback `or self._get_model("eva02")` | `metadata-service/app/services/ground_truth_finetune.py:859` | 5 phút |
-| **P3** | Sửa stale docstring "EVA-02 1024-dim" và weight label | `trace-service/app/api/routers/candidates.py:1-27` | 5 phút |
+| Priority | Action | File | Effort | Status |
+|----------|--------|------|--------|--------|
+| ~~P0 — Sau DB wipe~~ | ~~Xóa `_upsert_person_candidates()`~~ | `metadata-service/app/services/queue_service.py` | 30 phút | 🟡 TBD |
+| ~~P0~~ | ~~Rewrite `candidate_to_payload()`~~ | ~~`query-service/app/services/candidate_query.py`~~ | ~~2h~~ | ✅ **ĐÃ XÓA** 2026-05-11 |
+| ~~P1~~ | ~~Xóa `_load_eva02()`~~ | ~~`trace-service/app/services/model_warmup.py`~~ | ~~15 phút~~ | ✅ **ĐÃ XÓA** 2026-05-11 |
+| ~~P2~~ | ~~Xóa EVA-02 fallback~~ | ~~`metadata-service/app/services/ground_truth_finetune.py:859`~~ | ~~5 phút~~ | 🟡 TBD |
+| ~~P3~~ | ~~Sửa stale EVA-02 comments~~ | ~~`trace-service/app/api/routers/candidates.py`~~ | ~~5 phút~~ | ✅ **ĐÃ SỬA** 2026-05-11 |
+| ~~P4~~ | ~~Xóa DINOv2 khỏi pipeline~~ | ~~`video_process.py` — xóa `_generate_dinov2_embeddings`, thay DINOv2 batch bằng SigLIP2 multi-frame~~ | ~~1h~~ | ✅ **ĐÃ XÓA** 2026-05-11 |
+| ~~P4~~ | ~~Xóa `_load_dinov2` khỏi model_warmup~~ | ~~`metadata-service/app/services/model_warmup.py`~~ | ~~15 phút~~ | ✅ **ĐÃ XÓA** 2026-05-11 |
+| ~~P4~~ | ~~Cập nhật comment/docstring DINOv2→SigLIP2~~ | ~~`main.py`, `Dockerfile`, `requirements.txt`, `queue_worker.py`, `tracking_pipeline.py`, `video_process_schemas.py`, `ingest.py`~~ | ~~30 phút~~ | ✅ **ĐÃ SỬA** 2026-05-11 |
 
 ---
 
-## PHẦN 18 — PIPELINE ORDER AUDIT: RT-DETR → TRACKER → FRAGMENTMERGER → QWEN
+## PHẦN 18 — PIPELINE ORDER: SIGLIP → MERGE → QWEN+VMAE (2026-05-11)
+
+> **Cập nhật 2026-05-11:** Pipeline được sửa để Qwen2-VL + VideoMAE chạy **SAU Fragment Merge** trên merged tracklet.
+> Luồng chính xác:
+> `RT-DETR → BodypartAdaptiveTracker → raw tracklets → SigLIP2 embed (5-frame pool-avg) → Fragment merge → merged tracklet → Qwen2-VL + VideoMAE → tracklet result → DB`
+> DINOv2 đã bị xóa hoàn toàn. SigLIP2 là model appearance duy nhất.
 
 ### 18.1 — Thứ tự thực tế trong code
-
-> Mô tả trực quan: "RT-DETR → Tracker → FragmentMerger → Qwen + embeddings lưu DB" **không khớp** với code.  
-> Qwen và embeddings chạy **trước** FragmentMerger, không phải sau.
 
 ```
 video_process.py — _process_video_sync()
 
 Stage 1 : VideoFrameSampler           → sampled_frames (4fps)
-Stage 2 : RT-DETR batch detect        → detections_by_frame          line ~1354
-Stage 3 : BodyPartAdaptiveTracker     → local_tracklets (per-fragment)  line ~1396
-Stage 4 : TrackletQualityScorer       → accepted fragments              line ~1408
-Stage 5-7: _batch_extract_features()  ← TRƯỚC MERGE                    line ~1429
-           ├── DINOv2    → all_embeddings        (dùng cho merge)
-           ├── SigLIP2   → all_siglip_embeddings (dùng cho merge + DB)
-           ├── Qwen2-VL  → all_attributes        (attributes per fragment)
-           └── VideoMAE  → all_actions
-Stage 8 : TrackletFragmentMerger      → dùng embeddings từ Stage 5-7   line ~1441
-           └── sau merge:
-               ├── embeddings : pool_avg(tất cả fragments đã merge)
-               └── attributes : copy từ "richest" fragment (max obs)
-Stage 9 : Rebuild t_data              → BEV projection + crop save      line ~1470
-Stage 10: Build TrackletResult        → ingest_service → DB
+Stage 2 : RT-DETR batch detect      → detections_by_frame
+Stage 3 : BodyPartAdaptiveTracker   → local_tracklets (per-fragment)
+Stage 4 : TrackletQualityScorer     → accepted raw fragments
+Stage 5 : _batch_siglip_embeddings() — SigLIP2 multi-frame pool-avg TRƯỚC MERGE
+           ├── siglip_multi_feats   → cho fragment merge (SigLIP cosine sim)
+           └── all_siglip_embeddings → pool-avg cho DB storage
+Stage 6 : TrackletFragmentMerger    → merged tracklets
+           └── siglip_embeddings_merged : pool_avg(SigLIP embeds từ tất cả fragments)
+Stage 7 : _batch_caption_and_classify() — Qwen2-VL + VideoMAE SAU MERGE
+           ├── Qwen2-VL  → attributes trên merged tracklet (best frame by conf)
+           └── VideoMAE   → action trên merged tracklet (tất cả frames trong group)
+Stage 8 : Build TrackletResult     → ingest_service → DB
 ```
 
 Evidence — thứ tự trong code:
 ```python
-# video_process.py:1429 — features trước merge
-all_embeddings, all_attributes, ... = _batch_extract_features(t_data, video_id)
+# Stage 5 — SigLIP trước merge
+siglip_multi_feats, all_rep_crops, all_siglip_embeddings = _batch_siglip_embeddings(t_data_raw)
 
-# video_process.py:1441 — merge SAU features
+# Stage 6 — Fragment merge
 _merger = TrackletFragmentMerger(similarity_threshold=0.85, max_gap_seconds=60.0)
-accepted, _groups = _merger.merge(list(accepted), _merge_embs)
+accepted, _groups = _merger.merge(list(accepted), siglip_multi_feats)
 
-# video_process.py:1458-1467 — pool/copy sau merge, KHÔNG re-run
-def _richest(g):
-    return max(g, key=lambda i: len(_orig_accepted[i].observations))
+# Pool-avg SigLIP sau merge
+siglip_multi_feats_merged = [_pool_avg([siglip_multi_feats[i] for i in g]) for g in _groups]
+siglip_embeddings_merged  = [_pool_avg([all_siglip_embeddings[i] for i in g]) for g in _groups]
 
-all_embeddings        = [_pool_avg([all_embeddings[i]        for i in g]) for g in _groups]
-all_siglip_embeddings = [_pool_avg([all_siglip_embeddings[i] for i in g]) for g in _groups]
-all_attributes        = [all_attributes[_richest(g)]  for g in _groups]  # copy, không re-run
-all_actions           = [all_actions[_richest(g)]     for g in _groups]  # copy, không re-run
+# Rebuild t_data cho merged tracklets — best frame by detection confidence
+def _best_obs_for_merged(g):  # highest conf obs across all fragments in group
+    ...
+
+t_data_merged, rep_crops_merged = build_merged_data(...)
+
+# Stage 7 — Qwen2-VL + VideoMAE SAU merge
+all_attributes, all_attr_confs, all_actions = _batch_caption_and_classify(t_data_merged, rep_crops_merged)
 ```
 
 ---
@@ -2058,41 +2005,32 @@ all_actions           = [all_actions[_richest(g)]     for g in _groups]  # copy,
 
 | Bước | Hiện tại | Lý tưởng | Verdict |
 |------|---------|---------|---------|
-| FragmentMerger dùng embedding để quyết định merge | SigLIP2 pre-merge | Cần embedding trước | ✅ Bắt buộc — không thể đổi thứ tự |
-| Embedding lưu DB | `pool_avg` tất cả fragments trong group | Pool avg | ✅ Hợp lý — tổng hợp toàn tracklet |
-| Qwen attributes lưu DB | Copy từ "richest" fragment (nhiều obs nhất) | Re-run trên best frame của merged tracklet | ⚠️ Suboptimal |
-| VideoMAE actions lưu DB | Copy từ "richest" fragment | Re-run trên merged tracklet | ⚠️ Suboptimal |
-| `_richest` = fragment nhiều obs nhất | Max `len(observations)` | Best frame quality | ⚠️ Nhiều obs ≠ frame rõ nhất |
+| FragmentMerger dùng embedding để merge | SigLIP2 pool-avg 5 frames pre-merge | ✅ | ✅ Bắt buộc |
+| Qwen2-VL captioning | **Chạy SAU merge trên merged tracklet** | ✅ | ✅ Đúng |
+| VideoMAE action | **Chạy SAU merge trên merged tracklet** | ✅ | ✅ Đúng |
+| Representative frame cho Qwen | Best frame by detection confidence (không phải mid-frame) | ✅ | ✅ Đúng |
+| VideoMAE frames cho merged | Tất cả frames từ mọi fragment trong group | ✅ | ✅ Đúng |
+| SigLIP2 multi-frame cho merge | 5 evenly-spaced frames → pool avg | ✅ | ✅ |
+| DINOv2 | Đã xóa hoàn toàn | ✅ | ✅ |
+
+**Pipeline hoàn toàn đúng theo yêu cầu:** SigLIP → Fragment Merge → Qwen2-VL + VideoMAE trên merged.
 
 ---
 
-### 18.3 — Vấn đề `_richest` ≠ best frame
+### 18.3 — Cải tiến so với logic cũ
 
-`_richest` chọn fragment có **nhiều observation nhất** — giả định rằng tracklet dài hơn có frame tốt hơn. Điều này không đúng nếu fragment dài lại bị che khuất phần lớn thời gian.
-
-Kết hợp với `_best_observation()` (xem Phần 14.6): sau khi chọn richest fragment, vẫn nên chọn best frame *trong* fragment đó thay vì `obs[len(obs)//2]`.
-
-**Tuy nhiên**, vẫn không re-run Qwen trên merged tracklet — attributes vẫn từ fragment được chọn, chỉ frame tốt hơn.
+- **Trước:** Qwen/VMAE chạy trước merge → copy attributes từ "richest" fragment  
+- **Sau:** Qwen/VMAE chạy sau merge trên merged tracklet → attributes/action đại diện cho toàn bộ người
 
 ---
 
-### 18.4 — Có nên re-run Qwen sau merge không?
+### 18.4 — Tóm tắt
 
-| Approach | Ưu | Nhược |
-|----------|-----|------|
-| **Hiện tại:** copy attributes từ richest fragment | Không tốn thêm GPU | Attribute có thể từ fragment bị khuất hoặc mờ |
-| **Re-run Qwen sau merge:** inference trên best frame của merged tracklet | Attribute chính xác hơn, đại diện cho toàn tracklet | Tốn thêm 1 lần Qwen inference (~14GB VRAM, latency cao) per merged group |
-
-**Recommendation:** Giữ cách hiện tại (copy từ richest) + implement `_best_observation()` để chọn frame tốt hơn trong richest fragment. Re-run Qwen sau merge chỉ đáng nếu % tracklets bị merge cao (>20%) và có budget GPU.
-
----
-
-### 18.5 — Tóm tắt
-
-- Pipeline thứ tự **đúng về mặt logic** — FragmentMerger cần embedding trước để quyết định merge.
-- Embedding lưu DB là **pool average** — tốt.
-- Attributes lưu DB là **copy từ 1 fragment** — chấp nhận được, nhưng có thể cải thiện bằng `_best_observation()`.
-- **Không có bug** trong thứ tự pipeline, chỉ có optimization opportunity ở chất lượng representative frame.
+- ✅ Pipeline thứ tự **đúng hoàn toàn** theo yêu cầu
+- ✅ SigLIP2 → Fragment Merge → Qwen2-VL + VideoMAE trên merged tracklet
+- ✅ DINOv2 xóa hoàn toàn khỏi pipeline
+- ✅ Representative frame chọn best (highest conf) không phải mid-frame
+- ✅ VideoMAE dùng tất cả frames từ mọi fragment trong group
 
 ---
 
@@ -2176,7 +2114,7 @@ for key in ("search_text", "appearance_summary", "attribute_summary", "action"):
 | Metadata conflict guard | ❌ Không dùng | `candidates.py:_metadata_matches()` |
 | Ranking / fusion score | ❌ Không dùng | `candidates.py:fusion_score` formula |
 | trace-service (new pipeline) | ❌ Không dùng | `trace_service.py` — zero action references |
-| Old pipeline paths | ⚠️ Có code nhưng luôn rỗng | `candidate_query.py`, `trace-service/routers/candidates.py` — đọc từ `raw_metadata` (None) |
+| Old pipeline paths | ~~⚠️ Có code nhưng luôn rỗng~~ ✅ Đã xóa | `candidate_query.py`: đã xóa 2026-05-11; `trace-service/routers/candidates.py`: stale code đã fix |
 
 ### 19.4 — Fix tối thiểu (Option A — không cần thêm join)
 
@@ -2193,9 +2131,40 @@ joinedload(Tracklet.embedding),
 joinedload(Tracklet.actions),   # ← thêm
 ```
 
-### 19.5 — Priority
+### 19.5 — Fix đã áp dụng (2026-05-11)
+
+**Thay đổi 1 — ORM load:** `candidates.py:188` thêm `joinedload(Tracklet.actions)`.
+
+**Thay đổi 2 — `_build_search_text()`:** action_label được join vào search text.
+
+```python
+# candidates.py:117-118 — action_label ghép vào text để ILIKE match
+action_label = ""
+if row.actions:
+    action_label = " ".join(a.action_label or "" for a in row.actions)
+...
+action_label,   # ← thêm vào join
+```
+
+**Thay đổi 3 — `_search_text_expr()`:** correlated subquery join sang `tracklets_actions`.
+
+**Thay đổi 4 — `_metadata_matches()`:** thêm action conflict guard.
+
+**Thay đổi 5 — Import:** `TrackletAction` được import và dùng trong subquery.
+
+### 19.6 — Priority
 
 **MEDIUM** — VideoMAE đang tốn GPU compute để sinh action labels nhưng data không được dùng trong search. Không phải crash, nhưng là lãng phí tài nguyên và mất tính năng action-aware search hoàn toàn.
+
+**Trạng thái sau fix:**
+
+|| Layer | Trước | Sau |
+|-------|-------|-------|
+|| ORM load | ❌ | ✅ `joinedload(Tracklet.actions)` |
+|| `_build_search_text()` | ❌ | ✅ action_label join |
+|| `_search_text_expr()` SQL prefilter | ❌ | ✅ correlated subquery |
+|| `_metadata_matches()` conflict guard | ❌ | ✅ action conflict check |
+|| `tracklets_actions` INSERT | ✅ | ✅ (unchanged) |
 
 ---
 
@@ -2287,3 +2256,370 @@ Không có `bev_valid` flag → consumer không phân biệt được.
 | Đảm bảo `CAMERA_CALIBRATION_PATH` được set và có đủ camera IDs trong deployment | Ops | HIGH |
 | Thêm `bev_valid: bool` vào `TrackletResult` — `True` khi BEVProjector load thành công | 30 phút | MEDIUM |
 | Log ERROR (không chỉ WARNING) khi camera_id không có trong calibration | 5 phút | MEDIUM |
+
+---
+
+## PHẦN X — FRONTEND REACHECK (2026-05-11)
+
+### Tổng quan
+
+Kiểm tra frontend (`frontend/`) cho các tham chiếu đến code đã xóa theo audit report.
+
+### Kết quả tìm kiếm
+
+| Item | Tìm thấy | File(s) | Trạng thái |
+|------|-----------|---------|------------|
+| `bev` / BEV | ❌ KHÔNG | — | Sạch |
+| `queue_service` | ❌ KHÔNG | — | Sạch |
+| `load_queue_video_metadata` | ❌ KHÔNG | — | Sạch |
+| `upsert_person_candidates` | ❌ KHÔNG | — | Sạch |
+
+### Tham chiếu cần cập nhật
+
+#### 1. `frontend/lib/api/client.ts` — Docker hostname cũ (line 78)
+
+```typescript
+// frontend/lib/api/client.ts:52-78
+if (process.env.NODE_ENV === "server") {
+  if (process.env.NEXT_PUBLIC_API_BASE_URL) {
+    return process.env.NEXT_PUBLIC_API_BASE_URL;
+  }
+  return "http://metadata-service:8000";  // ⚠️ STALE - không khớp với lightningai-compose.yml
+}
+```
+
+**Vấn đề:** `metadata-service:8000` là hostname cũ. Cần kiểm tra service name trong `lightningai-compose.yml` và cập nhật.
+
+**Đề xuất:** Thay bằng `http://metadata-service:8002` hoặc hostname đúng từ compose file.
+
+#### 2. `frontend/.env.example` — Comment tham chiếu service cũ
+
+```bash
+# .env.example:4
+# Set this to the real LightningAI metadata-service URL.
+NEXT_PUBLIC_API_BASE_URL=https://8002-XXXXXXXXXXXXXXXXXX.cloudspaces.litng.ai/api/v1
+```
+
+Comment ghi "metadata-service" nhưng URL thực tế dùng cloud URL. Port `8002` đúng với compose files.
+
+#### 3. `frontend/middleware.ts` — Redirect cho URL cũ (line 10)
+
+```typescript
+// frontend/middleware.ts:1-14
+/**
+ * Tránh xung đột route: trang UI đặt tại /admin/users, còn POST/GET/PATCH /users proxy sang API gateway.
+ * GET /users (bookmark cũ) chuyển hướng sang trang quản trị.
+ */
+export function middleware(request: NextRequest) {
+  if (request.method === "GET" && request.nextUrl.pathname === "/users") {
+    return NextResponse.redirect(new URL("/admin/users", request.url));
+  }
+```
+
+**Trạng thái:** ACTIVE — Redirect cho bookmark cũ của người dùng. Không phải dead code.
+
+#### 4. `frontend/lib/api/client.ts` — `/candidates/` URL path (lines 55, 91)
+
+```typescript
+// frontend/lib/api/client.ts:52-55
+if (value.includes("/candidates/") && value.endsWith("/preview")) {
+  return true;
+}
+
+// frontend/lib/api/client.ts:91-97
+if (typeof window !== "undefined" && raw.includes("/api/v1/candidates/") && raw.endsWith("/preview")) {
+  const token = loadAccessToken();
+  if (token) {
+    const separator = resolved.includes("?") ? "&" : "?";
+    resolved = `${resolved}${separator}access_token=${encodeURIComponent(token)}`;
+  }
+}
+```
+
+**Trạng thái:** ACTIVE — Logic để attach access token cho candidate preview URLs. Không phải dead code.
+
+#### 5. `frontend/features/settings/SettingsPage.tsx` — Queue metrics
+
+```typescript
+// frontend/features/settings/SettingsPage.tsx:21-29
+type OverviewResponse = {
+  metrics?: {
+    total_users?: number;
+    total_managed_videos?: number;
+    total_queries?: number;
+    total_candidates?: number;           // ⚠️ Defined nhưng KHÔNG hiển thị
+    total_cameras?: number;
+    total_candidate_videos?: number;     // ⚠️ Defined nhưng KHÔNG hiển thị
+    total_queue_videos?: number;         // ✅ ACTIVE - hiển thị line 250
+  };
+};
+```
+
+**Trạng thái:**
+- `total_queue_videos` — **ACTIVE**, được hiển thị trong UI
+- `total_candidates` — **DEAD FIELD**, định nghĩa trong type nhưng không hiển thị
+- `total_candidate_videos` — **DEAD FIELD**, định nghĩa trong type nhưng không hiển thị
+
+### Action Items
+
+| Action | File | Effort | Priority |
+|--------|------|--------|----------|
+| Cập nhật `metadata-service:8000` fallback hostname | `lib/api/client.ts:78` | 5 phút | MEDIUM |
+| Xóa `total_candidates` và `total_candidate_videos` khỏi type | `features/settings/SettingsPage.tsx:26,28` | 5 phút | LOW |
+| Kiểm tra đúng service name trong `lightningai-compose.yml` | N/A | — | HIGH |
+
+### Kết luận
+
+Frontend **không có tham chiếu** đến các code đã xóa trong audit (BEV, queue_service, upsert_person_candidates). Các item cần cập nhật chỉ là:
+1. Stale Docker hostname trong SSR fallback
+2. Dead type fields không được sử dụng trong Settings UI
+
+---
+
+## PHẦN Y — FIX SUMMARY: 14.2 UNKNOWN FIELDS (2026-05-11)
+
+### Đã thực hiện
+
+| # | Fix | File | Line | Status |
+|---|-----|------|------|--------|
+| 1 | Thêm context margin 15% + padding xám thay vì đen | `video_process.py` | 796 | ✅ Done |
+| 2 | Cải thiện VLM prompt instruction | `video_process.py` | 476, 518 | ✅ Done |
+| 3 | Repair presence fields từ `appearance_summary` | `video_process.py` | 572 | ✅ Done |
+| 4 | Fix `conf=0.0` → `None`, gán `None` cho unknown fields | `video_process.py` | 572 | ✅ Done |
+
+### Chi tiết từng fix
+
+#### Fix 1: Crop extraction — context margin + gray padding
+
+**Trước:**
+```python
+crop = frame[y1:y2, x1:x2]          # raw bbox — KHÔNG có margin
+cv2.BORDER_CONSTANT, value=(0, 0, 0)  # padding đen
+```
+
+**Sau:**
+```python
+mx = int(bw * 0.15)   # expand 15% mỗi phía
+x1_e = max(0, int(x1) - mx)
+y1_e = max(0, int(y1) - my)
+x2_e = min(frame.shape[1], int(x2) + mx)
+y2_e = min(frame.shape[0], int(y2) + my)
+crop = frame[y1_e:y2_e, x1_e:x2_e]
+cv2.BORDER_CONSTANT, value=(114, 114, 114)  # gray thay vì đen
+```
+
+#### Fix 2: VLM Prompt — giảm "unknown" lazy
+
+**Thêm `IMPORTANT INSTRUCTIONS`:**
+- Gender: `"unknown" only if face/head not visible` (thay vì blanket rule)
+- Bag/hat/mask: `"no" not "unknown"` khi upper body visible và item không có
+- Hair: `"unknown" only if top of person not in frame`
+- Nếu không phải "unknown" → phải có conf > 0.0
+
+#### Fix 3: Parser repair từ summary
+
+```python
+summary = (parsed.get("appearance_summary") or "").lower()
+if bag_pres == "unknown" and "bag" not in summary and "backpack" not in summary:
+    bag_pres = "no"
+if hat_pres == "unknown" and "hat" not in summary and "cap" not in summary:
+    hat_pres = "no"
+if mask_pres == "unknown" and "mask" not in summary:
+    mask_pres = "no"
+```
+
+#### Fix 4: Confidence semantics
+
+```python
+def _f(key: str) -> float | None:
+    val = float(parsed[key])
+    return val if val > 0.0 else None  # 0.0 = placeholder → None
+
+# Gender/age unknown → conf = None
+if gender_val == "unknown":
+    gender_conf = None
+if age_val == "unknown":
+    age_conf = None
+```
+
+### Tác động mong đợi
+
+| Trường | Trước | Sau |
+|--------|-------|-----|
+| `hat_presence` | `"unknown"` (khi không nhắc) | `"no"` |
+| `bag_presence` | `"unknown"` (khi không nhắc) | `"no"` |
+| `is_wearing_mask` | `"unknown"` (khi không nhắc) | `"no"` |
+| `upper_clothing_conf=0.0` | Lưu vào DB | `NULL` |
+| `gender_conf` khi unknown | `0.0` | `NULL` |
+| Hat/hair/gender | Unknown nhiều | Giảm nhờ margin + prompt |
+
+---
+
+## PHẦN 21 — VECTOR_SOCRE ĐO SAI: INTER-MEMBER COSINE THAY VÌ QUERY-VS-CANDIDATE COSINE
+
+### 21.1 — Vấn đề (trước fix)
+
+`vector_score` trong fusion formula đo **cosine similarity giữa các tracklet trong cùng group**, không phải giữa **query và candidate**:
+
+```python
+# TRƯỚC — candidates.py:504-511 (bug)
+member_scores = []
+for member in group:
+    if member.tracklet_id == rep.tracklet_id:
+        continue
+    member_emb = _tracklet_embedding(member)
+    if rep_emb and member_emb:
+        member_scores.append(_cosine_sim(rep_emb, member_emb))
+vector_score = max(member_scores) if member_scores else 0.0
+```
+
+Hệ quả:
+- **Multi-tracklet group**: vector_score luôn ≥ 0.85 (vì group được tạo bởi merge threshold ≥ 0.85) → bão hòa, không discriminative
+- **Single-tracklet group**: vector_score = 0.0 → fusion biến thành 0.7*text + 0.3*quality
+- **Query text không được encode** → SigLIP2 text tower bị bỏ phí
+
+### 21.2 — Công thức cũ
+
+```
+# multi-tracklet (len(group) > 1):
+fusion = 0.5*text + 0.3*quality + 0.2*vector  → range [~0.17, ~0.97]
+
+# single-tracklet (len(group) == 1):
+fusion = 0.7*text + 0.3*quality               → range [0, 1.0]
+```
+
+Hai-tier scoring tạo bias không nhất quán: cùng text/quality, single luôn cao hơn multi.
+
+### 21.3 — Fix đã áp dụng (2026-05-11)
+
+**Thay đổi 1 — SigLIP2 text tower cho query-service:**
+
+Viết lại `query-service/app/services/model_warmup.py`:
+- Load `google/siglip2-so400m-patch14-384` (fp16, ~3GB VRAM) vào GPU lúc startup
+- Warmup bằng 2 dummy text samples
+- Model + processor được cache trong `_MODELS` dict
+
+**Thay đổi 2 — `_build_query_embedding()` mới:**
+
+```python
+# candidates.py:370-397
+def _build_query_embedding(query_text: str) -> list[float]:
+    model = get_model("siglip2")
+    processor = get_model("siglip2_processor")
+    inputs = processor(text=[query_text], return_tensors="pt", padding=True)
+    with torch.no_grad():
+        text_emb = model.get_text_features(...)
+    vec = text_emb[0].cpu().float().numpy()
+    vec = vec / (np.linalg.norm(vec) + 1e-8)
+    return vec.tolist()  # 1152-dim — cùng không gian với siglip_embedding
+```
+
+**Thay đổi 3 — Fusion dùng query-vs-candidate cosine:**
+
+```python
+# candidates.py:621-626 (sau fix)
+vector_score = _cosine_sim(query_emb, rep_emb) if (query_emb and rep_emb) else 0.0
+fusion_score = round(
+    (0.5 * text_score) + (0.3 * quality_score) + (0.2 * vector_score), 4
+)
+```
+
+**Thay đổi 4 — Two-tier scoring → unified với merge boost:**
+
+Branch `if len(group) > 1` bị xóa. Công thức thống nhất:
+```
+fusion = 0.5*text + 0.3*quality + 0.2*vector + merge_boost
+merge_boost = 0.05 * (len(group) - 1)
+```
+Single-tracklet: 0 boost; 2 tracklets: +0.05; 3 tracklets: +0.10.
+
+### 21.4 — Tác động sau fix
+
+| Trường hợp | Trước | Sau |
+|---|---|---|
+| Query "woman in red" | vector_score luôn ≥0.85 hoặc 0.0 | Discriminative cosine vs query |
+| Single-tracklet group | fusion=0.7t+0.3q (không có vector) | 0.5t+0.3q+0.2v (có vector) |
+| Multi-tracklet group | fusion range [~0.17, ~0.97] | range [~0.17, ~1.10] |
+| SigLIP2 text tower | Bỏ phí (dead code trong trace-service) | Query-service dùng cho recall |
+
+---
+
+## PHẦN 22 — MULTI-BUG QUERY PIPELINE: PREFILTER / PAGINATION / MERGE GUARD
+
+### 22.1 — Bug tổng hợp (trước fix)
+
+|| # | Bug | Tác động |
+||---|-----|----------|
+|| 1 | Text-only prefilter: `_score_search_text > 0` loại candidate semantic đúng nhưng không match keyword (VD: "crimson top" ≠ "red shirt") | Recall thấp, query "người đang chạy" bỏ lỡ candidate đúng |
+|| 4 | INSERT all trước, paginate sau: `merged[offset:top_k]` sau khi đã INSERT toàn bộ | Mỗi request tạo query_id mới, không tái sử dụng kết quả |
+|| 5 | Merge guard: `conf=0.0` (VLM placeholder) không block conflict → "red shirt" và "blue shirt" với conf=0.0 merge được | False positive merge |
+
+### 22.2 — Fix đã áp dụng (2026-05-11)
+
+**Fix #1 — Vector-first recall + text rerank:**
+
+Thêm `_vector_recall()` mới:
+
+```python
+# candidates.py:185-243
+def _vector_recall(session, query_emb, camera_ids, time_from, time_to, recall_limit=500):
+    # Load up to recall_limit*3 rows from DB
+    # Compute cosine(query_emb, siglip_embedding) in Python
+    # Return top-N sorted by descending cosine score
+```
+
+`_local_prefilter()` viết lại:
+- **Vector-first path**: SigLIP2 encode query → cosine vs siglip_embedding → top-N → text rerank
+- **Text-only fallback**: khi SigLIP2 unavailable hoặc query_emb rỗng
+
+```python
+# candidates.py:246-270
+if query_emb:
+    shortlist = _vector_recall(...)
+    if shortlist:
+        # Text rerank on vector-recalled candidates
+        for row in shortlist:
+            st = _build_search_text(row)
+            ts = _score_search_text(st, cleaned_query, set(cleaned_query.split()))
+            # sort and return
+        return shortlist, text_score_map, True   # used_vector_recall=True
+
+# Text-only fallback path (unchanged logic)
+return shortlist, text_score_map, False
+```
+
+**Fix #4 — Paginate before INSERT:**
+
+```python
+# TRƯỚC: INSERT tất cả → rồi mới paginate
+for rank_idx, item in enumerate(merged, start=1):
+    db.execute(pg_insert(...))
+paged = merged[offset:offset + top_k]
+
+# SAU: Paginate trước → INSERT chỉ page hiện tại
+paged = merged[offset:offset + top_k]
+for rank_idx, item in enumerate(paged, start=offset + 1):
+    db.execute(pg_insert(...))
+```
+
+**Fix #5 — Merge guard: conf ≤ 0.05 → block conflict:**
+
+```python
+# candidates.py:417-420
+# VLM returns 0.0 as a literal placeholder when it didn't replace the template.
+# 0.0 is indistinguishable from "no confidence" — must not block a merge.
+if c1 <= 0.05 or c2 <= 0.05:
+    continue  # at least one side is uncertain → don't block
+```
+
+### 22.3 — Tác động sau fix
+
+| Bug | Trước | Sau |
+|-----|-------|-----|
+| #1 Recall | Text-only: keyword mismatch → candidate bị loại | Vector-first: semantic recall → text rerank |
+| #4 Pagination | INSERT all 50 candidates dù page chỉ 10 | INSERT 10 candidate trên page |
+| #5 Merge guard | conf=0.0 placeholder → false positive merge | conf≤0.05 coi như uncertain → không block |
+
+### Chưa xử lý (deferred)
+
+- **Hair style/color**: Phụ thuộc hoàn toàn vào VLM output. Có thể thêm repair rule từ summary cho hair color.

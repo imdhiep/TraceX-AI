@@ -2,9 +2,12 @@
 
 Flow:
 1. metadata-service (/api/v1/search) forwards request here
-2. Local text pre-filter → shortlist candidates (sorted by text relevance)
-3. Union-find merge: group tracklets by cosine similarity + metadata + temporal/camera guards
-4. Save QueryCandidate + QueryCandidateTracklet rows, format and return results
+2. Vector-first recall: encode query with SigLIP 2 text tower → cosine vs siglip_embedding → top-N
+   (falls back to text-only prefilter when SigLIP 2 unavailable or query_emb unavailable)
+3. Python text rerank: score each candidate's metadata text vs query tokens
+4. Union-find merge: group tracklets by SigLIP2 cosine + metadata + temporal/camera guards
+5. Fusion: 0.5*text + 0.3*quality + 0.2*vector + merge_boost
+6. Paginate → INSERT only candidates on current page → return results
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ class SearchRequest(BaseModel):
     user_id: int = 1  # injected by metadata-service from JWT; fallback=1 for direct calls
 
 from shared.database import SessionLocal
-from shared.models import QueryCandidate, QueryCandidateTracklet, QueryHistory, Tracklet, Video
+from shared.models import QueryCandidate, QueryCandidateTracklet, QueryHistory, Tracklet, TrackletAction, Video
 from app.services.translation import detect_vietnamese, translate_to_english, warmup as warmup_translation
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.orm import contains_eager, joinedload
@@ -113,11 +116,14 @@ def _parse_dt(value: str | None):
 
 
 def _build_search_text(row: Tracklet) -> str:
+    action_label = ""
+    if row.actions:
+        action_label = " ".join(a.action_label or "" for a in row.actions)
     return " ".join([
         row.appearance_summary or "",
         row.gender or "",
-        row.top_color or "",
-        row.bottom_color or "",
+        row.upper_clothing_color or "",
+        row.lower_clothing_color or "",
         row.shoes_color or "",
         row.age_range or "",
         getattr(row, "hat_color", "") or "",
@@ -125,6 +131,7 @@ def _build_search_text(row: Tracklet) -> str:
         getattr(row, "is_wearing_mask", "") or "",
         getattr(row, "hair_style", "") or "",
         getattr(row, "hair_color", "") or "",
+        action_label,
     ]).lower()
 
 
@@ -140,13 +147,21 @@ def _score_search_text(search_text: str, cleaned_query: str, query_tokens: set[s
 
 
 def _search_text_expr():
+    action_subq = (
+        select(TrackletAction.action_label)
+        .where(TrackletAction.tracklet_id == Tracklet.tracklet_id)
+        .order_by(TrackletAction.id.desc())
+        .limit(1)
+        .correlate(Tracklet)
+        .scalar_subquery()
+    )
     return func.lower(
         func.concat_ws(
             " ",
             func.coalesce(Tracklet.appearance_summary, ""),
             func.coalesce(Tracklet.gender, ""),
-            func.coalesce(Tracklet.top_color, ""),
-            func.coalesce(Tracklet.bottom_color, ""),
+            func.coalesce(Tracklet.upper_clothing_color, ""),
+            func.coalesce(Tracklet.lower_clothing_color, ""),
             func.coalesce(Tracklet.shoes_color, ""),
             func.coalesce(Tracklet.age_range, ""),
             func.coalesce(Tracklet.hat_color, ""),
@@ -154,6 +169,7 @@ def _search_text_expr():
             func.coalesce(Tracklet.is_wearing_mask, ""),
             func.coalesce(Tracklet.hair_style, ""),
             func.coalesce(Tracklet.hair_color, ""),
+            func.coalesce(action_subq, ""),
         )
     )
 
@@ -167,25 +183,109 @@ def _ilike_contains(expr, value: str):
     return expr.ilike(f"%{escaped}%", escape="\\")
 
 
-def _local_prefilter(
+def _vector_recall(
     session: Session,
-    query_text: str,
+    query_emb: list[float],
     camera_ids: list[str] | None = None,
     time_from: str | None = None,
     time_to: str | None = None,
-    limit: int = 200,
-) -> tuple[list[Tracklet], dict[str, float]]:
-    """Pre-filter tracklets using camera, time range, and text matching."""
-    cleaned_query = (query_text or "").strip().lower()
+    recall_limit: int = 500,
+) -> list[Tracklet]:
+    """Vector-first recall: top-N by SigLIP2 cosine similarity.
 
-    # Join Video so we can filter by absolute recording timestamp.
-    # Absolute tracklet time = video.recorded_at + start/end_time (seconds).
+    Returns tracklets ordered by descending vector similarity to query_emb.
+    Falls back to empty list if query_emb is unavailable.
+    """
+    if not query_emb:
+        return []
+
+    # base statement with camera/time filters
     statement = (
         select(Tracklet)
         .join(Video, Tracklet.video_id == Video.video_id)
         .options(
-            contains_eager(Tracklet.video),   # reuse joined rows — needed for _tracklet_abs_time
+            contains_eager(Tracklet.video),
             joinedload(Tracklet.embedding),
+            joinedload(Tracklet.actions),
+        )
+    )
+
+    if camera_ids:
+        cam_lower = [c.lower().strip() for c in camera_ids if c.strip()]
+        if cam_lower:
+            statement = statement.where(func.lower(Tracklet.camera_id).in_(cam_lower))
+
+    tf = _parse_dt(time_from)
+    tt = _parse_dt(time_to)
+    if tf:
+        statement = statement.where(
+            text("videos.recorded_at + (tracklets.end_time * interval '1 second') >= :tf")
+            .bindparams(tf=tf)
+        )
+    if tt:
+        statement = statement.where(
+            text("videos.recorded_at + (tracklets.start_time * interval '1 second') <= :tt")
+            .bindparams(tt=tt)
+        )
+
+    rows: list[Tracklet] = session.scalars(statement.limit(recall_limit * 3)).all()
+
+    scored: list[tuple[float, int, Tracklet]] = []
+    for row in rows:
+        emb = _tracklet_embedding(row)
+        if not emb:
+            continue
+        score = _cosine_sim(query_emb, emb)
+        scored.append((score, row.id, row))
+
+    scored.sort(key=lambda x: (-x[0], -x[1]))
+    return [row for _, _, row in scored[:recall_limit]]
+
+
+def _local_prefilter(
+    session: Session,
+    query_text: str,
+    query_emb: list[float],
+    camera_ids: list[str] | None = None,
+    time_from: str | None = None,
+    time_to: str | None = None,
+    limit: int = 200,
+) -> tuple[list[Tracklet], dict[str, float], bool]:
+    """Pre-filter tracklets.
+
+    Returns (shortlist, text_score_map, used_vector_recall).
+    used_vector_recall=True means vector-first recall was used (siglip text encoding available).
+    Falls back to text-only prefilter when query_emb is empty or SigLIP unavailable.
+    """
+    cleaned_query = (query_text or "").strip().lower()
+
+    # ── Vector-first path ─────────────────────────────────────────────────────
+    if query_emb:
+        shortlist = _vector_recall(
+            session, query_emb, camera_ids, time_from, time_to,
+            recall_limit=max(limit * 2, 400),
+        )
+        if shortlist:
+            # Text rerank: score each candidate on metadata text vs query tokens
+            text_score_map: dict[str, float] = {}
+            scored: list[tuple[float, int, Tracklet]] = []
+            for row in shortlist:
+                st = _build_search_text(row)
+                ts = _score_search_text(st, cleaned_query, set(cleaned_query.split()))
+                text_score_map[row.tracklet_id] = ts
+                scored.append((ts, row.id, row))
+            scored.sort(key=lambda x: (-x[0], -x[1]))
+            shortlist = [row for _, _, row in scored]
+            return shortlist, text_score_map, True
+
+    # ── Text-only fallback path ───────────────────────────────────────────────
+    statement = (
+        select(Tracklet)
+        .join(Video, Tracklet.video_id == Video.video_id)
+        .options(
+            contains_eager(Tracklet.video),
+            joinedload(Tracklet.embedding),
+            joinedload(Tracklet.actions),
         )
         .order_by(Tracklet.created_at.desc(), Tracklet.id.desc())
     )
@@ -198,15 +298,11 @@ def _local_prefilter(
     tf = _parse_dt(time_from)
     tt = _parse_dt(time_to)
     if tf:
-        # Tracklet still active at time_from:
-        # video.recorded_at + end_time seconds >= time_from
         statement = statement.where(
             text("videos.recorded_at + (tracklets.end_time * interval '1 second') >= :tf")
             .bindparams(tf=tf)
         )
     if tt:
-        # Tracklet started before time_to:
-        # video.recorded_at + start_time seconds <= time_to
         statement = statement.where(
             text("videos.recorded_at + (tracklets.start_time * interval '1 second') <= :tt")
             .bindparams(tt=tt)
@@ -214,7 +310,7 @@ def _local_prefilter(
 
     if not cleaned_query:
         rows = session.scalars(statement.limit(limit)).all()
-        return rows, {row.tracklet_id: 0.0 for row in rows}
+        return rows, {row.tracklet_id: 0.0 for row in rows}, False
 
     query_tokens = {token for token in cleaned_query.split() if token}
     text_expr = _search_text_expr()
@@ -232,12 +328,10 @@ def _local_prefilter(
         score = _score_search_text(search_text, cleaned_query, query_tokens)
         if score <= 0:
             continue
-
         heap_item = (score, row.id, row)
         if len(top_matches) < limit:
             heapq.heappush(top_matches, heap_item)
             continue
-
         if (score, row.id) > (top_matches[0][0], top_matches[0][1]):
             heapq.heapreplace(top_matches, heap_item)
 
@@ -245,10 +339,10 @@ def _local_prefilter(
         top_matches.sort(key=lambda item: (-item[0], -item[1]))
         shortlist = [row for _, _, row in top_matches]
         score_map = {row.tracklet_id: score for score, _, row in top_matches}
-        return shortlist, score_map
+        return shortlist, score_map, False
 
     rows = session.scalars(statement.limit(limit)).all()
-    return rows, {row.tracklet_id: 0.0 for row in rows}
+    return rows, {row.tracklet_id: 0.0 for row in rows}, False
 
 
 
@@ -272,9 +366,6 @@ _CONF_THRESHOLDS: dict[str, float] = {
     "shoes_color":          0.82,
     "hat_color":            0.82,
     "hair_color":           0.82,
-    # backward compat (old SigLIP columns)
-    "top_color":            0.82,
-    "bottom_color":         0.82,
 }
 
 # "none" is a meaningful value (model confirmed absence) for these fields
@@ -312,9 +403,6 @@ def _metadata_matches(t1: Tracklet, t2: Tracklet) -> bool:
         ("shoes_color",          "shoes_conf"),
         ("hat_color",            "hat_conf"),
         ("hair_color",           "hair_conf"),
-        # backward compat (old SigLIP columns, populated for existing rows)
-        ("top_color",            "top_color_conf"),
-        ("bottom_color",         "bottom_color_conf"),
         ("age_range",            "age_range_conf"),
         # NOTE: upper_clothing_type, lower_clothing_type, *_desc intentionally
         # excluded — free-text from VLM; "blazer" ≠ "suit jacket" in string
@@ -327,12 +415,29 @@ def _metadata_matches(t1: Tracklet, t2: Tracklet) -> bool:
             continue  # one side unknown → not a conflict
         if v1 == v2:
             continue
-        # Values differ → check confidence; missing conf → treat as uncertain
+        # Values differ → check confidence; missing conf → treat as uncertain.
+        # VLM often returns 0.0 as a literal placeholder when it didn't replace the
+        # template value — 0.0 is indistinguishable from "no confidence" and must not
+        # block a merge. Threshold is raised only when VLM clearly replaced the value.
         c1 = getattr(t1, conf_field, None) or 0.0
         c2 = getattr(t2, conf_field, None) or 0.0
+        if c1 <= 0.05 or c2 <= 0.05:
+            continue  # at least one side is uncertain → don't block
         threshold = _CONF_THRESHOLDS.get(attr, _CONF_THRESHOLD)
         if c1 >= threshold and c2 >= threshold:
             return False  # both sides confident about conflicting values
+
+    # Action conflict check — VideoMAE labels
+    if t1.actions and t2.actions:
+        a1 = t1.actions[0].action_label
+        a2 = t2.actions[0].action_label
+        if a1 and a2 and a1 != a2:
+            conf1 = t1.actions[0].confidence or 0.0
+            conf2 = t2.actions[0].confidence or 0.0
+            action_threshold = 0.80
+            if conf1 >= action_threshold and conf2 >= action_threshold:
+                return False  # both sides confident about different actions
+
     return True
 
 
@@ -347,16 +452,46 @@ def _cosine_sim(a: list[float], b: list[float]) -> float:
     return dot / (na * nb)
 
 
-def _tracklet_embedding(t: Tracklet) -> list[float]:
-    """SigLIP2 embedding preferred; fallback to DINOv2."""
-    if not t.embedding:
+def _build_query_embedding(query_text: str) -> list[float]:
+    """
+    Encode query text into a SigLIP 2 text embedding (1152-dim, same space as siglip_embedding).
+
+    Falls back to empty list when SigLIP 2 is unavailable (no GPU / model load failed).
+    """
+    if not query_text:
         return []
-    if t.embedding.siglip_embedding is not None:
-        try:
-            return list(t.embedding.siglip_embedding)
-        except Exception:
-            pass
-    return list(t.embedding.embedding_vector or [])
+
+    try:
+        import numpy as np
+        import torch
+        from ..services.model_warmup import get_model
+
+        model = get_model("siglip2")
+        processor = get_model("siglip2_processor")
+        if model is None or processor is None:
+            return []
+
+        device = next(model.parameters()).device
+        inputs = processor(text=[query_text], return_tensors="pt", padding=True)
+        inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
+        with torch.no_grad():
+            text_emb = model.get_text_features(**{k: v for k, v in inputs.items()
+                                                  if k in ["input_ids", "attention_mask"]})
+        vec = text_emb[0].cpu().float().numpy()
+        vec = vec / (np.linalg.norm(vec) + 1e-8)
+        return vec.tolist()  # 1152-dim — matches siglip_embedding
+    except Exception:
+        return []
+
+
+def _tracklet_embedding(t: Tracklet) -> list[float]:
+    """Return SigLIP2 embedding for cosine similarity; empty list if unavailable."""
+    if not t.embedding or t.embedding.siglip_embedding is None:
+        return []
+    try:
+        return list(t.embedding.siglip_embedding)
+    except Exception:
+        return []
 
 
 def _tracklet_abs_window(t: Tracklet) -> tuple[float, float]:
@@ -458,9 +593,12 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
         db.add(qh)
         db.flush()  # FK constraint: query_candidates.query_id → query_history.query_id
 
-        # Local pre-filter
-        shortlist, text_score_map = _local_prefilter(
-            db, search_query, camera_ids, time_from, time_to, limit=200
+        # Encode query once using SigLIP 2 text tower (same embedding space as siglip_embedding)
+        query_emb = _build_query_embedding(search_query)
+
+        # Local pre-filter (vector-first when SigLIP 2 available, text-only fallback)
+        shortlist, text_score_map, _used_vector = _local_prefilter(
+            db, search_query, query_emb, camera_ids, time_from, time_to, limit=200
         )
 
         if not shortlist:
@@ -469,11 +607,10 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
             db.commit()
             return {"results": [], "query_id": qid}
 
-        # shortlist is already sorted by text relevance from _local_prefilter
-        # Merge tracklets that belong to the same person identity
+        # Union-find merge: group tracklets belonging to the same person identity
         groups = _merge_by_similarity(shortlist)
 
-        # Build candidates first, then persist in final ranked order.
+        # Build candidates, compute fusion scores
         merged: list[dict] = []
         for group in groups:
             rep = group[0]
@@ -481,19 +618,13 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
             rep_emb = _tracklet_embedding(rep)
             text_score = float(text_score_map.get(rep.tracklet_id, 0.0))
             quality_score = float(rep.quality_score or 0.0)
-            vector_score: float | None = None
-            if len(group) > 1:
-                member_scores = []
-                for member in group:
-                    if member.tracklet_id == rep.tracklet_id:
-                        continue
-                    member_emb = _tracklet_embedding(member)
-                    if rep_emb and member_emb:
-                        member_scores.append(_cosine_sim(rep_emb, member_emb))
-                vector_score = max(member_scores) if member_scores else 0.0
-                fusion_score = round((0.5 * text_score) + (0.3 * quality_score) + (0.2 * vector_score), 4)
-            else:
-                fusion_score = round((0.7 * text_score) + (0.3 * quality_score), 4)
+            # vector_score: cosine between query text embedding and candidate appearance embedding
+            vector_score = _cosine_sim(query_emb, rep_emb) if (query_emb and rep_emb) else 0.0
+            # merge_boost: multi-tracklet group signals cross-camera/cross-time identity evidence
+            merge_boost = round(0.05 * (len(group) - 1), 4) if len(group) > 1 else 0.0
+            fusion_score = round(
+                (0.5 * text_score) + (0.3 * quality_score) + (0.2 * vector_score) + merge_boost, 4
+            )
 
             member_links = []
             for member in group:
@@ -518,12 +649,16 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                 "fusion_score": fusion_score,
                 "text_score": text_score,
                 "vector_score": vector_score,
+                "merge_boost": merge_boost,
                 "member_links": member_links,
             })
 
         merged.sort(key=lambda item: (-item["fusion_score"], -item["rep"].id))
 
-        for rank_idx, item in enumerate(merged, start=1):
+        # Paginate BEFORE INSERT — only persist candidates on the current page
+        paged = merged[offset:offset + top_k]
+
+        for rank_idx, item in enumerate(paged, start=offset + 1):
             rep = item["rep"]
             candidate_id = item["candidate_id"]
             db.execute(pg_insert(QueryCandidate).values(
@@ -536,8 +671,6 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                 primary_camera_id=rep.camera_id or "",
                 appearance_summary=rep.appearance_summary or "",
                 gender=rep.gender or "unknown",
-                top_color=rep.top_color or "unknown",
-                bottom_color=rep.bottom_color or "unknown",
             ).on_conflict_do_nothing(index_elements=["candidate_id"]))
 
             for link in item["member_links"]:
@@ -548,7 +681,6 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                     match_type="vector",
                 ).on_conflict_do_nothing(index_elements=["candidate_id", "tracklet_id"]))
 
-        paged = merged[offset:offset + top_k]
         qh.status = "candidates_found"
         qh.result_count = len(paged)
         db.commit()

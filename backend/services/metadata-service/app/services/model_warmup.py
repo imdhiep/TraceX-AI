@@ -1,18 +1,18 @@
-"""GPU model warmup for metadata-service — SOTA 2026 AI pipeline.
+"""GPU model warmup for metadata-service.
 
 Loads all models into VRAM once at startup via FastAPI lifespan.
 VRAM budget (metadata-service, A100 80GB):
   - RT-DETR R50 (person detection):                    ~3GB fp16
-  - DINOv2 ViT-L/14 (appearance embedding, 1024-dim):  ~5GB fp16
-  - SigLIP 2-So400m (image encoder for text search):   ~3GB fp16
-  - VideoMAE V2 (action recognition):                  ~3GB fp16
-  - Qwen2-VL-7B-Instruct (open-vocabulary metadata):  ~14GB fp16
+  - SigLIP 2-So400m (appearance embedding + text search): ~3GB fp16
+  - VideoMAE V2 (action recognition):                ~3GB fp16
+  - Qwen2-VL-7B-Instruct (open-vocabulary metadata): ~14GB fp16
   Runtime overhead (KV cache, activations):            ~3GB
-  Total metadata-service:                              ~31GB / 80GB
+  Total metadata-service:                            ~26GB / 80GB
 
 Pre-download models: python scripts/download_models.py --models qwen2vl siglip2 videomae
 
-Forbidden: YOLO (any version), ByteTrack, Grounding DINO (replaced by RT-DETR).
+Models: RT-DETR, SigLIP 2, VideoMAE V2, Qwen2-VL-7B.
+Forbidden: YOLO, ByteTrack, Grounding DINO, DINOv2 (replaced by SigLIP 2).
 """
 
 from __future__ import annotations
@@ -50,28 +50,24 @@ def get_device() -> torch.device:
 
 
 async def warmup_models() -> None:
-    """Load all SOTA 2026 models into GPU memory. Called once at FastAPI lifespan startup."""
+    """Load all models into GPU memory. Called once at FastAPI lifespan startup."""
     global _warmup_done, _warmup_error
 
     if _warmup_done:
         logger.info("GPU models already loaded")
         return
 
-    logger.info("=== metadata-service SOTA 2026 warmup starting ===")
+    logger.info("=== metadata-service warmup starting ===")
     device = get_device()
 
     if device.type == "cuda":
-        # A100 Tensor Cores support TF32 — free ~10 % matmul speedup
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32       = True
-        # cuDNN picks the fastest kernel for each fixed input shape
         torch.backends.cudnn.benchmark        = True
-        # Prefer TF32 over FP32 for internal matmul precision
         torch.set_float32_matmul_precision("high")
         logger.info("A100 flags: TF32=on  cuDNN.benchmark=on  matmul_precision=high")
 
     _load_rtdetr(device)
-    _load_dinov2(device)
     _load_siglip2(device)
     _load_videomae_v2(device)
     _load_qwen2vl(device)
@@ -88,43 +84,8 @@ async def warmup_models() -> None:
         logger.info("=== Warmup complete (CPU) ===")
 
 
-def _load_dinov2(device: torch.device) -> None:
-    """Load DINOv2 ViT-L/14 for 1024-dim appearance embeddings."""
-    logger.info("Loading DINOv2 ViT-L/14...")
-    try:
-        from transformers import AutoImageProcessor, AutoModel
-        import numpy as np
-        from PIL import Image
-
-        torch_dtype = torch.float16 if device.type == "cuda" else torch.float32
-        model_id = "facebook/dinov2-large"
-        processor = AutoImageProcessor.from_pretrained(model_id)
-        model = AutoModel.from_pretrained(model_id, torch_dtype=torch_dtype)
-        model = model.to(device)
-        model.eval()
-
-        dummy = Image.fromarray(np.zeros((224, 224, 3), dtype=np.uint8))
-        inputs = processor(images=[dummy], return_tensors="pt")
-        inputs = {
-            k: v.to(device=device, dtype=torch_dtype) if v.is_floating_point() else v.to(device)
-            for k, v in inputs.items()
-        }
-        with torch.no_grad():
-            feat = model(**inputs).pooler_output  # [1, 1024]
-        logger.info("  DINOv2 output dim: %d", feat.shape[-1])
-        assert feat.shape[-1] == 1024, f"Expected 1024-dim, got {feat.shape[-1]}"
-
-        _MODELS["dinov2"] = model
-        _MODELS["dinov2_processor"] = processor
-        logger.info("  DINOv2 ViT-L/14 loaded OK")
-
-    except Exception as exc:
-        logger.warning("DINOv2 load failed (non-fatal): %s", exc)
-
-
-
 def _load_siglip2(device: torch.device) -> None:
-    """Load SigLIP 2-So400m image encoder for text-image search embeddings (1152-dim)."""
+    """Load SigLIP 2-So400m image encoder for appearance embeddings + text-image search (1152-dim)."""
     logger.info("Loading SigLIP 2-So400m...")
     try:
         from transformers import AutoProcessor, AutoModel
@@ -144,11 +105,10 @@ def _load_siglip2(device: torch.device) -> None:
 
         import numpy as np
         from PIL import Image
-        siglip_dtype = torch.float16 if device.type == "cuda" else torch.float32
         dummy_img = Image.fromarray(np.zeros((384, 384, 3), dtype=np.uint8))
         labels = ["person in red shirt", "person in blue jeans"]
         inputs = processor(text=labels, images=dummy_img, return_tensors="pt", padding=True)
-        inputs = {k: v.to(device=device, dtype=siglip_dtype) if v.is_floating_point() else v.to(device) for k, v in inputs.items()}
+        inputs = {k: v.to(device=device, dtype=siglip_torch_dtype) if v.is_floating_point() else v.to(device) for k, v in inputs.items()}
         with torch.no_grad():
             _ = model(**inputs)
 

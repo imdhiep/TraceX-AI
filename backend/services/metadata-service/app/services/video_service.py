@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
 from ..config import settings
-from shared.models import Video, VideoQuery, User
+from shared.models import Video, QueryHistory, User
 
 if TYPE_CHECKING:
     from shared.models import User
@@ -35,7 +35,7 @@ def video_to_payload(video: Video) -> dict:
     }
 
 
-def query_to_payload(query: VideoQuery) -> dict:
+def query_to_payload(query: QueryHistory) -> dict:
     return {
         "query_id": query.query_id,
         "video_id": query.video.video_id,
@@ -99,8 +99,8 @@ def get_video_by_public_id(session: Session, user: "User", video_id: str) -> Vid
     )
 
 
-def create_video_query(session: Session, user: "User", video: Video, query_text: str) -> VideoQuery:
-    query = VideoQuery(
+def create_video_query(session: Session, user: "User", video: Video, query_text: str) -> QueryHistory:
+    query = QueryHistory(
         user_id=user.id,
         video_id=video.video_id,
         query_text=query_text.strip(),
@@ -110,34 +110,34 @@ def create_video_query(session: Session, user: "User", video: Video, query_text:
     session.commit()
     session.refresh(query)
     return session.scalar(
-        select(VideoQuery).options(joinedload(VideoQuery.video)).where(VideoQuery.id == query.id)
+        select(QueryHistory).options(joinedload(QueryHistory.video)).where(QueryHistory.id == query.id)
     )
 
 
 def list_video_queries(session: Session, user: "User") -> list[dict]:
     statement = (
-        select(VideoQuery)
-        .options(joinedload(VideoQuery.video))
-        .where(VideoQuery.user_id == user.id)
-        .order_by(VideoQuery.updated_at.desc(), VideoQuery.id.desc())
+        select(QueryHistory)
+        .options(joinedload(QueryHistory.video))
+        .where(QueryHistory.user_id == user.id)
+        .order_by(QueryHistory.updated_at.desc(), QueryHistory.id.desc())
     )
     return [query_to_payload(query) for query in session.scalars(statement).all()]
 
 
-def get_video_query(session: Session, user: "User", query_id: str) -> VideoQuery | None:
+def get_video_query(session: Session, user: "User", query_id: str) -> QueryHistory | None:
     return session.scalar(
-        select(VideoQuery)
-        .options(joinedload(VideoQuery.video))
-        .where(VideoQuery.query_id == query_id, VideoQuery.user_id == user.id)
+        select(QueryHistory)
+        .options(joinedload(QueryHistory.video))
+        .where(QueryHistory.query_id == query_id, QueryHistory.user_id == user.id)
     )
 
 
 def update_video_query(
     session: Session,
-    query: VideoQuery,
+    query: QueryHistory,
     status: str | None = None,
     ai_job_id: str | None = None,
-) -> VideoQuery:
+) -> QueryHistory:
     if status is not None:
         query.status = status
     if ai_job_id is not None:
@@ -145,4 +145,4 @@ def update_video_query(
     session.add(query)
     session.commit()
     session.refresh(query)
-    return session.scalar(select(VideoQuery).options(joinedload(VideoQuery.video)).where(VideoQuery.id == query.id))
+    return session.scalar(select(QueryHistory).options(joinedload(QueryHistory.video)).where(QueryHistory.id == query.id))

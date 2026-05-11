@@ -211,7 +211,7 @@ def _save_candidates_from_batch(
     Writes to:
       - QueryHistory  : one record per batch (query_id links all candidates)
       - Tracklet      : one row per unified person (all cameras combined)
-      - TrackletEmbedding : DINOv2 1024-dim + SigLIP2 1152-dim vectors per tracklet
+      - TrackletEmbedding : SigLIP2 1152-dim vectors per tracklet
       - TrackletAction    : VideoMAE action classification per tracklet
     """
     from shared.models import QueryHistory, Tracklet, TrackletEmbedding, TrackletAction
@@ -246,12 +246,10 @@ def _save_candidates_from_batch(
         gender = str(tracklet.get("gender") or "unknown")
         upper_color = str(
             tracklet.get("upper_clothing_color")
-            or tracklet.get("top_color")
             or "unknown"
         )
         lower_color = str(
             tracklet.get("lower_clothing_color")
-            or tracklet.get("bottom_color")
             or "unknown"
         )
         shoes_color = str(tracklet.get("shoes_color") or "unknown")

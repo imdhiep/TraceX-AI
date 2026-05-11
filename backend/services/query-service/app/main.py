@@ -3,8 +3,8 @@
 Responsibilities:
 - Search candidates with hybrid ranking (text + vector)
 - SeamlessM4T v2-large (Vietnamese ↔ English translation)
-- Forward GPU re-ranking to trace-service (SigLIP 2 text tower)
-- Forward shortlist to trace-service for EVA-02 cosine re-ranking
+- SigLIP 2-So400m text tower: encode query text → 1152-dim embedding → cosine vs stored siglip_embedding
+- Union-find identity merge (SigLIP2 cosine + metadata + temporal/camera guards)
 """
 
 from contextlib import asynccontextmanager
@@ -23,7 +23,15 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Query service starting — SeamlessM4T v2-large warmup...")
+    logger.info("Query service starting — GPU model warmup...")
+
+    # SigLIP 2 text tower (text→embedding encoding)
+    try:
+        from .services.model_warmup import warmup_models
+        await warmup_models()
+        logger.info("SigLIP 2 text tower ready")
+    except Exception as exc:
+        logger.warning("SigLIP 2 warmup skipped (non-fatal): %s", exc)
 
     # SeamlessM4T v2-large translation model
     try:
@@ -101,7 +109,7 @@ def root():
     return {
         "service": "query-service",
         "version": "2.0.0",
-        "description": "Candidate search + SeamlessM4T v2 translation + GPU re-ranking",
+        "description": "Candidate search + SeamlessM4T v2 translation + SigLIP 2 text-image search",
         "translation_model": "SeamlessM4T v2-large",
-        "ranking_service": "trace-service (SigLIP 2 text tower + EVA-02 cosine)",
+        "ranking_model": "SigLIP 2-So400m text tower (query→1152-dim) vs stored siglip_embedding",
     }

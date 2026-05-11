@@ -223,7 +223,7 @@ def _process_video_stream(drive_file_id: str, filename: str, video_id: str, came
         from ..api.routers.video_process import _process_video_sync
         result = _process_video_sync(
             str(tmp_path), video_id, camera_id,
-            sample_interval=15, bev_max_dist=1.5,
+            sample_interval=15,
         )
 
         tracklets = [t.model_dump() if hasattr(t, "model_dump") else t for t in (result.tracklets or [])]
@@ -333,9 +333,6 @@ def _save_tracklets_from_gpu_result(
             occlusion_score=float(t.get("occlusion_score") or 0.0),
             gender=str(t.get("gender") or "unknown"),
             age_range=str(t.get("age_range") or "unknown"),
-            # backward compat — populated from VLM upper/lower clothing color
-            top_color=str(t.get("top_color") or t.get("upper_clothing_color") or "unknown"),
-            bottom_color=str(t.get("bottom_color") or t.get("lower_clothing_color") or "unknown"),
             shoes_color=str(t.get("shoes_color") or "unknown"),
             hat_color=str(t.get("hat_color") or "unknown"),
             bag_type=str(t.get("bag_type") or "unknown"),
@@ -361,15 +358,11 @@ def _save_tracklets_from_gpu_result(
             hat_presence=t.get("hat_presence"),
             hat_type=t.get("hat_type"),
             hat_conf=_opt_float(t.get("hat_conf")),
-            bev_x=float(t.get("bev_x") or 0.0),
-            bev_y=float(t.get("bev_y") or 0.0),
             crop_url=str(t.get("crop_url") or ""),
             representative_bbox=t.get("representative_bbox") or [],
             contributing_cameras=t.get("contributing_cameras") or [],
             contributing_video_ids=t.get("contributing_video_ids") or [],
             gender_conf=_opt_float(t.get("gender_conf")),
-            top_color_conf=_opt_float(t.get("top_color_conf") or t.get("upper_clothing_conf")),
-            bottom_color_conf=_opt_float(t.get("bottom_color_conf") or t.get("lower_clothing_conf")),
             shoes_conf=_opt_float(t.get("shoes_conf")),
             accessory_conf=_opt_float(t.get("accessory_conf")),
             age_range_conf=_opt_float(t.get("age_range_conf")),
@@ -381,16 +374,13 @@ def _save_tracklets_from_gpu_result(
         )
         session.add(tracklet)
 
-        # Embedding (DINOv2 1024-dim + SigLIP2 1152-dim)
-        embedding_vec = t.get("embedding_vector") or []
+        # Embedding (SigLIP2 1152-dim)
         siglip_vec = t.get("siglip_embedding") or []
-        if embedding_vec or siglip_vec:
+        if siglip_vec:
             session.add(TrackletEmbedding(
                 tracklet_id=tracklet_id,
-                embedding_vector=embedding_vec or [],   # DINOv2 JSON fallback
-                embedding=embedding_vec or None,        # DINOv2 vector(1024)
-                siglip_embedding=siglip_vec or None,    # SigLIP2 vector(1152)
-                model_version="dinov2_vitl14+siglip2",
+                siglip_embedding=siglip_vec,
+                model_version="siglip2",
             ))
 
         # Action (VideoMAE V2)
