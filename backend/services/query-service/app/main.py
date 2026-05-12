@@ -71,6 +71,46 @@ def health_check():
     return {"status": "healthy", "service": "query-service", "version": "2.0.0"}
 
 
+# ── Runtime log-level toggle ──────────────────────────────────────────────
+# Lets operators flip the candidates router between INFO and DEBUG without
+# restarting the container. DEBUG enables the heavy per-tracklet payloads
+# (prefilter_top_N, vector_top_N, merged_group_preview, top_detail) that
+# are otherwise gated by isEnabledFor(DEBUG) in candidates.py.
+#
+#   curl -X POST http://<host>:8003/debug/log-level/DEBUG
+#   curl -X POST http://<host>:8003/debug/log-level/INFO
+#
+# Scope is limited to the search router so other loggers (uvicorn, sqlalchemy)
+# stay at their current level — DEBUG on those is overwhelming.
+_TOGGLEABLE_LOGGERS = ("app.api.routers.candidates",)
+_VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+
+
+@app.post("/debug/log-level/{level}")
+def set_log_level(level: str):
+    level_upper = level.upper()
+    if level_upper not in _VALID_LOG_LEVELS:
+        return {
+            "error": f"invalid level {level!r}",
+            "valid": sorted(_VALID_LOG_LEVELS),
+        }
+    numeric = getattr(logging, level_upper)
+    applied = []
+    for name in _TOGGLEABLE_LOGGERS:
+        logging.getLogger(name).setLevel(numeric)
+        applied.append(name)
+    logger.warning("Log level toggled to %s for: %s", level_upper, applied)
+    return {"level": level_upper, "loggers": applied}
+
+
+@app.get("/debug/log-level")
+def get_log_level():
+    return {
+        name: logging.getLevelName(logging.getLogger(name).getEffectiveLevel())
+        for name in _TOGGLEABLE_LOGGERS
+    }
+
+
 @app.post("/api/v1/overview")
 @app.get("/api/v1/overview")
 def overview():
