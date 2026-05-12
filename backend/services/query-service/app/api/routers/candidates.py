@@ -35,8 +35,19 @@ class SearchRequest(BaseModel):
     user_id: int = 1  # injected by metadata-service from JWT; fallback=1 for direct calls
 
 from shared.database import SessionLocal
-from shared.models import QueryCandidate, QueryCandidateTracklet, QueryHistory, Tracklet, Video
+from shared.models import (
+    QueryCandidate, QueryCandidateTracklet, QueryHistory,
+    Tracklet, TrackletAction, Video,
+)
 from app.services.translation import detect_vietnamese, translate_to_english, warmup as warmup_translation
+from app.services.query_metadata_parse import (
+    parse_query_metadata,
+    ParsedQueryMetadata,
+    ACTION_CONFIDENCE_FLOOR,
+    ACTION_BONUS_SCORE,
+    METADATA_BONUS_PER_MATCH,
+    METADATA_MAX_BONUS,
+)
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.orm import contains_eager, joinedload
 import re
@@ -116,15 +127,15 @@ def _build_search_text(row: Tracklet) -> str:
     return " ".join([
         row.appearance_summary or "",
         row.gender or "",
-        row.top_color or "",
-        row.bottom_color or "",
+        row.upper_color or "",
+        row.lower_color or "",
         row.shoes_color or "",
         row.age_range or "",
-        getattr(row, "hat_color", "") or "",
-        getattr(row, "bag_type", "") or "",
-        getattr(row, "is_wearing_mask", "") or "",
-        getattr(row, "hair_style", "") or "",
-        getattr(row, "hair_color", "") or "",
+        row.hat_color or "",
+        row.bag_type or "",
+        row.mask_presence or "",
+        row.hair_style or "",
+        row.hair_color or "",
     ]).lower()
 
 
@@ -145,13 +156,13 @@ def _search_text_expr():
             " ",
             func.coalesce(Tracklet.appearance_summary, ""),
             func.coalesce(Tracklet.gender, ""),
-            func.coalesce(Tracklet.top_color, ""),
-            func.coalesce(Tracklet.bottom_color, ""),
+            func.coalesce(Tracklet.upper_color, ""),
+            func.coalesce(Tracklet.lower_color, ""),
             func.coalesce(Tracklet.shoes_color, ""),
             func.coalesce(Tracklet.age_range, ""),
             func.coalesce(Tracklet.hat_color, ""),
             func.coalesce(Tracklet.bag_type, ""),
-            func.coalesce(Tracklet.is_wearing_mask, ""),
+            func.coalesce(Tracklet.mask_presence, ""),
             func.coalesce(Tracklet.hair_style, ""),
             func.coalesce(Tracklet.hair_color, ""),
         )
@@ -167,6 +178,15 @@ def _ilike_contains(expr, value: str):
     return expr.ilike(f"%{escaped}%", escape="\\")
 
 
+# Gender hard-filter — applied at prefilter stage so a query for "woman" can
+# never surface male tracklets (and vice-versa). The keyword vocabulary lives
+# in backend/config/query_metadata_vocab.json and is parsed by
+# query_metadata_parse.parse_query_metadata(); we only keep the confidence
+# floor here because it's a prefilter-stage policy, not a vocabulary concern.
+# Kept in sync with _CONF_THRESHOLDS["gender"] in the merge logic below.
+_GENDER_FILTER_CONF_FLOOR = 0.55
+
+
 def _local_prefilter(
     session: Session,
     query_text: str,
@@ -174,8 +194,15 @@ def _local_prefilter(
     time_from: str | None = None,
     time_to: str | None = None,
     limit: int = 200,
+    parsed: ParsedQueryMetadata | None = None,
 ) -> tuple[list[Tracklet], dict[str, float]]:
-    """Pre-filter tracklets using camera, time range, and text matching."""
+    """Pre-filter tracklets using camera, time range, and text matching.
+
+    `parsed` is the structured-metadata view of `query_text` produced once by
+    the caller (search_candidates). When supplied, gender → hard filter at the
+    SQL layer. Other parsed fields are applied as bonuses downstream, not as
+    filters, so VLM mis-labels can't silently drop valid matches.
+    """
     cleaned_query = (query_text or "").strip().lower()
 
     # Join Video so we can filter by absolute recording timestamp.
@@ -210,6 +237,20 @@ def _local_prefilter(
         statement = statement.where(
             text("videos.recorded_at + (tracklets.start_time * interval '1 second') <= :tt")
             .bindparams(tt=tt)
+        )
+
+    # Gender hard-filter — only when the query explicitly mentions one gender.
+    # Tracklets with low gender_conf (uncertain VLM output) are kept to avoid
+    # silently dropping valid matches.
+    query_gender = parsed.gender[0] if (parsed and parsed.gender) else None
+    if query_gender is not None:
+        statement = statement.where(
+            or_(
+                func.lower(Tracklet.gender) == query_gender,
+                Tracklet.gender_conf < _GENDER_FILTER_CONF_FLOOR,
+                Tracklet.gender_conf.is_(None),
+                Tracklet.gender.is_(None),
+            )
         )
 
     if not cleaned_query:
@@ -247,8 +288,11 @@ def _local_prefilter(
         score_map = {row.tracklet_id: score for score, _, row in top_matches}
         return shortlist, score_map
 
-    rows = session.scalars(statement.limit(limit)).all()
-    return rows, {row.tracklet_id: 0.0 for row in rows}
+    # No tracklet matched the query text. Returning "latest N rows" here would
+    # silently flood the SigLIP re-rank stage with unrelated tracklets and
+    # produce arbitrary-looking top-k — return empty so the caller surfaces
+    # "no results" honestly.
+    return [], {}
 
 
 
@@ -259,26 +303,25 @@ _MERGE_MAX_GAP_S = 86400.0   # max 24-hour gap — matches trace window
 _CONF_THRESHOLD = 0.70        # fallback: below this = uncertain → don't block merge
 
 # Per-attribute confidence thresholds: both sides must exceed to block merge.
-# Free-text fields (upper_clothing_type, *_desc) are NOT in this list — exact
-# string match would incorrectly treat "blazer" vs "suit jacket" as a conflict.
+# These are calibrated for LOGIT-DERIVED confidences (geometric mean of token
+# probabilities under Qwen2-VL), not self-reported numbers. Logit confs are
+# generally lower than self-report — categorical short values like "man"/"woman"
+# typically sit around 0.5–0.9; long free-text spans drift lower.
 _CONF_THRESHOLDS: dict[str, float] = {
-    "gender":               0.70,
-    "is_wearing_mask":      0.70,
-    "bag_presence":         0.75,
-    "hat_presence":         0.75,
-    "age_range":            0.75,
-    "upper_clothing_color": 0.82,
-    "lower_clothing_color": 0.82,
-    "shoes_color":          0.82,
-    "hat_color":            0.82,
-    "hair_color":           0.82,
-    # backward compat (old SigLIP columns)
-    "top_color":            0.82,
-    "bottom_color":         0.82,
+    "gender":         0.55,
+    "mask_presence":  0.55,
+    "bag_presence":   0.60,
+    "hat_presence":   0.60,
+    "age_range":      0.50,
+    "upper_color":    0.55,
+    "lower_color":    0.55,
+    "shoes_color":    0.55,
+    "hat_color":      0.55,
+    "hair_color":     0.55,
 }
 
 # "none" is a meaningful value (model confirmed absence) for these fields
-_NONE_IS_VALID = frozenset({"hat_color", "bag_type", "is_wearing_mask"})
+_NONE_IS_VALID = frozenset({"hat_color", "bag_type", "mask_presence"})
 _UNKNOWN_VALUES = frozenset({"", "unknown", "null", "n/a", "not sure"})
 
 
@@ -289,45 +332,42 @@ def _norm_meta(attr: str, value: object) -> str | None:
     s = str(value).strip().lower()
     if s in _UNKNOWN_VALUES:
         return None
-    # "none" only counts as a real value for fields that explicitly track absence
     if s == "none" and attr not in _NONE_IS_VALID:
         return None
     return s
 
 
 def _metadata_matches(t1: Tracklet, t2: Tracklet) -> bool:
-    """Return False only when both tracklets have conflicting attribute values with sufficient confidence.
+    """Return False only when both tracklets have conflicting attribute values
+    with sufficient confidence.
 
     Missing confidence (None) is treated as 0.0 (uncertain) — does not block merge.
+    Confidence values are logit-derived (geometric mean of token P), so the
+    thresholds here are intentionally lower than the legacy self-report regime.
     """
     checks = [
         # binary / presence fields — most reliable conflict signal
-        ("gender",               "gender_conf"),
-        ("is_wearing_mask",      "mask_conf"),
-        ("bag_presence",         "bag_conf"),
-        ("hat_presence",         "hat_conf"),
-        # color fields — VLM self-reported confidence
-        ("upper_clothing_color", "upper_clothing_conf"),
-        ("lower_clothing_color", "lower_clothing_conf"),
-        ("shoes_color",          "shoes_conf"),
-        ("hat_color",            "hat_conf"),
-        ("hair_color",           "hair_conf"),
-        # backward compat (old SigLIP columns, populated for existing rows)
-        ("top_color",            "top_color_conf"),
-        ("bottom_color",         "bottom_color_conf"),
-        ("age_range",            "age_range_conf"),
-        # NOTE: upper_clothing_type, lower_clothing_type, *_desc intentionally
-        # excluded — free-text from VLM; "blazer" ≠ "suit jacket" in string
-        # comparison but may refer to the same garment.
+        ("gender",        "gender_conf"),
+        ("mask_presence", "mask_conf"),
+        ("bag_presence",  "bag_conf"),
+        ("hat_presence",  "hat_conf"),
+        # categorical / color fields
+        ("upper_color",   "upper_conf"),
+        ("lower_color",   "lower_conf"),
+        ("shoes_color",   "shoes_conf"),
+        ("hat_color",     "hat_conf"),
+        ("hair_color",    "hair_color_conf"),
+        ("age_range",     "age_range_conf"),
+        # NOTE: upper_type, lower_type, *_desc intentionally excluded — free-text
+        # from VLM; "blazer" ≠ "suit jacket" in string comparison.
     ]
     for attr, conf_field in checks:
         v1 = _norm_meta(attr, getattr(t1, attr, None))
         v2 = _norm_meta(attr, getattr(t2, attr, None))
         if v1 is None or v2 is None:
-            continue  # one side unknown → not a conflict
+            continue
         if v1 == v2:
             continue
-        # Values differ → check confidence; missing conf → treat as uncertain
         c1 = getattr(t1, conf_field, None) or 0.0
         c2 = getattr(t2, conf_field, None) or 0.0
         threshold = _CONF_THRESHOLDS.get(attr, _CONF_THRESHOLD)
@@ -347,16 +387,100 @@ def _cosine_sim(a: list[float], b: list[float]) -> float:
     return dot / (na * nb)
 
 
-def _tracklet_embedding(t: Tracklet) -> list[float]:
-    """SigLIP2 embedding preferred; fallback to DINOv2."""
-    if not t.embedding:
+# ── SigLIP query encoder ──────────────────────────────────────────────────────
+# Encodes text / image queries into the same 1152-dim space as
+# tracklets_embeddings.siglip_embedding. Vectors are L2-normalized so cosine =
+# dot product.
+
+
+def _encode_query_text_siglip(text_query: str) -> list[float]:
+    """Run the SigLIP text tower on `text_query`. Returns an L2-normalized list
+    of length 1152, or [] when the model isn't loaded / encoding fails."""
+    if not text_query or not text_query.strip():
         return []
-    if t.embedding.siglip_embedding is not None:
-        try:
-            return list(t.embedding.siglip_embedding)
-        except Exception:
-            pass
-    return list(t.embedding.embedding_vector or [])
+    try:
+        from app.services.model_warmup import get_model, get_device
+    except Exception:
+        return []
+    model = get_model("siglip2")
+    processor = get_model("siglip2_processor")
+    if model is None or processor is None:
+        return []
+    try:
+        import torch as _torch
+        device = get_device()
+        inputs = processor(
+            text=[text_query.strip()],
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with _torch.no_grad():
+            feats = model.get_text_features(**{k: v for k, v in inputs.items() if k != "pixel_values"})
+        feats = feats / feats.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        return feats[0].detach().cpu().float().tolist()
+    except Exception as exc:
+        logger.warning("[siglip-text] encode failed: %s", exc)
+        return []
+
+
+def _encode_query_image_siglip(image_url: str) -> list[float]:
+    """Run the SigLIP image tower on an image URL or local path. Returns
+    L2-normalized list of length 1152, or [] on failure."""
+    if not image_url:
+        return []
+    try:
+        from app.services.model_warmup import get_model, get_device
+    except Exception:
+        return []
+    model = get_model("siglip2")
+    processor = get_model("siglip2_processor")
+    if model is None or processor is None:
+        return []
+    try:
+        import io
+        import torch as _torch
+        from PIL import Image
+        device = get_device()
+
+        if image_url.startswith(("http://", "https://")):
+            import urllib.request
+            with urllib.request.urlopen(image_url, timeout=10) as resp:
+                img = Image.open(io.BytesIO(resp.read())).convert("RGB")
+        else:
+            # Local path (Coolify / static-served crops)
+            img = Image.open(image_url).convert("RGB")
+
+        inputs = processor(images=[img], return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items() if k == "pixel_values"}
+        with _torch.no_grad():
+            feats = model.get_image_features(**inputs)
+        feats = feats / feats.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        return feats[0].detach().cpu().float().tolist()
+    except Exception as exc:
+        logger.warning("[siglip-image] encode failed: %s", exc)
+        return []
+
+
+def _vec_score(query_vec: list[float], tracklet_vec: list[float]) -> float:
+    """Cosine similarity in [0, 1]. SigLIP vectors live in [-1, 1] cosine range
+    but for normalized identity-rich embeddings 0 is already 'unrelated';
+    negative cosine is uncommon. We clamp to [0, 1] for fusion stability."""
+    if not query_vec or not tracklet_vec:
+        return 0.0
+    c = _cosine_sim(query_vec, tracklet_vec)
+    return max(0.0, min(1.0, c))
+
+
+def _tracklet_embedding(t: Tracklet) -> list[float]:
+    """Return the SigLIP2 embedding for this tracklet (1152-dim), or []."""
+    if not t.embedding or t.embedding.siglip_embedding is None:
+        return []
+    try:
+        return list(t.embedding.siglip_embedding)
+    except Exception:
+        return []
 
 
 def _tracklet_abs_window(t: Tracklet) -> tuple[float, float]:
@@ -458,9 +582,19 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
         db.add(qh)
         db.flush()  # FK constraint: query_candidates.query_id → query_history.query_id
 
-        # Local pre-filter
+        # Parse query into structured constraints once (gender / colors /
+        # garments / actions). Drives both the gender hard-filter at the
+        # prefilter stage and the metadata bonus during rerank.
+        parsed_query = parse_query_metadata(search_query)
+
+        # Stage A — Text-shortlist (SQL ILIKE on materialized attributes).
+        # Recall up to 200 candidates. This is still text-based, so it can miss
+        # tracklets whose appearance_summary phrasing doesn't share tokens with
+        # the query — Stage B (SigLIP rerank below) compensates by re-scoring
+        # ALL shortlisted items in a shared text↔image embedding space.
         shortlist, text_score_map = _local_prefilter(
-            db, search_query, camera_ids, time_from, time_to, limit=200
+            db, search_query, camera_ids, time_from, time_to, limit=200,
+            parsed=parsed_query,
         )
 
         if not shortlist:
@@ -469,46 +603,169 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
             db.commit()
             return {"results": [], "query_id": qid}
 
-        # shortlist is already sorted by text relevance from _local_prefilter
-        # Merge tracklets that belong to the same person identity
+        # Stage B — Encode the query once with SigLIP. Image takes priority
+        # over text when both are supplied; text is the fallback.
+        query_vec: list[float] = []
+        if body.query_image_url:
+            query_vec = _encode_query_image_siglip(body.query_image_url)
+            if query_vec:
+                logger.info("[search] query encoded via SigLIP image tower")
+        if not query_vec and search_query:
+            query_vec = _encode_query_text_siglip(search_query)
+            if query_vec:
+                logger.info("[search] query encoded via SigLIP text tower (len=%d)", len(search_query))
+
+        # Pre-compute vec-score per tracklet for the whole shortlist.
+        # If the SigLIP encoder is unavailable or query is empty, all scores
+        # default to 0 and ranking falls back to text + quality.
+        per_tracklet_vec_score: dict[str, float] = {}
+        if query_vec:
+            for t in shortlist:
+                emb = _tracklet_embedding(t)
+                per_tracklet_vec_score[t.tracklet_id] = _vec_score(query_vec, emb)
+
+        # Stage C — Identity merge (union-find on tracklet-tracklet SigLIP sim).
         groups = _merge_by_similarity(shortlist)
 
-        # Build candidates first, then persist in final ranked order.
+        # Stage C.5 — Per-tracklet action labels (Tier A: soft bonus, no filter).
+        # Aggregated to a deduped set per candidate so a query mentioning
+        # "running" can boost a candidate whose member tracklets include
+        # walking + running, even when the representative tracklet was sitting.
+        query_actions = set(parsed_query.actions)
+        action_by_tracklet: dict[str, str] = {}
+        if shortlist:
+            tracklet_ids = [t.tracklet_id for t in shortlist]
+            act_rows = db.execute(
+                select(TrackletAction.tracklet_id, TrackletAction.action_label)
+                .where(TrackletAction.tracklet_id.in_(tracklet_ids))
+                .where(TrackletAction.confidence >= ACTION_CONFIDENCE_FLOOR)
+            ).all()
+            action_by_tracklet = {tid: label for tid, label in act_rows}
+
+        # Stage D — Score each candidate.
+        # New fusion (when query_vec available):
+        #   fusion = 0.65 * vec_q          ← cosine(query, group representative-vec)
+        #          + 0.20 * text_overlap   ← legacy SQL token overlap
+        #          + 0.15 * quality
+        # Fallback (no query_vec): 0.7 * text_overlap + 0.3 * quality (old behaviour).
         merged: list[dict] = []
         for group in groups:
             rep = group[0]
             candidate_id = rep.tracklet_id if len(group) == 1 else str(uuid.uuid4())
-            rep_emb = _tracklet_embedding(rep)
             text_score = float(text_score_map.get(rep.tracklet_id, 0.0))
             quality_score = float(rep.quality_score or 0.0)
-            vector_score: float | None = None
-            if len(group) > 1:
-                member_scores = []
-                for member in group:
-                    if member.tracklet_id == rep.tracklet_id:
-                        continue
-                    member_emb = _tracklet_embedding(member)
-                    if rep_emb and member_emb:
-                        member_scores.append(_cosine_sim(rep_emb, member_emb))
-                vector_score = max(member_scores) if member_scores else 0.0
-                fusion_score = round((0.5 * text_score) + (0.3 * quality_score) + (0.2 * vector_score), 4)
-            else:
-                fusion_score = round((0.7 * text_score) + (0.3 * quality_score), 4)
 
+            # vec_score = average of the top-3 member vec-scores w.r.t. query.
+            # Identity covered by multiple high-scoring tracklets gets boosted;
+            # a singleton with one weak hit gets dragged down.
+            member_vec_scores = [
+                per_tracklet_vec_score.get(m.tracklet_id, 0.0) for m in group
+            ]
+            top_n = sorted(member_vec_scores, reverse=True)[:3]
+            vec_score = sum(top_n) / len(top_n) if top_n else 0.0
+
+            if query_vec:
+                fusion_score = (
+                    0.65 * vec_score + 0.20 * text_score + 0.15 * quality_score
+                )
+            else:
+                fusion_score = 0.7 * text_score + 0.3 * quality_score
+
+            # Candidate actions = union over member tracklets, deduped.
+            # Skipping members below ACTION_CONFIDENCE_FLOOR (handled in the
+            # SQL load above) keeps low-confidence VideoMAE labels from
+            # polluting the set.
+            candidate_actions: set[str] = set()
+            for member in group:
+                label = action_by_tracklet.get(member.tracklet_id)
+                if label:
+                    candidate_actions.add(label)
+
+            # Tier A bonus: at least one matching action → small score nudge,
+            # never a hard filter. Helps surface candidates whose action
+            # matches even when appearance similarity is borderline.
+            matched_actions = candidate_actions & query_actions if query_actions else set()
+            if matched_actions:
+                fusion_score += ACTION_BONUS_SCORE
+
+            # Per-field metadata bonus: each parsed (field, value) that matches
+            # at least one member tracklet of this candidate adds
+            # METADATA_BONUS_PER_MATCH. This is what disambiguates "red shirt"
+            # from "red shoes" — only the candidate whose upper_color == "red"
+            # gets the upper_color bonus, regardless of token overlap or vector
+            # noise. Capped at METADATA_MAX_BONUS so a heavily-tagged query
+            # can't dominate vec_score.
+            matched_metadata: dict[str, list[str]] = {}
+            metadata_bonus = 0.0
+
+            def _candidate_field_values(field_name: str) -> set[str]:
+                """Distinct non-empty lowercased values of a Tracklet column
+                across all members of this candidate group."""
+                vals: set[str] = set()
+                for m in group:
+                    v = getattr(m, field_name, None)
+                    if v is None:
+                        continue
+                    s = str(v).strip().lower()
+                    if s and s not in {"unknown", "none", "null", "n/a"}:
+                        vals.add(s)
+                return vals
+
+            field_specs = [
+                ("upper_color", parsed_query.upper_color),
+                ("lower_color", parsed_query.lower_color),
+                ("shoes_color", parsed_query.shoes_color),
+                ("hat_color",   parsed_query.hat_color),
+            ]
+            for col_name, requested in field_specs:
+                if not requested:
+                    continue
+                cand_vals = _candidate_field_values(col_name)
+                hits = [v for v in requested if v in cand_vals]
+                if hits:
+                    matched_metadata[col_name] = hits
+                    metadata_bonus += METADATA_BONUS_PER_MATCH * len(hits)
+
+            # Unbound colors ("red dress" with dress ambiguous, or a bare
+            # color word) match if they appear in upper OR lower of any member.
+            if parsed_query.unbound_colors:
+                upper_vals = _candidate_field_values("upper_color")
+                lower_vals = _candidate_field_values("lower_color")
+                unbound_hits = [
+                    v for v in parsed_query.unbound_colors
+                    if v in upper_vals or v in lower_vals
+                ]
+                if unbound_hits:
+                    matched_metadata["unbound_color"] = unbound_hits
+                    metadata_bonus += METADATA_BONUS_PER_MATCH * len(unbound_hits)
+
+            # Gender is already a hard filter at the prefilter stage, but
+            # surviving tracklets with matching gender deserve a small bonus
+            # to nudge them above unknown-gender tracklets that slipped past
+            # the filter.
+            if parsed_query.gender:
+                cand_genders = _candidate_field_values("gender")
+                if any(g in cand_genders for g in parsed_query.gender):
+                    matched_metadata["gender"] = list(parsed_query.gender)
+                    metadata_bonus += METADATA_BONUS_PER_MATCH
+
+            if metadata_bonus > 0.0:
+                fusion_score += min(metadata_bonus, METADATA_MAX_BONUS)
+
+            fusion_score = round(fusion_score, 4)
+
+            # member_links: per-tracklet score within the candidate (for evidence UI).
+            # Now reflects the member's own vec-similarity to the query when available,
+            # not the artificial rep↔member cosine.
             member_links = []
             for member in group:
-                if member.tracklet_id == rep.tracklet_id:
-                    match_score = 1.0
+                if query_vec:
+                    match_score = per_tracklet_vec_score.get(member.tracklet_id, 0.0)
                 else:
-                    member_emb = _tracklet_embedding(member)
-                    match_score = (
-                        _cosine_sim(rep_emb, member_emb)
-                        if rep_emb and member_emb
-                        else float(member.quality_score or 0.0)
-                    )
+                    match_score = float(text_score_map.get(member.tracklet_id, 0.0))
                 member_links.append({
                     "tracklet_id": member.tracklet_id,
-                    "match_score": match_score,
+                    "match_score": round(match_score, 4),
                 })
 
             merged.append({
@@ -517,8 +774,11 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                 "rep": rep,
                 "fusion_score": fusion_score,
                 "text_score": text_score,
-                "vector_score": vector_score,
+                "vector_score": round(vec_score, 4) if query_vec else None,
                 "member_links": member_links,
+                "actions": sorted(candidate_actions),
+                "matched_actions": sorted(matched_actions),
+                "matched_metadata": matched_metadata,
             })
 
         merged.sort(key=lambda item: (-item["fusion_score"], -item["rep"].id))
@@ -536,8 +796,8 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                 primary_camera_id=rep.camera_id or "",
                 appearance_summary=rep.appearance_summary or "",
                 gender=rep.gender or "unknown",
-                top_color=rep.top_color or "unknown",
-                bottom_color=rep.bottom_color or "unknown",
+                top_color=rep.upper_color or "unknown",
+                bottom_color=rep.lower_color or "unknown",
             ).on_conflict_do_nothing(index_elements=["candidate_id"]))
 
             for link in item["member_links"]:
@@ -565,11 +825,17 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                 "id": candidate_id,
                 "thumbnail_url": f"/candidates/{rep.tracklet_id}/preview",
                 "description": description,
+                "actions": mc["actions"],
+                "matched_actions": mc["matched_actions"],
+                "matched_metadata": mc["matched_metadata"],
                 "_raw": {
                     "candidate_id": candidate_id,
                     "tracklet_count": tracklet_count,
                     "camera_id": rep.camera_id,
                     "appearance_summary": rep.appearance_summary,
+                    "actions": mc["actions"],
+                    "matched_actions": mc["matched_actions"],
+                    "matched_metadata": mc["matched_metadata"],
                 },
                 "query_id": qid,
             })

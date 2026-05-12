@@ -1,12 +1,13 @@
 """GPU model warmup for query-service.
 
-Auto-load AI models on service startup for GPU inference.
+Loads SigLIP 2-So400m (text + image towers) on startup. Models stay resident
+in VRAM so text/image queries can be encoded online during search requests.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -15,9 +16,11 @@ logger = logging.getLogger(__name__)
 _warmup_done = False
 _warmup_error: Optional[str] = None
 
+# Model registry — populated by _warmup_siglip2.
+_MODELS: dict[str, Any] = {}
+
 
 def get_device() -> torch.device:
-    """Get the best available device (CUDA > CPU)."""
     if torch.cuda.is_available():
         device = torch.device("cuda:0")
         gpu_name = torch.cuda.get_device_name(0)
@@ -28,22 +31,23 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+def get_model(key: str):
+    """Lookup a warmed-up model. Returns None if not loaded."""
+    return _MODELS.get(key)
+
+
 async def warmup_models():
-    """
-    Warmup all AI models by running a dummy inference.
-    This loads models into GPU memory and compiles CUDA kernels.
-    """
     global _warmup_done, _warmup_error
 
     if _warmup_done:
         logger.info("Models already warmed up")
         return
 
-    logger.info("=== Starting model warmup ===")
+    logger.info("=== Starting query-service model warmup ===")
     device = get_device()
 
     try:
-        await _warmup_dinov2(device)
+        _warmup_siglip2(device)
         _warmup_done = True
         logger.info("=== Model warmup COMPLETE ===")
     except Exception as e:
@@ -52,53 +56,43 @@ async def warmup_models():
         raise
 
 
-async def _warmup_dinov2(device: torch.device):
-    """Warmup DINOv2 model for appearance embedding."""
-    logger.info("Warming up DINOv2...")
+def _warmup_siglip2(device: torch.device) -> None:
+    """Load SigLIP 2-So400m. Same checkpoint as metadata-service's ingest
+    pipeline so the query embedding lives in the SAME space as
+    `tracklets_embeddings.siglip_embedding`."""
+    logger.info("Loading SigLIP 2-So400m (text + image)...")
     try:
-        from transformers import AutoImageProcessor, AutoModel
+        from transformers import AutoModel, AutoProcessor
 
-        model_id = "facebook/dinov2-large"
-        logger.info("  Loading DINOv2 from HuggingFace: %s", model_id)
+        model_id = "google/siglip2-so400m-patch14-384"
+        try:
+            processor = AutoProcessor.from_pretrained(model_id)
+            model = AutoModel.from_pretrained(
+                model_id,
+                torch_dtype=torch.float16 if device.type == "cuda" else torch.float32,
+            ).to(device).eval()
+        except Exception as primary_exc:
+            # Fallback to the v1 checkpoint if siglip2 isn't available offline
+            logger.warning("  siglip2 load failed (%s) — falling back to siglip", primary_exc)
+            model_id = "google/siglip-so400m-patch14-384"
+            processor = AutoProcessor.from_pretrained(model_id)
+            model = AutoModel.from_pretrained(
+                model_id,
+                torch_dtype=torch.float16 if device.type == "cuda" else torch.float32,
+            ).to(device).eval()
 
-        processor = AutoImageProcessor.from_pretrained(
-            model_id,
-            torch_dtype=torch.float16 if device.type == "cuda" else torch.float32,
-        )
-        model = AutoModel.from_pretrained(
-            model_id,
-            torch_dtype=torch.float16 if device.type == "cuda" else torch.float32,
-        ).to(device)
-        model.eval()
-
-        import numpy as np
-        from PIL import Image
-
-        dummy_image = Image.fromarray(
-            np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
-        )
-        inputs = processor(images=dummy_image, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            outputs = model(**inputs)
-            embedding = outputs.last_hidden_state[:, 0]
-            logger.info("  DINOv2 output shape: %s", embedding.shape)
-
-        del model, processor
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-        logger.info("  DINOv2 warmup OK")
-
+        _MODELS["siglip2"] = model
+        _MODELS["siglip2_processor"] = processor
+        _MODELS["siglip2_model_id"] = model_id
+        logger.info("  SigLIP 2 loaded OK (%s)", model_id)
     except Exception as e:
-        logger.warning("DINOv2 warmup failed (non-fatal): %s", e)
+        logger.exception("SigLIP 2 warmup failed: %s", e)
+        raise
 
 
 def is_warmup_done() -> bool:
-    """Check if warmup has completed."""
     return _warmup_done
 
 
 def get_warmup_error() -> Optional[str]:
-    """Get warmup error message if any."""
     return _warmup_error

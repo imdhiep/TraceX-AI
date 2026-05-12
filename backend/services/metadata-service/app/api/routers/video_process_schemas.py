@@ -75,68 +75,84 @@ class BatchProcessRequest(BaseModel):
 
 
 class TrackletResult(BaseModel):
+    """One tracklet — schema mirrors the refactored DB. All confidence values
+    are derived from Qwen2-VL token logprobs (geometric mean of P(token | ctx))."""
     tracklet_id: str
     video_id: str
     camera_id: str
-    track_id: int
+    track_id: str
     start_time: float = 0.0
     end_time: float = 0.0
     quality_score: float = 0.0
+
+    # Demographic
     gender: str = "unknown"
+    gender_conf: Optional[float] = None
     age_range: str = "unknown"
-    top_color: str = "unknown"
-    bottom_color: str = "unknown"
-    shoes_color: str = "unknown"
+    age_range_conf: Optional[float] = None
+
+    # Upper / lower / shoes / bag / hat (color + type share one *_conf; desc has its own)
+    upper_color: Optional[str] = None
+    upper_type: Optional[str] = None
+    upper_desc: Optional[str] = None
+    upper_conf: Optional[float] = None
+    upper_desc_conf: Optional[float] = None
+
+    lower_color: Optional[str] = None
+    lower_type: Optional[str] = None
+    lower_desc: Optional[str] = None
+    lower_conf: Optional[float] = None
+    lower_desc_conf: Optional[float] = None
+
+    shoes_color: Optional[str] = None
+    shoes_type: Optional[str] = None
+    shoes_desc: Optional[str] = None
+    shoes_conf: Optional[float] = None
+    shoes_desc_conf: Optional[float] = None
+
+    bag_presence: Optional[str] = None
+    bag_type: Optional[str] = None
+    bag_desc: Optional[str] = None
+    bag_conf: Optional[float] = None
+    bag_desc_conf: Optional[float] = None
+
+    hat_presence: Optional[str] = None
+    hat_color: Optional[str] = None
+    hat_type: Optional[str] = None
+    hat_desc: Optional[str] = None
+    hat_conf: Optional[float] = None
+    hat_desc_conf: Optional[float] = None
+
+    # Mask / hair
+    mask_presence: str = "unknown"
+    mask_conf: Optional[float] = None
+    hair_style: str = "unknown"
+    hair_style_conf: Optional[float] = None
+    hair_color: str = "unknown"
+    hair_color_conf: Optional[float] = None
+
+    # Summary
     appearance_summary: str = ""
+    appearance_summary_conf: Optional[float] = None
+
+    # Spatial / crop
     crop_url: str = ""
     representative_bbox: list[int] = [0, 0, 0, 0]
     bev_x: float = 0.0
     bev_y: float = 0.0
-    embedding_vector: list[float] = Field(default_factory=list)
+
+    # Embedding (DB)
+    siglip_embedding: list[float] = Field(default_factory=list)
+
+    # Action (VideoMAE)
     action: str = "standing"
     action_confidence: float = 0.0
     kinetics_label: str = ""
-    occlusion_score: float = 0.0
-    hat_color: str = "unknown"
-    bag_type: str = "unknown"
-    is_wearing_mask: str = "unknown"
-    hair_style: str = "unknown"
-    hair_color: str = "unknown"
-    # Per-attribute confidence scores [0, 1] (None = not yet extracted)
-    gender_conf: Optional[float] = None
-    top_color_conf: Optional[float] = None
-    bottom_color_conf: Optional[float] = None
-    shoes_conf: Optional[float] = None
-    accessory_conf: Optional[float] = None
-    age_range_conf: Optional[float] = None
-    hat_color_conf: Optional[float] = None
-    bag_type_conf: Optional[float] = None
-    mask_conf: Optional[float] = None
-    hair_style_conf: Optional[float] = None
-    hair_color_conf: Optional[float] = None
-    # Open-vocabulary VLM metadata (Qwen2-VL-7B-Instruct)
-    upper_clothing_desc: Optional[str] = None
-    upper_clothing_color: Optional[str] = None
-    upper_clothing_type: Optional[str] = None
-    upper_clothing_conf: Optional[float] = None
-    lower_clothing_desc: Optional[str] = None
-    lower_clothing_color: Optional[str] = None
-    lower_clothing_type: Optional[str] = None
-    lower_clothing_conf: Optional[float] = None
-    shoes_desc: Optional[str] = None
-    shoes_type: Optional[str] = None
-    bag_desc: Optional[str] = None
-    bag_presence: Optional[str] = None
-    bag_conf: Optional[float] = None
-    hat_desc: Optional[str] = None
-    hat_presence: Optional[str] = None
-    hat_type: Optional[str] = None
-    hat_conf: Optional[float] = None
-    # SigLIP2 image embedding for text-image search (1152-dim)
-    siglip_embedding: list[float] = Field(default_factory=list)
-    # Cross-camera: which cameras/frames contributed to this tracklet
-    contributing_cameras: list[str] = Field(default_factory=list)
-    contributing_video_ids: list[str] = Field(default_factory=list)
+
+    # Per-frame bbox timeline. Each entry: {frame_index, timestamp_second, bbox: [x1,y1,x2,y2], confidence}.
+    # Saved into tracklet_observations table so trace-service can render
+    # evidence clips with a moving bbox.
+    observations: list[dict] = Field(default_factory=list)
 
 
 class ProcessVideoResponse(BaseModel):

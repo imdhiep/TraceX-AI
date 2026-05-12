@@ -1,18 +1,25 @@
 """Video processing pipeline for metadata-service — SOTA 2026 AI.
 
-Full 7-stage pipeline (per video):
-  1. Sample frames (uniform)
-  2. RT-DETR R50 person detection (primary)
-  3. BEVProjector (2D→3D via homography)
-  4. MCBLT Hungarian cross-camera association
-  5. DINOv2 ViT-L/14 appearance embedding (1024-dim)
-  6. Qwen2-VL-7B-Instruct open-vocabulary attribute captioning
-  7. VideoMAE V2 action classification
+Production single-video pipeline (`_process_video_sync`):
+  1. VideoFrameSampler (4 fps, Laplacian sharpness scoring)
+  2. RT-DETR R50 person detection (primary) / Grounding DINO 1.6 (fallback)
+  3. BodyPartAdaptiveTracker (head/foot adaptive cost, IoU + velocity)
+  4. TrackletQualityScorer (min_frames, density, duration, Laplacian)
+  5. SigLIP 2-So400m (1152-dim) — multi-frame pool-avg per fragment
+  6. TrackletFragmentMerger (cosine ≥ 0.85, max_gap ≤ 60 s, Union-Find)
+  7. Qwen2-VL-7B-Instruct open-vocabulary attribute captioning
+     (only on MERGED tracklets, batch with OOM-aware backoff)
+  8. VideoMAE V2 action classification
+     (per-frame bbox crops, Kinetics-400 → TraceX taxonomy)
+  9. BEV projection + crop save + DB write
 
-Batch pipeline (across cameras):
-  - Stage 1-3: Run per video in parallel
+DB embedding = L2-normalized pool-avg of multi-frame SigLIP features across
+all fragments in the merged group (DINOv2 has been removed).
+
+Cross-camera batch pipeline (`process_batch`):
+  - Stage 1-3: parallel per video
   - Stage 4: ONE MCBLT call across all cameras
-  - Stage 5-7: Per unified tracklet (cross-camera)
+  - Stage 5-7: per unified tracklet (uses legacy `_caption_crop_vlm` path)
 """
 
 from __future__ import annotations
@@ -80,16 +87,24 @@ DEFAULT_SAMPLE_INTERVAL = 15
 DEFAULT_MIN_BBOX_AREA = 400
 DEFAULT_BEV_MAX_DIST = 1.5
 MAX_WORKERS = int(os.getenv("BATCH_MAX_WORKERS", "8"))
-VLM_BATCH_SIZE = _get_positive_env_int("VLM_BATCH_SIZE", 4)
+VLM_BATCH_SIZE = _get_positive_env_int("VLM_BATCH_SIZE", 2)
 VLM_BATCH_MAX_SIZE = _get_positive_env_int("VLM_BATCH_MAX_SIZE", 8)
 VLM_BATCH_GROW_STEP = _get_positive_env_int("VLM_BATCH_GROW_STEP", 1)
 VLM_BATCH_STABLE_STEPS = _get_positive_env_int("VLM_BATCH_STABLE_STEPS", 3)
+# Per-crop budget for the FULL schema (~30 fields, of which 6 are free-text:
+# upper_clothing_desc, lower_clothing_desc, shoes_desc, bag_desc, hat_desc,
+# appearance_summary). Token count for a complete object is typically 330-380;
+# 512 gives enough headroom that the trailing fields (often `appearance_summary`
+# or `hair_color`) don't get truncated, which would drop the entire crop's
+# attrs to defaults via the JSON-regex fallback.
 VLM_BATCH_MAX_NEW_TOKENS_PER_CROP = _get_positive_env_int(
     "VLM_BATCH_MAX_NEW_TOKENS_PER_CROP", 512
 )
 FRAGMENT_MERGE_SIM_THRESHOLD = _get_env_float("FRAGMENT_MERGE_SIM_THRESHOLD", 0.85)
 FRAGMENT_MERGE_MAX_GAP_SECONDS = _get_env_float("FRAGMENT_MERGE_MAX_GAP_SECONDS", 60.0)
 FRAGMENT_MERGE_COMPONENT_MARGIN = _get_env_float("FRAGMENT_MERGE_COMPONENT_MARGIN", 0.03)
+FRAGMENT_MERGE_MAX_SPEED_PX_PER_S = _get_env_float("FRAGMENT_MERGE_MAX_SPEED_PX_PER_S", 800.0)
+FRAGMENT_MERGE_SPATIAL_BYPASS_MARGIN = _get_env_float("FRAGMENT_MERGE_SPATIAL_BYPASS_MARGIN", 0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -259,18 +274,28 @@ def _detect_persons_rtdetr(
     return all_dets
 
 
+_NMS_IOU_THRESH = _get_env_float("PERSON_NMS_IOU_THRESH", 0.55)
+
+
 def _sanitize_dets_inplace(
     dets_per_frame: list[list[dict]],
     frames: list[np.ndarray],
     min_w: int = 6,
     min_h: int = 12,
 ) -> list[list[dict]]:
-    """Clip bboxes into frame bounds and drop bboxes smaller than min_w/min_h.
+    """Clip bboxes into frame bounds, drop bboxes smaller than min_w/min_h, then
+    apply class-agnostic NMS at PERSON_NMS_IOU_THRESH (default 0.55) to suppress
+    duplicate person boxes that survived the detector's internal NMS.
 
-    Conservative: only removes clearly broken bboxes (out-of-frame or pixel-noise sized).
-    No aspect-ratio or score-based filter — those risk dropping crouching/sitting persons.
-    Per-frame numpy vectorization keeps overhead negligible.
+    Conservative: NMS threshold is relatively high (0.55) so that genuinely
+    adjacent persons are kept, only truly overlapping duplicates are removed.
+    Per-frame numpy/torch vectorization keeps overhead negligible.
     """
+    try:
+        from torchvision.ops import nms as _tv_nms
+    except Exception:
+        _tv_nms = None
+
     out: list[list[dict]] = []
     for dets, frame in zip(dets_per_frame, frames):
         if not dets:
@@ -282,19 +307,30 @@ def _sanitize_dets_inplace(
         arr[:, 2] = np.clip(arr[:, 2], 0.0, W)
         arr[:, 1] = np.clip(arr[:, 1], 0.0, H - 1)
         arr[:, 3] = np.clip(arr[:, 3], 0.0, H)
-        keep = ((arr[:, 2] - arr[:, 0]) >= min_w) & ((arr[:, 3] - arr[:, 1]) >= min_h)
-        if bool(keep.all()):
-            for d, row in zip(dets, arr):
-                d["bbox"] = row.tolist()
-            out.append(dets)
-            continue
-        kept = []
-        for d, row, k in zip(dets, arr, keep):
-            if not k:
+        keep_size = ((arr[:, 2] - arr[:, 0]) >= min_w) & ((arr[:, 3] - arr[:, 1]) >= min_h)
+        if not bool(keep_size.all()):
+            dets = [d for d, k in zip(dets, keep_size) if k]
+            arr  = arr[keep_size]
+            if not dets:
+                out.append(dets)
                 continue
+        for d, row in zip(dets, arr):
             d["bbox"] = row.tolist()
-            kept.append(d)
-        out.append(kept)
+
+        # Class-agnostic NMS on person boxes (priority = score).
+        if _tv_nms is not None and len(dets) > 1:
+            try:
+                boxes_t  = torch.from_numpy(arr)
+                scores_t = torch.tensor(
+                    [float(d.get("score", 0.0)) for d in dets], dtype=torch.float32,
+                )
+                keep_idx = _tv_nms(boxes_t, scores_t, _NMS_IOU_THRESH).tolist()
+                if len(keep_idx) < len(dets):
+                    keep_idx_sorted = sorted(keep_idx)
+                    dets = [dets[i] for i in keep_idx_sorted]
+            except Exception:
+                pass
+        out.append(dets)
     return out
 
 
@@ -527,7 +563,7 @@ def _generate_dinov2_embeddings(
         right = max_dim - crop_w - left
         square = cv2.copyMakeBorder(
             crop, top, bottom, left, right,
-            cv2.BORDER_CONSTANT, value=(0, 0, 0)
+            cv2.BORDER_CONSTANT, value=(114, 114, 114)
         )
         resized = cv2.resize(square, (224, 224), interpolation=cv2.INTER_LINEAR)
         pil_crops.append(Image.fromarray(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)))
@@ -622,27 +658,27 @@ def _legacy_run_siglip2_label_attributes(
     right = max_dim - crop_w - left
     square = cv2.copyMakeBorder(
         crop, top, bottom, left, right,
-        cv2.BORDER_CONSTANT, value=(0, 0, 0)
+        cv2.BORDER_CONSTANT, value=(114, 114, 114)
     )
     resized = cv2.resize(square, (384, 384), interpolation=cv2.INTER_LINEAR)
     pil_crop = Image.fromarray(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB))
 
     label_groups = {
-        "top_color": [
+        "upper_color": [
             "red shirt", "blue shirt", "green shirt", "white shirt", "black shirt",
             "yellow shirt", "orange shirt", "purple shirt", "gray shirt", "brown shirt",
         ],
-        "bottom_color": [
+        "lower_color": [
             "black pants", "blue jeans", "gray pants", "white pants", "brown pants",
             "black shorts", "gray shorts",
         ],
-        "gender": ["man", "woman"],
-        "bag": ["person carrying a bag", "person not carrying a bag"],
-        "hat": ["person wearing a hat", "person not wearing a hat"],
+        "gender":         ["man", "woman"],
+        "bag_presence":   ["person carrying a bag", "person not carrying a bag"],
+        "hat_presence":   ["person wearing a hat", "person not wearing a hat"],
         "age_range":      list(_AGE_RANGE_MAP.keys()),
         "hat_color":      list(_HAT_COLOR_MAP.keys()),
         "bag_type":       list(_BAG_TYPE_MAP.keys()),
-        "is_wearing_mask": ["person wearing face mask", "person not wearing face mask"],
+        "mask_presence":  ["person wearing face mask", "person not wearing face mask"],
         "hair_style":     list(_HAIR_STYLE_MAP.keys()),
         "hair_color":     list(_HAIR_COLOR_MAP.keys()),
     }
@@ -666,24 +702,24 @@ def _legacy_run_siglip2_label_attributes(
             best_label = labels[best_idx]
             best_prob = float(probs[best_idx])
 
-            if attr_type == "top_color":
-                attributes["top_color"] = best_label.split()[0]
-            elif attr_type == "bottom_color":
-                attributes["bottom_color"] = best_label.split()[0]
+            if attr_type == "upper_color":
+                attributes["upper_color"] = best_label.split()[0]
+            elif attr_type == "lower_color":
+                attributes["lower_color"] = best_label.split()[0]
             elif attr_type == "gender":
                 attributes["gender"] = best_label.split()[0] if best_prob > 0.6 else "unknown"
-            elif attr_type == "bag":
-                attributes["bag"] = "carrying_bag" if "not" not in best_label else "no_bag"
-            elif attr_type == "hat":
-                attributes["hat"] = "wearing_hat" if "not" not in best_label else "no_hat"
+            elif attr_type == "bag_presence":
+                attributes["bag_presence"] = "yes" if "not" not in best_label else "no"
+            elif attr_type == "hat_presence":
+                attributes["hat_presence"] = "yes" if "not" not in best_label else "no"
             elif attr_type == "age_range":
                 attributes["age_range"] = _AGE_RANGE_MAP.get(best_label, "unknown")
             elif attr_type == "hat_color":
                 attributes["hat_color"] = _HAT_COLOR_MAP.get(best_label, "unknown")
             elif attr_type == "bag_type":
                 attributes["bag_type"] = _BAG_TYPE_MAP.get(best_label, "unknown")
-            elif attr_type == "is_wearing_mask":
-                attributes["is_wearing_mask"] = "yes" if best_label == "person wearing face mask" else "no"
+            elif attr_type == "mask_presence":
+                attributes["mask_presence"] = "yes" if best_label == "person wearing face mask" else "no"
             elif attr_type == "hair_style":
                 attributes["hair_style"] = _HAIR_STYLE_MAP.get(best_label, "unknown")
             elif attr_type == "hair_color":
@@ -692,8 +728,8 @@ def _legacy_run_siglip2_label_attributes(
         except Exception as exc:
             logger.warning("SigLIP2 attribute failed for %s: %s", attr_type, exc)
 
-    for key in ["top_color", "bottom_color", "gender", "bag", "hat",
-                "age_range", "hat_color", "bag_type", "is_wearing_mask", "hair_style", "hair_color"]:
+    for key in ["upper_color", "lower_color", "gender", "bag_presence", "hat_presence",
+                "age_range", "hat_color", "bag_type", "mask_presence", "hair_style", "hair_color"]:
         if key not in attributes:
             attributes[key] = "unknown"
 
@@ -874,123 +910,193 @@ def _run_videomae_actions(
 # ---------------------------------------------------------------------------
 
 def _default_attributes() -> dict[str, Any]:
+    """All-unknown attrs used when VLM fails / falls back. Confidences are None,
+    not 0.0 — None means 'not yet extracted', 0.0 means 'extracted, very unsure'."""
     return {
-        "gender": "unknown", "age_range": "unknown",
-        "upper_clothing_desc": None, "upper_clothing_color": "unknown",
-        "upper_clothing_type": "unknown", "upper_clothing_conf": None,
-        "lower_clothing_desc": None, "lower_clothing_color": "unknown",
-        "lower_clothing_type": "unknown", "lower_clothing_conf": None,
-        "shoes_desc": None, "shoes_color": "unknown", "shoes_conf": None,
-        "bag_presence": "unknown", "bag_type": "unknown",
-        "bag_desc": None, "bag_conf": None,
-        "hat_presence": "unknown", "hat_color": "unknown",
-        "hat_type": "unknown", "hat_desc": None, "hat_conf": None,
-        "is_wearing_mask": "unknown", "mask_conf": None,
-        "hair_style": "unknown", "hair_color": "unknown", "hair_conf": None,
-        "appearance_summary": "person",
-        # backward compat
-        "top_color": "unknown", "bottom_color": "unknown",
-        "bag": "unknown", "hat": "unknown",
+        "gender": "unknown",          "gender_conf": None,
+        "age_range": "unknown",       "age_range_conf": None,
+        "upper_color": "unknown",     "upper_type": "unknown",
+        "upper_desc": None,           "upper_conf": None, "upper_desc_conf": None,
+        "lower_color": "unknown",     "lower_type": "unknown",
+        "lower_desc": None,           "lower_conf": None, "lower_desc_conf": None,
+        "shoes_color": "unknown",     "shoes_type": "unknown",
+        "shoes_desc": None,           "shoes_conf": None, "shoes_desc_conf": None,
+        "bag_presence": "unknown",    "bag_type": "unknown",
+        "bag_desc": None,             "bag_conf": None,   "bag_desc_conf": None,
+        "hat_presence": "unknown",    "hat_color": "unknown", "hat_type": "unknown",
+        "hat_desc": None,             "hat_conf": None,   "hat_desc_conf": None,
+        "mask_presence": "unknown",   "mask_conf": None,
+        "hair_style": "unknown",      "hair_style_conf": None,
+        "hair_color": "unknown",      "hair_color_conf": None,
+        "appearance_summary": "person", "appearance_summary_conf": None,
     }
 
 
+def _build_tracklet_result(
+    *,
+    tracklet_id: str,
+    video_id: str,
+    camera_id: str,
+    track_idx: int,
+    start_time: float,
+    end_time: float,
+    quality_score: float,
+    attrs: dict,
+    summary: str,
+    rep_bbox: Any,
+    bev_x: float,
+    bev_y: float,
+    siglip_embedding: list[float],
+    action: str,
+    action_confidence: float,
+    kinetics_label: str,
+    crop_url: str,
+    observations: list[dict] | None = None,
+) -> "TrackletResult":
+    """Single source-of-truth for building a TrackletResult from a parsed attrs dict.
+
+    Used by all 3 pipeline entry points (sync, single-video legacy, cross-camera
+    batch) so a schema change only touches this one helper.
+    """
+    return TrackletResult(
+        tracklet_id=tracklet_id,
+        video_id=video_id,
+        camera_id=camera_id,
+        track_id=str(track_idx),
+        start_time=float(start_time or 0.0),
+        end_time=float(end_time or 0.0),
+        quality_score=float(quality_score or 0.0),
+
+        gender=attrs.get("gender", "unknown"),
+        gender_conf=attrs.get("gender_conf"),
+        age_range=attrs.get("age_range", "unknown"),
+        age_range_conf=attrs.get("age_range_conf"),
+
+        upper_color=attrs.get("upper_color"),
+        upper_type=attrs.get("upper_type"),
+        upper_desc=attrs.get("upper_desc"),
+        upper_conf=attrs.get("upper_conf"),
+        upper_desc_conf=attrs.get("upper_desc_conf"),
+
+        lower_color=attrs.get("lower_color"),
+        lower_type=attrs.get("lower_type"),
+        lower_desc=attrs.get("lower_desc"),
+        lower_conf=attrs.get("lower_conf"),
+        lower_desc_conf=attrs.get("lower_desc_conf"),
+
+        shoes_color=attrs.get("shoes_color"),
+        shoes_type=attrs.get("shoes_type"),
+        shoes_desc=attrs.get("shoes_desc"),
+        shoes_conf=attrs.get("shoes_conf"),
+        shoes_desc_conf=attrs.get("shoes_desc_conf"),
+
+        bag_presence=attrs.get("bag_presence"),
+        bag_type=attrs.get("bag_type"),
+        bag_desc=attrs.get("bag_desc"),
+        bag_conf=attrs.get("bag_conf"),
+        bag_desc_conf=attrs.get("bag_desc_conf"),
+
+        hat_presence=attrs.get("hat_presence"),
+        hat_color=attrs.get("hat_color"),
+        hat_type=attrs.get("hat_type"),
+        hat_desc=attrs.get("hat_desc"),
+        hat_conf=attrs.get("hat_conf"),
+        hat_desc_conf=attrs.get("hat_desc_conf"),
+
+        mask_presence=attrs.get("mask_presence", "unknown"),
+        mask_conf=attrs.get("mask_conf"),
+        hair_style=attrs.get("hair_style", "unknown"),
+        hair_style_conf=attrs.get("hair_style_conf"),
+        hair_color=attrs.get("hair_color", "unknown"),
+        hair_color_conf=attrs.get("hair_color_conf"),
+
+        appearance_summary=summary,
+        appearance_summary_conf=attrs.get("appearance_summary_conf"),
+
+        representative_bbox=[int(x) for x in (rep_bbox or [0, 0, 0, 0])],
+        bev_x=float(bev_x or 0.0),
+        bev_y=float(bev_y or 0.0),
+        crop_url=crop_url,
+        siglip_embedding=siglip_embedding or [],
+
+        action=action,
+        action_confidence=float(action_confidence or 0.0),
+        kinetics_label=kinetics_label,
+
+        observations=observations or [],
+    )
+
+
+# Qwen no longer self-reports confidence — confidence is computed from the
+# token-level logprobs of the generated value spans (geometric mean of
+# P(token | context)). The prompt requests only the values themselves.
 _VLM_PROMPT = """You are analyzing a person crop from a surveillance camera.
 Describe this person's visible appearance accurately using ALL visible cues.
 
-GENDER INFERENCE RULES (important):
-- Infer gender from ANY combination of: clothing style (dress/skirt → woman), hair length, body silhouette, accessories, overall appearance
-- Use "man" or "woman" whenever you can make a reasonable inference — do NOT default to "unknown" if there are visible cues
-- Only use "unknown" if the person is completely obscured, facing away with no distinguishing features, or truly ambiguous
-- A person in a dress/skirt: "woman". A person in a suit/tie: likely "man". Long hair + feminine clothing: "woman". Etc.
+GENDER INFERENCE RULES:
+- Infer gender from clothing style (dress/skirt → woman), hair length, body silhouette, accessories.
+- Use "man" or "woman" whenever a reasonable inference is possible.
+- Use "unknown" only when truly obscured / ambiguous.
 
 AGE INFERENCE RULES:
-- Estimate from body size, posture, hair color, clothing style
-- Use "young_adult" (18-35), "middle_aged" (35-55), "elderly" (55+), "teenager" (13-17), "child" (<13)
-- Prefer a guess with lower confidence over "unknown"
+- Estimate from body size, posture, hair color, clothing style.
+- Allowed values: "child" (<13), "teenager" (13-17), "young_adult" (18-35), "middle_aged" (35-55), "elderly" (55+), "unknown".
 
-Return ONLY a valid JSON object with these exact fields:
+Return ONLY a JSON object with EXACTLY these fields and no others:
 
 {
-  "gender": "man or woman or unknown",
-  "gender_conf": 0.0,
-  "age_range": "child or teenager or young_adult or middle_aged or elderly or unknown",
-  "age_range_conf": 0.0,
-  "upper_clothing_desc": "free text e.g. black suit jacket",
-  "upper_clothing_color": "dominant color or unknown",
-  "upper_clothing_type": "e.g. suit jacket or hoodie or t-shirt or vest or unknown",
-  "upper_clothing_conf": 0.0,
-  "lower_clothing_desc": "free text e.g. black formal trousers",
-  "lower_clothing_color": "dominant color or unknown",
-  "lower_clothing_type": "e.g. jeans or formal trousers or shorts or skirt or unknown",
-  "lower_clothing_conf": 0.0,
-  "shoes_desc": "free text or unknown",
-  "shoes_color": "color or unknown",
-  "shoes_conf": 0.0,
-  "bag_presence": "yes or no or unknown",
-  "bag_type": "e.g. backpack or handbag or suitcase or none or unknown",
-  "bag_desc": "free text or none",
-  "bag_conf": 0.0,
-  "hat_presence": "yes or no or unknown",
-  "hat_color": "color or none or unknown",
-  "hat_type": "e.g. cap or hat or helmet or hood or none or unknown",
-  "hat_desc": "free text or none",
-  "hat_conf": 0.0,
-  "is_wearing_mask": "yes or no or unknown",
-  "mask_conf": 0.0,
-  "hair_style": "short or long or ponytail or tied or bald or unknown",
-  "hair_color": "color or unknown",
-  "hair_conf": 0.0,
+  "gender": "man | woman | unknown",
+  "age_range": "child | teenager | young_adult | middle_aged | elderly | unknown",
+  "upper_color": "dominant color of upper garment | unknown",
+  "upper_type": "e.g. suit jacket | hoodie | t-shirt | vest | unknown",
+  "upper_desc": "free-text 3-5 words describing upper garment",
+  "lower_color": "dominant color of lower garment | unknown",
+  "lower_type": "e.g. jeans | formal trousers | shorts | skirt | unknown",
+  "lower_desc": "free-text 3-5 words describing lower garment",
+  "shoes_color": "color | unknown",
+  "shoes_type": "e.g. sneakers | boots | sandals | unknown",
+  "shoes_desc": "free-text 3-5 words",
+  "bag_presence": "yes | no | unknown",
+  "bag_type": "backpack | handbag | suitcase | none | unknown",
+  "bag_desc": "free-text or 'none'",
+  "hat_presence": "yes | no | unknown",
+  "hat_color": "color | none | unknown",
+  "hat_type": "cap | hat | helmet | hood | none | unknown",
+  "hat_desc": "free-text or 'none'",
+  "mask_presence": "yes | no | unknown",
+  "hair_style": "short | long | ponytail | tied | bald | unknown",
+  "hair_color": "color | unknown",
   "appearance_summary": "one concise sentence describing the person"
 }
 
-Use "unknown" ONLY when truly impossible to determine — prefer a best-guess with lower confidence.
-Replace all 0.0 placeholders with your actual confidence (0.0–1.0)."""
+Do NOT include any confidence fields — the system computes confidence from
+your token logits, not from your self-report.
+Return only the JSON object, no surrounding text."""
 
 _VLM_BATCH_PROMPT_TEMPLATE = """You are analyzing {n} person crops from surveillance cameras.
 The images above show persons labeled (1) to ({n}) in order.
-Describe each person's visible appearance using ALL visible cues. Use free text for clothing descriptions.
 
-GENDER: infer from clothing style (dress/skirt→woman), hair, body silhouette — do NOT default to "unknown" if cues are visible.
-AGE: estimate from body, posture, hair — prefer a guess with low confidence over "unknown".
+Use the same inference rules:
+- GENDER: from clothing style, hair, body silhouette.
+- AGE: "child | teenager | young_adult | middle_aged | elderly | unknown".
 
-Return ONLY a valid JSON array with exactly {n} objects in order (index 0 = person 1).
-Each object must have the same fields as below:
+Return ONLY a JSON array with exactly {n} objects in order (index 0 = person 1).
+Each object must have EXACTLY these fields and no others:
 
 {{
-  "gender": "man or woman or unknown",
-  "gender_conf": 0.0,
-  "age_range": "child or teenager or young_adult or middle_aged or elderly or unknown",
-  "age_range_conf": 0.0,
-  "upper_clothing_desc": "free text",
-  "upper_clothing_color": "dominant color or unknown",
-  "upper_clothing_type": "e.g. suit jacket or hoodie or t-shirt or unknown",
-  "upper_clothing_conf": 0.0,
-  "lower_clothing_desc": "free text",
-  "lower_clothing_color": "dominant color or unknown",
-  "lower_clothing_type": "e.g. jeans or formal trousers or shorts or unknown",
-  "lower_clothing_conf": 0.0,
-  "shoes_desc": "free text or unknown",
-  "shoes_color": "color or unknown",
-  "shoes_conf": 0.0,
-  "bag_presence": "yes or no or unknown",
-  "bag_type": "backpack or handbag or none or unknown",
-  "bag_desc": "free text or none",
-  "bag_conf": 0.0,
-  "hat_presence": "yes or no or unknown",
-  "hat_color": "color or none or unknown",
-  "hat_type": "cap or hat or helmet or none or unknown",
-  "hat_desc": "free text or none",
-  "hat_conf": 0.0,
-  "is_wearing_mask": "yes or no or unknown",
-  "mask_conf": 0.0,
-  "hair_style": "short or long or ponytail or tied or bald or unknown",
-  "hair_color": "color or unknown",
-  "hair_conf": 0.0,
-  "appearance_summary": "one concise sentence describing the person"
+  "gender": "man | woman | unknown",
+  "age_range": "...",
+  "upper_color": "...", "upper_type": "...", "upper_desc": "...",
+  "lower_color": "...", "lower_type": "...", "lower_desc": "...",
+  "shoes_color": "...", "shoes_type": "...", "shoes_desc": "...",
+  "bag_presence": "yes|no|unknown", "bag_type": "...", "bag_desc": "...",
+  "hat_presence": "yes|no|unknown", "hat_color": "...", "hat_type": "...", "hat_desc": "...",
+  "mask_presence": "yes|no|unknown",
+  "hair_style": "...", "hair_color": "...",
+  "appearance_summary": "one concise sentence"
 }}
 
-Use "unknown" ONLY when truly impossible — prefer best-guess with lower confidence.
-Replace 0.0 with actual confidence (0.0–1.0). Return only the JSON array, no surrounding text."""
+Do NOT include any confidence fields. Return only the JSON array, no surrounding text."""
 
 
 _GENDER_NORM   = {"male": "man", "man": "man", "female": "woman", "woman": "woman"}
@@ -1003,61 +1109,231 @@ _AGE_NORM      = {
 }
 _PRESENCE_NORM = {"yes": "yes", "no": "no", "true": "yes", "false": "no", "none": "no"}
 
+# Mapping of VLM JSON key → (canonical attr key, conf key).
+# Used by _parse_vlm_attrs + _attach_logit_confs to keep everything in sync.
+_ATTR_CONF_MAP: list[tuple[str, str, str | None]] = [
+    # (vlm_key, conf_key, normaliser)
+    ("gender",             "gender_conf",              "GENDER"),
+    ("age_range",          "age_range_conf",           "AGE"),
+    ("upper_color",        "upper_conf",               None),
+    ("upper_type",         "upper_conf",               None),    # shares with upper_color
+    ("upper_desc",         "upper_desc_conf",          None),
+    ("lower_color",        "lower_conf",               None),
+    ("lower_type",         "lower_conf",               None),
+    ("lower_desc",         "lower_desc_conf",          None),
+    ("shoes_color",        "shoes_conf",               None),
+    ("shoes_type",         "shoes_conf",               None),
+    ("shoes_desc",         "shoes_desc_conf",          None),
+    ("bag_presence",       "bag_conf",                 "PRESENCE"),
+    ("bag_type",           "bag_conf",                 None),
+    ("bag_desc",           "bag_desc_conf",            None),
+    ("hat_presence",       "hat_conf",                 "PRESENCE"),
+    ("hat_color",          "hat_conf",                 None),
+    ("hat_type",           "hat_conf",                 None),
+    ("hat_desc",           "hat_desc_conf",            None),
+    ("mask_presence",      "mask_conf",                "PRESENCE"),
+    ("hair_style",         "hair_style_conf",          None),
+    ("hair_color",         "hair_color_conf",          None),
+    ("appearance_summary", "appearance_summary_conf",  None),
+]
+
 
 def _parse_vlm_attrs(parsed: dict) -> dict:
-    """Normalise a raw VLM JSON dict into the canonical attrs dict."""
+    """Normalise a raw VLM JSON dict into the canonical attrs dict.
+
+    Confidence fields are set to None here. They are filled in afterwards by
+    _attach_logit_confs() using token-level logprobs from generate().
+    """
     def _s(key: str, fallback: str = "unknown") -> str:
         v = parsed.get(key)
         return str(v).strip().lower() if v not in (None, "", "null") else fallback
 
-    def _f(key: str) -> float | None:
-        try:
-            return float(parsed[key])
-        except (KeyError, TypeError, ValueError):
-            return None
-
     def _norm(val: str, mapping: dict) -> str:
         return mapping.get(val.lower().strip(), val) if val else "unknown"
 
-    bag_pres = _norm(_s("bag_presence"), _PRESENCE_NORM)
-    hat_pres = _norm(_s("hat_presence"), _PRESENCE_NORM)
     return {
-        "gender":               _norm(_s("gender"), _GENDER_NORM),
-        "gender_conf":          _f("gender_conf"),
-        "age_range":            _norm(_s("age_range"), _AGE_NORM),
-        "age_range_conf":       _f("age_range_conf"),
-        "upper_clothing_desc":  parsed.get("upper_clothing_desc"),
-        "upper_clothing_color": _s("upper_clothing_color"),
-        "upper_clothing_type":  _s("upper_clothing_type"),
-        "upper_clothing_conf":  _f("upper_clothing_conf"),
-        "lower_clothing_desc":  parsed.get("lower_clothing_desc"),
-        "lower_clothing_color": _s("lower_clothing_color"),
-        "lower_clothing_type":  _s("lower_clothing_type"),
-        "lower_clothing_conf":  _f("lower_clothing_conf"),
-        "shoes_desc":           parsed.get("shoes_desc"),
-        "shoes_color":          _s("shoes_color"),
-        "shoes_conf":           _f("shoes_conf"),
-        "bag_presence":         bag_pres,
-        "bag_type":             _s("bag_type"),
-        "bag_desc":             parsed.get("bag_desc"),
-        "bag_conf":             _f("bag_conf"),
-        "hat_presence":         hat_pres,
-        "hat_color":            _s("hat_color"),
-        "hat_type":             _s("hat_type"),
-        "hat_desc":             parsed.get("hat_desc"),
-        "hat_conf":             _f("hat_conf"),
-        "is_wearing_mask":      _norm(_s("is_wearing_mask"), _PRESENCE_NORM),
-        "mask_conf":            _f("mask_conf"),
-        "hair_style":           _s("hair_style"),
-        "hair_color":           _s("hair_color"),
-        "hair_conf":            _f("hair_conf"),
-        "appearance_summary":   parsed.get("appearance_summary") or "person",
-        # backward compat
-        "top_color":    _s("upper_clothing_color"),
-        "bottom_color": _s("lower_clothing_color"),
-        "bag": "no_bag"      if bag_pres == "no"  else ("carrying_bag" if bag_pres == "yes" else "unknown"),
-        "hat": "no_hat"      if hat_pres == "no"  else ("wearing_hat"  if hat_pres == "yes" else "unknown"),
+        "gender":           _norm(_s("gender"), _GENDER_NORM),       "gender_conf": None,
+        "age_range":        _norm(_s("age_range"), _AGE_NORM),       "age_range_conf": None,
+        "upper_color":      _s("upper_color"),
+        "upper_type":       _s("upper_type"),
+        "upper_desc":       parsed.get("upper_desc"),
+        "upper_conf":       None,                                    "upper_desc_conf": None,
+        "lower_color":      _s("lower_color"),
+        "lower_type":       _s("lower_type"),
+        "lower_desc":       parsed.get("lower_desc"),
+        "lower_conf":       None,                                    "lower_desc_conf": None,
+        "shoes_color":      _s("shoes_color"),
+        "shoes_type":       _s("shoes_type"),
+        "shoes_desc":       parsed.get("shoes_desc"),
+        "shoes_conf":       None,                                    "shoes_desc_conf": None,
+        "bag_presence":     _norm(_s("bag_presence"), _PRESENCE_NORM),
+        "bag_type":         _s("bag_type"),
+        "bag_desc":         parsed.get("bag_desc"),
+        "bag_conf":         None,                                    "bag_desc_conf": None,
+        "hat_presence":     _norm(_s("hat_presence"), _PRESENCE_NORM),
+        "hat_color":        _s("hat_color"),
+        "hat_type":         _s("hat_type"),
+        "hat_desc":         parsed.get("hat_desc"),
+        "hat_conf":         None,                                    "hat_desc_conf": None,
+        "mask_presence":    _norm(_s("mask_presence"), _PRESENCE_NORM),
+        "mask_conf":        None,
+        "hair_style":       _s("hair_style"),                        "hair_style_conf": None,
+        "hair_color":       _s("hair_color"),                        "hair_color_conf": None,
+        "appearance_summary":      parsed.get("appearance_summary") or "person",
+        "appearance_summary_conf": None,
     }
+
+
+def _compute_value_logprob_confs(
+    generated_token_ids: "torch.Tensor",   # 1-D tensor of token IDs (already detached, cpu)
+    scores: list,                          # list[Tensor] of per-step logits (length = len(generated_token_ids))
+    tokenizer: Any,
+) -> dict[str, float]:
+    """Compute per-attribute confidence from token logprobs.
+
+    Strategy:
+      1. Decode the generated tokens into a string.
+      2. Tokenize the string with offset_mapping (or scan token-by-token) to find
+         the character span of each value token.
+      3. For each `"<key>": "<value>"` pair, locate the tokens belonging to
+         the value span, gather their per-token probabilities, and compute the
+         geometric mean. That is the "real" model confidence for that key.
+
+    Returns a dict mapping vlm_key (e.g. "gender", "upper_color") → conf in [0, 1].
+    Keys not found in the output are simply absent from the returned dict.
+    """
+    import torch as _torch
+
+    # Per-token probability of the actually-sampled token.
+    # scores[i] has shape [vocab]; sampled token = generated_token_ids[i].
+    token_probs: list[float] = []
+    for step, score_tensor in enumerate(scores):
+        if step >= len(generated_token_ids):
+            break
+        try:
+            logp = _torch.log_softmax(score_tensor.float(), dim=-1)
+            tok_id = int(generated_token_ids[step])
+            token_probs.append(float(logp[..., tok_id].squeeze().item()))  # log-prob
+        except Exception:
+            token_probs.append(0.0)  # safe default
+
+    # Walk the decoded string to find "key": "value" pairs and their char spans.
+    decoded = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+
+    # Build character → token index mapping by decoding each prefix.
+    # This avoids reliance on offset_mapping which isn't always exposed by
+    # the processor. Acceptable cost: |tokens| decodes.
+    cum_char_to_tok: list[int] = []  # cum_char_to_tok[char_idx] = token index containing that char
+    running = ""
+    for tok_idx in range(len(generated_token_ids)):
+        piece = tokenizer.decode(generated_token_ids[tok_idx:tok_idx + 1], skip_special_tokens=True)
+        for _ in piece:
+            cum_char_to_tok.append(tok_idx)
+        running += piece
+        if len(running) >= len(decoded):
+            break
+    # Pad if rounding caused a mismatch
+    while len(cum_char_to_tok) < len(decoded):
+        cum_char_to_tok.append(len(generated_token_ids) - 1)
+
+    pattern = re.compile(r'"(\w+)"\s*:\s*"((?:[^"\\]|\\.)*)"')
+    confs: dict[str, float] = {}
+
+    for match in pattern.finditer(decoded):
+        key = match.group(1)
+        val_start = match.start(2)
+        val_end   = match.end(2)
+        if val_end <= val_start:
+            continue
+        tok_lo = cum_char_to_tok[val_start] if val_start < len(cum_char_to_tok) else 0
+        tok_hi = cum_char_to_tok[val_end - 1] if (val_end - 1) < len(cum_char_to_tok) else tok_lo
+        span = token_probs[tok_lo:tok_hi + 1]
+        if not span:
+            continue
+        # Geometric mean of P(token) = exp(mean(log P))
+        mean_logp = sum(span) / len(span)
+        confs[key] = max(0.0, min(1.0, float(_torch.tensor(mean_logp).exp().item())))
+
+    return confs
+
+
+def _compute_value_logprob_confs_batch(
+    generated_token_ids: "torch.Tensor",
+    scores: list,
+    tokenizer: Any,
+    n: int,
+) -> list[dict[str, float]]:
+    """Like _compute_value_logprob_confs but partitions matches across n objects
+    in a JSON array. The k-th occurrence of each "key": "value" pair is assigned
+    to object k (0-indexed). Returns a list of n dicts.
+    """
+    import torch as _torch
+
+    token_logprobs: list[float] = []
+    for step, score_tensor in enumerate(scores):
+        if step >= len(generated_token_ids):
+            break
+        try:
+            logp = _torch.log_softmax(score_tensor.float(), dim=-1)
+            tok_id = int(generated_token_ids[step])
+            token_logprobs.append(float(logp[..., tok_id].squeeze().item()))
+        except Exception:
+            token_logprobs.append(0.0)
+
+    decoded = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+
+    cum_char_to_tok: list[int] = []
+    for tok_idx in range(len(generated_token_ids)):
+        piece = tokenizer.decode(generated_token_ids[tok_idx:tok_idx + 1], skip_special_tokens=True)
+        for _ in piece:
+            cum_char_to_tok.append(tok_idx)
+    while len(cum_char_to_tok) < len(decoded):
+        cum_char_to_tok.append(len(generated_token_ids) - 1)
+
+    pattern = re.compile(r'"(\w+)"\s*:\s*"((?:[^"\\]|\\.)*)"')
+    per_object: list[dict[str, float]] = [dict() for _ in range(n)]
+    key_seen_count: dict[str, int] = {}
+
+    for match in pattern.finditer(decoded):
+        key = match.group(1)
+        occurrence = key_seen_count.get(key, 0)
+        key_seen_count[key] = occurrence + 1
+        if occurrence >= n:
+            continue  # extra occurrences (shouldn't happen with valid output)
+        val_start = match.start(2)
+        val_end   = match.end(2)
+        if val_end <= val_start:
+            continue
+        tok_lo = cum_char_to_tok[val_start] if val_start < len(cum_char_to_tok) else 0
+        tok_hi = cum_char_to_tok[val_end - 1] if (val_end - 1) < len(cum_char_to_tok) else tok_lo
+        span = token_logprobs[tok_lo:tok_hi + 1]
+        if not span:
+            continue
+        mean_logp = sum(span) / len(span)
+        per_object[occurrence][key] = max(0.0, min(1.0, float(_torch.tensor(mean_logp).exp().item())))
+
+    return per_object
+
+
+def _attach_logit_confs(attrs: dict, logit_confs: dict[str, float]) -> dict:
+    """Merge logit-derived confidences into a parsed attrs dict.
+
+    Shared-conf fields (e.g. upper_color + upper_type → upper_conf) take the
+    MIN of the per-value confidences, so a shaky color doesn't get masked by
+    a confident type.
+    """
+    shared_min: dict[str, float] = {}
+    for vlm_key, conf_key, _norm in _ATTR_CONF_MAP:
+        if vlm_key not in logit_confs:
+            continue
+        c = float(logit_confs[vlm_key])
+        if conf_key in shared_min:
+            shared_min[conf_key] = min(shared_min[conf_key], c)
+        else:
+            shared_min[conf_key] = c
+    for conf_key, c in shared_min.items():
+        attrs[conf_key] = c
+    return attrs
 
 
 def _extract_json_array(raw: str) -> list[dict]:
@@ -1103,7 +1379,11 @@ def _extract_json_array(raw: str) -> list[dict]:
 
 
 def _caption_crop_vlm(crop: "Image.Image") -> dict:
-    """Generate open-vocabulary appearance attributes via Qwen2-VL-7B-Instruct (single crop)."""
+    """Generate open-vocabulary appearance attributes via Qwen2-VL-7B-Instruct (single crop).
+
+    Returns attrs with logit-derived confidence fields filled in (None for
+    values the model didn't emit / didn't match the JSON pattern).
+    """
     model = get_model("qwen2vl")
     processor = get_model("qwen2vl_processor")
     if model is None or processor is None:
@@ -1118,23 +1398,38 @@ def _caption_crop_vlm(crop: "Image.Image") -> dict:
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = processor(text=[text], images=[crop], return_tensors="pt").to(device)
         with torch.no_grad():
-            output_ids = model.generate(
+            gen = model.generate(
                 **inputs,
                 max_new_tokens=VLM_BATCH_MAX_NEW_TOKENS_PER_CROP,
                 do_sample=False,
                 temperature=None,
                 top_p=None,
                 top_k=None,
+                return_dict_in_generate=True,
+                output_scores=True,
             )
+        output_ids = gen.sequences
+        scores = list(gen.scores or [])
         input_len = inputs["input_ids"].shape[1]
-        raw = processor.decode(output_ids[0][input_len:], skip_special_tokens=True).strip()
+        gen_ids = output_ids[0][input_len:]
+        raw = processor.decode(gen_ids, skip_special_tokens=True).strip()
 
         json_match = re.search(r'\{.*\}', raw, re.DOTALL)
         if not json_match:
             logger.warning("[vlm] JSON not found in output: %s", raw[:200])
             return _default_attributes()
 
-        return _parse_vlm_attrs(json.loads(json_match.group()))
+        attrs = _parse_vlm_attrs(json.loads(json_match.group()))
+
+        # Token-level confidences from the model's own logits.
+        try:
+            tokenizer = getattr(processor, "tokenizer", processor)
+            logit_confs = _compute_value_logprob_confs(gen_ids.detach().cpu(), scores, tokenizer)
+            _attach_logit_confs(attrs, logit_confs)
+        except Exception as conf_exc:
+            logger.warning("[vlm] logit-conf compute failed (single): %s", conf_exc)
+
+        return attrs
 
     except Exception as exc:
         logger.warning("[vlm] _caption_crop_vlm failed: %s", exc)
@@ -1218,25 +1513,48 @@ def _caption_crops_vlm_batch(crops: list, batch_size: int = VLM_BATCH_SIZE, tag:
             inputs = processor(text=[text], images=batch, return_tensors="pt").to(device)
 
             with torch.no_grad():
-                output_ids = model.generate(
+                gen = model.generate(
                     **inputs,
                     max_new_tokens=VLM_BATCH_MAX_NEW_TOKENS_PER_CROP * n,
                     do_sample=False,
                     temperature=None,
                     top_p=None,
                     top_k=None,
+                    return_dict_in_generate=True,
+                    output_scores=True,
                 )
+            output_ids = gen.sequences
+            scores = list(gen.scores or [])
 
             input_len = inputs["input_ids"].shape[1]
-            raw = processor.decode(output_ids[0][input_len:], skip_special_tokens=True).strip()
+            gen_ids = output_ids[0][input_len:]
+            raw = processor.decode(gen_ids, skip_special_tokens=True).strip()
 
             parsed_list = _extract_json_array(raw)
             if not isinstance(parsed_list, list) or len(parsed_list) != n:
                 raise ValueError(f"Expected {n} objects, got {len(parsed_list) if isinstance(parsed_list, list) else type(parsed_list)}")
 
             logger.debug("[vlm] batch(%d) OK at offset %d", n, i)
-            for obj in parsed_list:
-                results.append(_parse_vlm_attrs(obj))
+
+            # Logit-derived per-object confidence. In batch mode every key
+            # appears n times in `decoded` (once per object). We re-walk the
+            # decoded string and partition matches by object — the k-th
+            # occurrence of each key belongs to object k. _compute_value_logprob_confs
+            # returns a flat dict; we instead handle batch here directly.
+            try:
+                tokenizer = getattr(processor, "tokenizer", processor)
+                batch_logit_confs = _compute_value_logprob_confs_batch(
+                    gen_ids.detach().cpu(), scores, tokenizer, n,
+                )
+            except Exception as conf_exc:
+                logger.warning("[vlm] logit-conf compute failed (batch=%d): %s", n, conf_exc)
+                batch_logit_confs = [{} for _ in range(n)]
+
+            for k, obj in enumerate(parsed_list):
+                attrs = _parse_vlm_attrs(obj)
+                if k < len(batch_logit_confs):
+                    _attach_logit_confs(attrs, batch_logit_confs[k])
+                results.append(attrs)
             i += n
             stable_windows += 1
             _log_progress(len(results), n)
@@ -1319,8 +1637,8 @@ def _build_appearance_summary(attrs: dict) -> str:
     # Fallback: compose from VLM desc fields
     parts = []
     gender = (attrs.get("gender") or "").strip()
-    upper = (attrs.get("upper_clothing_desc") or "").strip()
-    lower = (attrs.get("lower_clothing_desc") or "").strip()
+    upper = (attrs.get("upper_desc") or "").strip()
+    lower = (attrs.get("lower_desc") or "").strip()
     if gender and gender != "unknown":
         parts.append(gender)
     if upper and upper != "unknown":
@@ -1348,7 +1666,7 @@ def _extract_crop_for_vlm(frame: np.ndarray, bbox: list[float]) -> Optional[np.n
     right = max_dim - crop.shape[1] - left
     padded = cv2.copyMakeBorder(
         crop, top, bottom, left, right,
-        cv2.BORDER_CONSTANT, value=(0, 0, 0)
+        cv2.BORDER_CONSTANT, value=(114, 114, 114)
     )
     return cv2.resize(padded, (384, 384), interpolation=cv2.INTER_LINEAR)
 
@@ -1440,53 +1758,24 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
         action = _run_videomae_actions(tracklet_frames, rep_bbox)
         summary = _build_appearance_summary(attributes)
 
-        tracklets.append(TrackletResult(
+        tracklets.append(_build_tracklet_result(
             tracklet_id=f"{req.video_id}_{camera_id}_{group_idx}",
             video_id=req.video_id,
             camera_id=camera_id,
-            track_id=group_idx,
+            track_idx=group_idx,
             start_time=group[0].get("timestamp", 0),
             end_time=group[-1].get("timestamp", 0),
             quality_score=float(mid_det.get("score", 0.5)),
-            gender=attributes.get("gender", "unknown"),
-            age_range=attributes.get("age_range", "unknown"),
-            top_color=attributes.get("top_color", "unknown"),
-            bottom_color=attributes.get("bottom_color", "unknown"),
-            shoes_color=attributes.get("shoes_color", "unknown"),
-            hat_color=attributes.get("hat_color", "unknown"),
-            bag_type=attributes.get("bag_type", "unknown"),
-            is_wearing_mask=attributes.get("is_wearing_mask", "unknown"),
-            hair_style=attributes.get("hair_style", "unknown"),
-            hair_color=attributes.get("hair_color", "unknown"),
-            appearance_summary=summary,
-            upper_clothing_desc=attributes.get("upper_clothing_desc"),
-            upper_clothing_color=attributes.get("upper_clothing_color"),
-            upper_clothing_type=attributes.get("upper_clothing_type"),
-            upper_clothing_conf=attributes.get("upper_clothing_conf"),
-            lower_clothing_desc=attributes.get("lower_clothing_desc"),
-            lower_clothing_color=attributes.get("lower_clothing_color"),
-            lower_clothing_type=attributes.get("lower_clothing_type"),
-            lower_clothing_conf=attributes.get("lower_clothing_conf"),
-            shoes_desc=attributes.get("shoes_desc"),
-            shoes_type=attributes.get("shoes_type"),
-            bag_presence=attributes.get("bag_presence"),
-            bag_desc=attributes.get("bag_desc"),
-            bag_conf=attributes.get("bag_conf"),
-            hat_presence=attributes.get("hat_presence"),
-            hat_type=attributes.get("hat_type"),
-            hat_desc=attributes.get("hat_desc"),
-            hat_conf=attributes.get("hat_conf"),
-            mask_conf=attributes.get("mask_conf"),
-            gender_conf=attributes.get("gender_conf"),
-            age_range_conf=attributes.get("age_range_conf"),
-            representative_bbox=[int(x) for x in rep_bbox],
+            attrs=attributes,
+            summary=summary,
+            rep_bbox=rep_bbox,
             bev_x=rep_bev_x,
             bev_y=rep_bev_y,
-            embedding_vector=embedding or [],
-            action=action,
-            occlusion_score=0.0,
-            contributing_cameras=[camera_id],
-            contributing_video_ids=[req.video_id],
+            siglip_embedding=[],
+            action=action if isinstance(action, str) else str(action),
+            action_confidence=0.0,
+            kinetics_label="",
+            crop_url="",
         ))
 
     elapsed = time.time() - start
@@ -1595,6 +1884,7 @@ def _best_observation(obs: list):
 def _batch_siglip_embeddings(
     t_data: list,
     video_id: str,
+    frame_lookup: dict | None = None,
 ) -> tuple[list, list, list]:
     """
     Batch SigLIP2 embeddings only. DINOv2 removed — SigLIP2 is the sole embedding model.
@@ -1602,7 +1892,13 @@ def _batch_siglip_embeddings(
       siglip_multi_feats: multi-frame pool-avg per fragment (for fragment merge)
       all_rep_crops: PIL Images 384×384 from best-quality frame (for Qwen/storage)
       all_siglip_embeddings: single-crop embedding per fragment (for DB)
+
+    frame_lookup: optional {frame_index -> image} mapping. When provided, the
+    multi-frame SigLIP path crops each frame with that observation's own bbox
+    instead of a frozen rep_bbox — critical for moving subjects.
     """
+    if frame_lookup is None:
+        frame_lookup = {}
     device = _get_device()
     dtype = torch.float16
 
@@ -1621,7 +1917,7 @@ def _batch_siglip_embeddings(
             crop,
             (max_dim - crop.shape[0]) // 2, max_dim - crop.shape[0] - (max_dim - crop.shape[0]) // 2,
             (max_dim - crop.shape[1]) // 2, max_dim - crop.shape[1] - (max_dim - crop.shape[1]) // 2,
-            cv2.BORDER_CONSTANT, value=(0, 0, 0)
+            cv2.BORDER_CONSTANT, value=(114, 114, 114)
         )
         return cv2.resize(pad, (size, size), interpolation=cv2.INTER_LINEAR)
 
@@ -1719,19 +2015,46 @@ def _batch_siglip_embeddings(
         return torch.cat(feats_chunks, dim=0)
 
     # ── SigLIP2 multi-frame pool-avg — for fragment merge ────────────────────
+    # Use PER-OBSERVATION bbox (not the frozen rep_bbox), so each of the 5
+    # sampled crops actually contains the person. Without this, a tracklet of
+    # a moving person ends up averaging crops where 3/5 frames hit background.
+    # The frame-bbox pairs are built from lt.observations to stay aligned.
     siglip_multi_feats = [[] for _ in t_data]
     if model_sip and proc_sip and t_data:
         try:
             siglip_crops, siglip_slices = [], []
             for lt, t_idx, rep_bbox, t_frames in t_data:
-                n = min(5, len(t_frames))
-                indices = np.linspace(0, len(t_frames) - 1, n, dtype=int)
-                start = len(siglip_crops)
-                for idx in indices:
-                    c = _extract_crop(t_frames[idx], rep_bbox, 224)
-                    if c is not None:
-                        siglip_crops.append(Image.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB)))
-                siglip_slices.append((start, len(siglip_crops)))
+                # Build (frame, bbox) pairs aligned by observation order.
+                obs_pairs: list[tuple[np.ndarray, list[float]]] = []
+                if frame_lookup:
+                    for o in lt.observations:
+                        fr = frame_lookup.get(o.frame_index)
+                        if fr is not None:
+                            obs_pairs.append((fr, [float(v) for v in o.bbox]))
+
+                if obs_pairs:
+                    n = min(5, len(obs_pairs))
+                    indices = np.linspace(0, len(obs_pairs) - 1, n, dtype=int)
+                    start = len(siglip_crops)
+                    for idx in indices:
+                        fr, bbox = obs_pairs[idx]
+                        c = _extract_crop(fr, bbox, 224)
+                        if c is not None:
+                            siglip_crops.append(Image.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB)))
+                    siglip_slices.append((start, len(siglip_crops)))
+                else:
+                    # Legacy fallback when no frame_lookup is provided: sample
+                    # t_frames uniformly with the (frozen) rep_bbox. Less
+                    # accurate for moving subjects but keeps callers without
+                    # a frame_lookup working.
+                    n = min(5, len(t_frames))
+                    indices = np.linspace(0, len(t_frames) - 1, n, dtype=int)
+                    start = len(siglip_crops)
+                    for idx in indices:
+                        c = _extract_crop(t_frames[idx], rep_bbox, 224)
+                        if c is not None:
+                            siglip_crops.append(Image.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB)))
+                    siglip_slices.append((start, len(siglip_crops)))
 
             if siglip_crops:
                 feats = _encode_siglip_images_adaptive(siglip_crops, phase="multi-frame")
@@ -1883,7 +2206,9 @@ def _process_video_sync(
         t_frames = [frame_lookup[o.frame_index] for o in lt.observations if o.frame_index in frame_lookup] or [sampled_frames[0].image]
         t_data.append((lt, t_idx, rep_bbox_float, t_frames))
 
-    siglip_multi_feats, all_rep_crops, all_siglip_embeddings = _batch_siglip_embeddings(t_data, video_id)
+    siglip_multi_feats, all_rep_crops, all_siglip_embeddings = _batch_siglip_embeddings(
+        t_data, video_id, frame_lookup=frame_lookup,
+    )
 
     # Stage 8: Post-hoc fragment merging via SigLIP2 cosine similarity.
     import numpy as _np
@@ -1899,6 +2224,8 @@ def _process_video_sync(
         similarity_threshold=FRAGMENT_MERGE_SIM_THRESHOLD,
         max_gap_seconds=FRAGMENT_MERGE_MAX_GAP_SECONDS,
         component_similarity_margin=FRAGMENT_MERGE_COMPONENT_MARGIN,
+        max_speed_px_per_s=FRAGMENT_MERGE_MAX_SPEED_PX_PER_S,
+        spatial_bypass_margin=FRAGMENT_MERGE_SPATIAL_BYPASS_MARGIN,
     )
     _orig_accepted = list(accepted)
     _t_merge = time.perf_counter()
@@ -1915,17 +2242,23 @@ def _process_video_sync(
     for _gi, _g in enumerate(_multi_groups):
         logger.info("[merge] %s:   group %d: %d fragments → 1", video_id, _gi + 1, len(_g))
 
-    def _pool_avg(vecs: list) -> list:
+    def _pool_avg_normalized(vecs: list) -> list:
+        """Average a list of (possibly already-normalized) vectors, then L2-normalize.
+        Re-normalize because mean(unit_vectors) has norm < 1 when fragments diverge."""
         valid = [v for v in vecs if v]
         if not valid:
             return []
-        return _np.array(valid, dtype=_np.float32).mean(axis=0).tolist()
+        arr = _np.asarray(valid, dtype=_np.float32).mean(axis=0)
+        n = float(_np.linalg.norm(arr))
+        if n < 1e-8:
+            return arr.tolist()
+        return (arr / n).tolist()
 
-    def _richest(g: list[int]) -> int:
-        return max(g, key=lambda i: len(_orig_accepted[i].observations))
-
-    all_siglip_embeddings = [_pool_avg([all_siglip_embeddings[i] for i in g]) for g in _groups]
-    all_rep_crops         = [all_rep_crops[_richest(g)]          for g in _groups]
+    # Pool the multi-frame SigLIP features (5 crops/fragment, richer signal)
+    # for the DB-stored embedding, instead of the single-crop variant.
+    all_siglip_embeddings = [
+        _pool_avg_normalized([siglip_multi_feats[i] for i in g]) for g in _groups
+    ]
 
     # Rebuild t_data aligned to merged tracklets — use _best_observation for rep frame
     t_data = []
@@ -1938,9 +2271,10 @@ def _process_video_sync(
         )
         t_data.append((mt, new_idx, rep_bbox_float, t_frames))
 
-    # Rebuild all_rep_crops for Qwen from best-quality frame of each merged tracklet.
-    # _richest() above picks the fragment with most obs, but _best_observation() within
-    # the merged tracklet's observations is the correct frame for appearance captioning.
+    # Build all_rep_crops for Qwen from the best-quality frame of each merged
+    # tracklet (post-merge). _best_observation() scores observations across ALL
+    # fragments in the merged set, so the chosen crop is the sharpest/biggest
+    # of the whole identity, not just the longest fragment.
     def _make_rep_crop_384(frame, bbox):
         x1, y1 = max(0, int(bbox[0])), max(0, int(bbox[1]))
         x2, y2 = min(frame.shape[1], int(bbox[2])), min(frame.shape[0], int(bbox[3]))
@@ -1974,48 +2308,50 @@ def _process_video_sync(
     all_attributes: list[dict] = _caption_crops_vlm_batch(
         all_rep_crops, batch_size=VLM_BATCH_SIZE, tag=video_id,
     )
-    all_attr_confs: list[dict] = []
-    for attrs in all_attributes:
-        all_attr_confs.append({
-            "gender_conf":       attrs.get("gender_conf"),
-            "age_range_conf":    attrs.get("age_range_conf"),
-            "top_color_conf":    attrs.get("upper_clothing_conf"),
-            "bottom_color_conf": attrs.get("lower_clothing_conf"),
-            "shoes_conf":        attrs.get("shoes_conf"),
-            "accessory_conf":    max(
-                attrs.get("bag_conf") or 0.0,
-                attrs.get("hat_conf") or 0.0,
-            ) or None,
-            "hat_color_conf":    attrs.get("hat_conf"),
-            "bag_type_conf":     attrs.get("bag_conf"),
-            "mask_conf":         attrs.get("mask_conf"),
-            "hair_style_conf":   attrs.get("hair_conf"),
-            "hair_color_conf":   attrs.get("hair_conf"),
-        })
+    # Confidence fields are now embedded directly in attrs (filled by
+    # _attach_logit_confs) — no separate `all_attr_confs` mapping needed.
 
     # ── VideoMAE true-batch trên ~25 merged tracklets ────────────────────────
+    # Use PER-FRAME bbox from each observation (not a frozen rep_bbox), so the
+    # crop tracks the person as they move across the tracklet. Frames are aligned
+    # to observations through frame_lookup; obs without a sampled frame are skipped.
     device = _get_device()
     all_actions: list = []
     model_vmae = get_model("videomae")
     proc_vmae  = get_model("videomae_processor")
+
+    def _build_vmae_clip(mt, rep_bbox_fallback: list[float]) -> list[np.ndarray]:
+        """Return 16 frames at 224×224, each cropped by that frame's own bbox."""
+        pairs: list[tuple[np.ndarray, tuple[int, int, int, int]]] = []
+        for o in mt.observations:
+            frame = frame_lookup.get(o.frame_index)
+            if frame is None:
+                continue
+            pairs.append((frame, tuple(int(v) for v in o.bbox)))
+        if not pairs:
+            fb_bbox = tuple(int(v) for v in rep_bbox_fallback)
+            pairs = [(sampled_frames[0].image, fb_bbox)]
+
+        n = len(pairs)
+        idxs = np.linspace(0, n - 1, min(16, n), dtype=int)
+        clip: list[np.ndarray] = []
+        for fi in idxs:
+            f, (x1, y1, x2, y2) = pairs[fi]
+            h, w = f.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            crop = f[y1:y2, x1:x2] if x2 > x1 and y2 > y1 else f
+            if crop.size == 0:
+                crop = f
+            clip.append(cv2.resize(crop, (224, 224), interpolation=cv2.INTER_LINEAR))
+        # Pad to 16 by repeating the last frame
+        while len(clip) < 16:
+            clip.append(clip[-1] if clip else np.zeros((224, 224, 3), dtype=np.uint8))
+        return clip[:16]
+
     if model_vmae and proc_vmae and t_data:
         try:
-            all_clips: list[list[np.ndarray]] = []
-            for lt, t_idx, rep_bbox, t_frames in t_data:
-                x1, y1, x2, y2 = (max(0, int(v)) for v in rep_bbox)
-                n_f = len(t_frames)
-                idx_list = np.linspace(0, n_f - 1, min(16, n_f), dtype=int)
-                frames_224 = []
-                for fi in idx_list:
-                    f = t_frames[fi]
-                    h, w = f.shape[:2]
-                    x2c, y2c = min(w, x2), min(h, y2)
-                    crop = f[y1:y2c, x1:x2c] if x2c > x1 and y2c > y1 else f
-                    frames_224.append(cv2.resize(
-                        crop if crop.size > 0 else f, (224, 224), interpolation=cv2.INTER_LINEAR))
-                while len(frames_224) < 16:
-                    frames_224.append(frames_224[-1] if frames_224 else np.zeros((224, 224, 3), dtype=np.uint8))
-                all_clips.append(frames_224[:16])
+            all_clips = [_build_vmae_clip(mt, rep_bbox) for (mt, _, rep_bbox, _) in t_data]
             inputs = proc_vmae(all_clips, return_tensors="pt")
             inputs = {k: v.to(device=device, dtype=torch.float16) if v.is_floating_point() else v.to(device)
                       for k, v in inputs.items()}
@@ -2031,8 +2367,17 @@ def _process_video_sync(
                 all_actions.append((action, float(conf), label))
             logger.info("[pipeline] %s: VideoMAE done — %d actions", video_id, len(all_actions))
         except Exception as exc:
-            logger.warning("[pipeline] VideoMAE true-batch failed: %s — fallback", exc)
-            all_actions = [(_run_videomae_actions(t[3], t[2]), 0.0, "") for t in t_data]
+            logger.warning("[pipeline] VideoMAE true-batch failed: %s — per-tracklet fallback", exc)
+            all_actions = []
+            for (mt, _, rep_bbox, t_frames) in t_data:
+                # _run_videomae_actions returns a plain str (mapped TraceX action).
+                # Wrap it into (action, conf, kinetics_label) so downstream parsing
+                # in TrackletResult is uniform with the true-batch path. The
+                # previous code wrapped without conversion, which kept the string
+                # intact but lost confidence — accepted, since the slow path is
+                # already a degraded fallback.
+                action = _run_videomae_actions(t_frames, rep_bbox)
+                all_actions.append((str(action), 0.0, ""))
     else:
         all_actions = [("unknown", 0.0, "")] * len(t_data)
 
@@ -2047,7 +2392,7 @@ def _process_video_sync(
     tracklets: list[TrackletResult] = []
     for t_idx, (lt, _, rep_bbox_float, t_frames) in enumerate(t_data):
         obs = lt.observations
-        attributes = all_attributes[t_idx]
+        attrs = all_attributes[t_idx]
         siglip_emb = all_siglip_embeddings[t_idx] if t_idx < len(all_siglip_embeddings) else []
         action_tuple = all_actions[t_idx]
         if isinstance(action_tuple, tuple) and len(action_tuple) >= 3:
@@ -2056,8 +2401,7 @@ def _process_video_sync(
             action, action_conf, kinetics_raw = str(action_tuple[0]), float(action_tuple[1]), ""
         else:
             action, action_conf, kinetics_raw = str(action_tuple), 0.0, ""
-        summary = _build_appearance_summary(attributes)
-        attr_conf = all_attr_confs[t_idx]
+        summary = _build_appearance_summary(attrs)
 
         # Save representative crop image
         crop_url = ""
@@ -2071,65 +2415,36 @@ def _process_video_sync(
             logger.warning("[pipeline] Failed to save crop for %s_%s_%d: %s", video_id, camera_id, t_idx, exc)
 
         quality = quality_results[lt.track_id]
-        tracklets.append(TrackletResult(
+        # Serialize per-frame observations for the bbox timeline (trace-service
+        # uses these to render evidence clips with a moving bbox).
+        obs_payload = [
+            {
+                "frame_index": int(o.frame_index),
+                "timestamp_second": float(o.timestamp_second),
+                "bbox": [int(v) for v in o.bbox],
+                "confidence": float(getattr(o, "confidence", 0.0) or 0.0),
+            }
+            for o in obs
+        ]
+        tracklets.append(_build_tracklet_result(
             tracklet_id=f"{video_id}_{camera_id}_{t_idx}",
             video_id=video_id,
             camera_id=camera_id,
-            track_id=t_idx,
+            track_idx=t_idx,
             start_time=obs[0].timestamp_second,
             end_time=obs[-1].timestamp_second,
             quality_score=quality.average_confidence,
-            gender=attributes.get("gender", "unknown"),
-            age_range=attributes.get("age_range", "unknown"),
-            top_color=attributes.get("top_color", "unknown"),
-            bottom_color=attributes.get("bottom_color", "unknown"),
-            shoes_color=attributes.get("shoes_color", "unknown"),
-            hat_color=attributes.get("hat_color", "unknown"),
-            bag_type=attributes.get("bag_type", "unknown"),
-            is_wearing_mask=attributes.get("is_wearing_mask", "unknown"),
-            hair_style=attributes.get("hair_style", "unknown"),
-            hair_color=attributes.get("hair_color", "unknown"),
-            appearance_summary=summary,
-            crop_url=crop_url,
-            upper_clothing_desc=attributes.get("upper_clothing_desc"),
-            upper_clothing_color=attributes.get("upper_clothing_color"),
-            upper_clothing_type=attributes.get("upper_clothing_type"),
-            upper_clothing_conf=attributes.get("upper_clothing_conf"),
-            lower_clothing_desc=attributes.get("lower_clothing_desc"),
-            lower_clothing_color=attributes.get("lower_clothing_color"),
-            lower_clothing_type=attributes.get("lower_clothing_type"),
-            lower_clothing_conf=attributes.get("lower_clothing_conf"),
-            shoes_desc=attributes.get("shoes_desc"),
-            shoes_type=attributes.get("shoes_type"),
-            bag_presence=attributes.get("bag_presence"),
-            bag_desc=attributes.get("bag_desc"),
-            bag_conf=attributes.get("bag_conf"),
-            hat_presence=attributes.get("hat_presence"),
-            hat_type=attributes.get("hat_type"),
-            hat_desc=attributes.get("hat_desc"),
-            hat_conf=attributes.get("hat_conf"),
-            representative_bbox=[int(x) for x in rep_bbox_float],
+            attrs=attrs,
+            summary=summary,
+            rep_bbox=rep_bbox_float,
             bev_x=_bev_inputs[t_idx].get("bev_x", 0.0),
             bev_y=_bev_inputs[t_idx].get("bev_y", 0.0),
-            embedding_vector=[],
-            siglip_embedding=siglip_emb or [],
+            siglip_embedding=siglip_emb,
             action=action,
             action_confidence=action_conf,
             kinetics_label=kinetics_raw,
-            occlusion_score=0.0,
-            gender_conf=attr_conf.get("gender_conf"),
-            top_color_conf=attr_conf.get("top_color_conf"),
-            bottom_color_conf=attr_conf.get("bottom_color_conf"),
-            shoes_conf=attr_conf.get("shoes_conf"),
-            accessory_conf=attr_conf.get("accessory_conf"),
-            age_range_conf=attr_conf.get("age_range_conf"),
-            hat_color_conf=attr_conf.get("hat_color_conf"),
-            bag_type_conf=attr_conf.get("bag_type_conf"),
-            mask_conf=attr_conf.get("mask_conf"),
-            hair_style_conf=attr_conf.get("hair_style_conf"),
-            hair_color_conf=attr_conf.get("hair_color_conf"),
-            contributing_cameras=[camera_id],
-            contributing_video_ids=[video_id],
+            crop_url=crop_url,
+            observations=obs_payload,
         ))
 
     elapsed = time.time() - start
@@ -2306,55 +2621,24 @@ def process_batch(req: BatchProcessRequest) -> BatchProcessResponse:
         summary = _build_appearance_summary(attributes)
         global_tracklet_id = f"{tracklet_id_prefix}_{group_idx}"
 
-        tracklets.append(TrackletResult(
+        tracklets.append(_build_tracklet_result(
             tracklet_id=global_tracklet_id,
             video_id=rep_vid,
             camera_id=rep_cam,
-            track_id=group_idx,
+            track_idx=group_idx,
             start_time=start_time,
             end_time=end_time,
             quality_score=float(rep_det.get("score", 0.5)),
-            gender=attributes.get("gender", "unknown"),
-            age_range=attributes.get("age_range", "unknown"),
-            top_color=attributes.get("top_color", "unknown"),
-            bottom_color=attributes.get("bottom_color", "unknown"),
-            shoes_color=attributes.get("shoes_color", "unknown"),
-            hat_color=attributes.get("hat_color", "unknown"),
-            bag_type=attributes.get("bag_type", "unknown"),
-            is_wearing_mask=attributes.get("is_wearing_mask", "unknown"),
-            hair_style=attributes.get("hair_style", "unknown"),
-            hair_color=attributes.get("hair_color", "unknown"),
-            appearance_summary=summary,
-            upper_clothing_desc=attributes.get("upper_clothing_desc"),
-            upper_clothing_color=attributes.get("upper_clothing_color"),
-            upper_clothing_type=attributes.get("upper_clothing_type"),
-            upper_clothing_conf=attributes.get("upper_clothing_conf"),
-            lower_clothing_desc=attributes.get("lower_clothing_desc"),
-            lower_clothing_color=attributes.get("lower_clothing_color"),
-            lower_clothing_type=attributes.get("lower_clothing_type"),
-            lower_clothing_conf=attributes.get("lower_clothing_conf"),
-            shoes_desc=attributes.get("shoes_desc"),
-            shoes_type=attributes.get("shoes_type"),
-            bag_presence=attributes.get("bag_presence"),
-            bag_desc=attributes.get("bag_desc"),
-            bag_conf=attributes.get("bag_conf"),
-            hat_presence=attributes.get("hat_presence"),
-            hat_type=attributes.get("hat_type"),
-            hat_desc=attributes.get("hat_desc"),
-            hat_conf=attributes.get("hat_conf"),
-            gender_conf=attributes.get("gender_conf"),
-            age_range_conf=attributes.get("age_range_conf"),
-            mask_conf=attributes.get("mask_conf"),
-            hair_style_conf=attributes.get("hair_conf"),
-            hair_color_conf=attributes.get("hair_conf"),
-            representative_bbox=[int(x) for x in rep_bbox],
+            attrs=attributes,
+            summary=summary,
+            rep_bbox=rep_bbox,
             bev_x=rep_bev_x,
             bev_y=rep_bev_y,
-            embedding_vector=[],
-            action=action,
-            occlusion_score=0.0,
-            contributing_cameras=sorted(set(contributing_cams)),
-            contributing_video_ids=sorted(contributing_vids),
+            siglip_embedding=[],
+            action=action if isinstance(action, str) else str(action),
+            action_confidence=0.0,
+            kinetics_label="",
+            crop_url="",
         ))
 
     elapsed = time.time() - start

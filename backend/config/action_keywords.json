@@ -1,0 +1,48 @@
+{
+  "_comment": "Maps TraceX simplified action labels (Kinetics-400 → 8-class taxonomy in metadata-service/video_process.py) to keyword sets in English and Vietnamese. Loader matches whole words for ASCII tokens and substring for phrases containing spaces or non-ASCII chars. Edit this file to add synonyms without redeploying code.",
+  "_action_confidence_floor": 0.3,
+  "_bonus_score": 0.05,
+  "actions": {
+    "walking": [
+      "walk", "walking", "walks", "walked",
+      "stroll", "strolling",
+      "đi bộ", "đi", "dạo"
+    ],
+    "running": [
+      "run", "running", "runs", "ran",
+      "jog", "jogging", "sprint", "sprinting",
+      "chạy", "chạy bộ", "chạy nhanh"
+    ],
+    "standing": [
+      "stand", "standing", "stands",
+      "stationary", "still",
+      "đứng", "đứng yên"
+    ],
+    "sitting": [
+      "sit", "sitting", "sits", "sat",
+      "seated", "lying", "lie", "lying down",
+      "ngồi", "nằm"
+    ],
+    "bending": [
+      "bend", "bending", "bends", "bent",
+      "crouch", "crouching", "stoop", "stooping",
+      "cúi", "khom", "cúi xuống"
+    ],
+    "carrying": [
+      "carry", "carrying", "carries", "carried",
+      "holding", "hold",
+      "mang", "vác", "xách", "cầm"
+    ],
+    "pushing_pulling": [
+      "push", "pushing", "pushes", "pushed",
+      "pull", "pulling", "pulls", "pulled",
+      "đẩy", "kéo"
+    ],
+    "sports": [
+      "play", "playing", "plays", "played",
+      "sport", "sports", "exercise", "exercising",
+      "workout", "working out",
+      "chơi", "tập", "thể thao", "tập thể dục"
+    ]
+  }
+}

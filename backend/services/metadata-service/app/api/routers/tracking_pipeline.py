@@ -617,9 +617,12 @@ class TrackletFragmentMerger:
     Post-hoc fragment merging using SigLIP2 or DINOv2 cosine similarity.
 
     Fragments of the same person caused by occlusion are re-joined when:
-      1. They are temporally ordered (tj starts after ti ends, overlap ≤ 1 s).
+      1. They are strictly temporally ordered (tj starts after ti ends — no overlap).
       2. The temporal gap is within max_gap_seconds / max_gap_frames.
       3. Their appearance embeddings have cosine similarity ≥ similarity_threshold.
+      4. The foot-point displacement between ti.end and tj.start is plausible
+         given the gap duration (max_speed_px_per_s), unless SigLIP similarity
+         is high enough (≥ sim_thresh + spatial_bypass_margin) to override.
 
     Union-Find is guarded at component level so a weak bridge cannot collapse
     many different people into one large merged tracklet.
@@ -634,11 +637,15 @@ class TrackletFragmentMerger:
         max_gap_seconds: float = 480.0,
         max_gap_frames: int = 1920,
         component_similarity_margin: float = 0.03,
+        max_speed_px_per_s: float = 800.0,
+        spatial_bypass_margin: float = 0.05,
     ):
         self.sim_thresh     = similarity_threshold
         self.max_gap_s      = max_gap_seconds
         self.max_gap_frames = max_gap_frames
         self.component_floor = max(0.0, similarity_threshold - component_similarity_margin)
+        self.max_speed_px_per_s = max_speed_px_per_s
+        self.spatial_bypass_thresh = min(1.0, similarity_threshold + spatial_bypass_margin)
 
     def merge(
         self,
@@ -684,10 +691,11 @@ class TrackletFragmentMerger:
             for a in members[px]:
                 for b in members[py]:
                     early, late = (a, b) if starts_t[a] <= starts_t[b] else (b, a)
-                    # Same-person fragments should not be visible concurrently.
-                    if starts_t[late] - ends_t[early] < -1.0:
+                    # Same-person fragments cannot be visible concurrently in
+                    # one camera. Any temporal overlap → different people.
+                    if starts_t[late] - ends_t[early] < 0.0:
                         return False
-                    if starts_f[late] - ends_f[early] < -4:
+                    if starts_f[late] - ends_f[early] < 0:
                         return False
             return True
 
@@ -720,6 +728,7 @@ class TrackletFragmentMerger:
             ti        = tracklets[order[i]]
             ti_end_f  = ti.observations[-1].frame_index
             ti_end_t  = ti.observations[-1].timestamp_second
+            ti_end_foot = _foot_point(ti.observations[-1].bbox)
 
             for j in range(i + 1, n):
                 tj         = tracklets[order[j]]
@@ -731,13 +740,28 @@ class TrackletFragmentMerger:
                     break  # sorted → all future j will also exceed frame gap
 
                 gap_t = tj_start_t - ti_end_t
-                if gap_t < -1.0:   # overlap > 1 s → concurrent, different people
+                if gap_t < 0.0:   # any temporal overlap → different people
                     continue
                 if gap_t > self.max_gap_s:
                     continue
 
-                if sim[i, j] >= self.sim_thresh:
-                    union(i, j)
+                if sim[i, j] < self.sim_thresh:
+                    continue
+
+                # Spatial transition gate: foot-point displacement between
+                # ti's last frame and tj's first frame must be plausible for
+                # the elapsed gap. A weak/borderline appearance match that
+                # violates this gate is rejected; a very strong match
+                # (≥ spatial_bypass_thresh) can override (e.g. camera with
+                # large dead zones, fast occluded transit).
+                tj_start_foot = _foot_point(tj.observations[0].bbox)
+                dist_px = _dist(ti_end_foot, tj_start_foot)
+                # Floor at 0.25 s so gap≈0 doesn't collapse the budget to 0.
+                max_dist = max(gap_t, 0.25) * self.max_speed_px_per_s
+                if dist_px > max_dist and sim[i, j] < self.spatial_bypass_thresh:
+                    continue
+
+                union(i, j)
 
         # ── Build merged tracklets ────────────────────────────────────────────
         root_to_members: dict[int, list[int]] = defaultdict(list)

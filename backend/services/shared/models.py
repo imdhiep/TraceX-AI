@@ -248,91 +248,93 @@ class Tracklet(Base):
         Index("ix_tracklets_video_id", "video_id"),
         Index("ix_tracklets_camera_id", "camera_id"),
         Index("ix_tracklets_bev_xy", "bev_x", "bev_y"),
-        Index("ix_tracklets_upper_color",  "upper_clothing_color"),
-        Index("ix_tracklets_upper_type",   "upper_clothing_type"),
-        Index("ix_tracklets_lower_color",  "lower_clothing_color"),
-        Index("ix_tracklets_lower_type",   "lower_clothing_type"),
+        Index("ix_tracklets_upper_color",  "upper_color"),
+        Index("ix_tracklets_upper_type",   "upper_type"),
+        Index("ix_tracklets_lower_color",  "lower_color"),
+        Index("ix_tracklets_lower_type",   "lower_type"),
         Index("ix_tracklets_bag_presence", "bag_presence"),
         Index("ix_tracklets_hat_presence", "hat_presence"),
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True,)
-    tracklet_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True,)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tracklet_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     video_id: Mapped[str] = mapped_column(
         String(255), ForeignKey("videos.video_id", ondelete="CASCADE"), nullable=False,
     )
-    camera_id: Mapped[str] = mapped_column(String(50), nullable=False,)
-    track_id: Mapped[str] = mapped_column(String(50), nullable=False)  # ID within the video
+    camera_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    track_id: Mapped[str] = mapped_column(String(50), nullable=False)
 
     # Temporal
     start_time: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    end_time: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    end_time:   Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
 
     # Quality
     quality_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    occlusion_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
 
-    # Per-attribute confidence scores from Qwen2-VL-2B-Instruct (null = not yet extracted)
-    gender_conf: Mapped[float | None] = mapped_column(Float, nullable=True)
-    top_color_conf: Mapped[float | None] = mapped_column(Float, nullable=True)
-    bottom_color_conf: Mapped[float | None] = mapped_column(Float, nullable=True)
-    shoes_conf: Mapped[float | None] = mapped_column(Float, nullable=True)
-    accessory_conf: Mapped[float | None] = mapped_column(Float, nullable=True)
-    age_range_conf: Mapped[float | None] = mapped_column(Float, nullable=True)
-    hat_color_conf: Mapped[float | None] = mapped_column(Float, nullable=True)
-    bag_type_conf: Mapped[float | None] = mapped_column(Float, nullable=True)
-    mask_conf: Mapped[float | None] = mapped_column(Float, nullable=True)
-    hair_style_conf: Mapped[float | None] = mapped_column(Float, nullable=True)
-    hair_color_conf: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # ── Demographic (Qwen2-VL) ──────────────────────────────────────────
+    gender:         Mapped[str]           = mapped_column(String(32), nullable=False, default="unknown")
+    gender_conf:    Mapped[float | None]  = mapped_column(Float, nullable=True)
+    age_range:      Mapped[str]           = mapped_column(String(32), nullable=False, default="unknown")
+    age_range_conf: Mapped[float | None]  = mapped_column(Float, nullable=True)
 
-    # Appearance attributes
-    gender: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
-    age_range: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
-    top_color: Mapped[str] = mapped_column(String(64), nullable=False, default="unknown")
-    bottom_color: Mapped[str] = mapped_column(String(64), nullable=False, default="unknown")
-    shoes_color: Mapped[str] = mapped_column(String(64), nullable=False, default="unknown")
-    hat_color: Mapped[str] = mapped_column(String(64), nullable=False, default="unknown")
-    bag_type: Mapped[str] = mapped_column(String(64), nullable=False, default="unknown")
-    is_wearing_mask: Mapped[str] = mapped_column(String(16), nullable=False, default="unknown")
-    hair_style: Mapped[str] = mapped_column(String(64), nullable=False, default="unknown")
-    hair_color: Mapped[str] = mapped_column(String(64), nullable=False, default="unknown")
-    appearance_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # ── Upper clothing (Qwen2-VL) ───────────────────────────────────────
+    upper_color:     Mapped[str | None]    = mapped_column(String(64),  nullable=True)
+    upper_type:      Mapped[str | None]    = mapped_column(String(128), nullable=True)
+    upper_desc:      Mapped[str | None]    = mapped_column(Text,        nullable=True)
+    upper_conf:      Mapped[float | None]  = mapped_column(Float,       nullable=True)
+    upper_desc_conf: Mapped[float | None]  = mapped_column(Float,       nullable=True)
 
-    # Open-vocabulary clothing metadata (Qwen2-VL-2B-Instruct)
-    upper_clothing_desc:  Mapped[str | None] = mapped_column(Text, nullable=True)
-    upper_clothing_color: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    upper_clothing_type:  Mapped[str | None] = mapped_column(String(128), nullable=True)
-    upper_clothing_conf:  Mapped[float | None] = mapped_column(Float, nullable=True)
+    # ── Lower clothing ──────────────────────────────────────────────────
+    lower_color:     Mapped[str | None]    = mapped_column(String(64),  nullable=True)
+    lower_type:      Mapped[str | None]    = mapped_column(String(128), nullable=True)
+    lower_desc:      Mapped[str | None]    = mapped_column(Text,        nullable=True)
+    lower_conf:      Mapped[float | None]  = mapped_column(Float,       nullable=True)
+    lower_desc_conf: Mapped[float | None]  = mapped_column(Float,       nullable=True)
 
-    lower_clothing_desc:  Mapped[str | None] = mapped_column(Text, nullable=True)
-    lower_clothing_color: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    lower_clothing_type:  Mapped[str | None] = mapped_column(String(128), nullable=True)
-    lower_clothing_conf:  Mapped[float | None] = mapped_column(Float, nullable=True)
+    # ── Shoes ───────────────────────────────────────────────────────────
+    shoes_color:     Mapped[str | None]    = mapped_column(String(64),  nullable=True)
+    shoes_type:      Mapped[str | None]    = mapped_column(String(128), nullable=True)
+    shoes_desc:      Mapped[str | None]    = mapped_column(Text,        nullable=True)
+    shoes_conf:      Mapped[float | None]  = mapped_column(Float,       nullable=True)
+    shoes_desc_conf: Mapped[float | None]  = mapped_column(Float,       nullable=True)
 
-    shoes_desc: Mapped[str | None] = mapped_column(Text, nullable=True)
-    shoes_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # ── Bag (accessory) ─────────────────────────────────────────────────
+    bag_presence:    Mapped[str | None]    = mapped_column(String(16),  nullable=True)
+    bag_type:        Mapped[str | None]    = mapped_column(String(64),  nullable=True)
+    bag_desc:        Mapped[str | None]    = mapped_column(Text,        nullable=True)
+    bag_conf:        Mapped[float | None]  = mapped_column(Float,       nullable=True)
+    bag_desc_conf:   Mapped[float | None]  = mapped_column(Float,       nullable=True)
 
-    bag_desc:     Mapped[str | None] = mapped_column(Text, nullable=True)
-    bag_presence: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    bag_conf:     Mapped[float | None] = mapped_column(Float, nullable=True)
+    # ── Hat (accessory) ─────────────────────────────────────────────────
+    hat_presence:    Mapped[str | None]    = mapped_column(String(16),  nullable=True)
+    hat_color:       Mapped[str | None]    = mapped_column(String(64),  nullable=True)
+    hat_type:        Mapped[str | None]    = mapped_column(String(128), nullable=True)
+    hat_desc:        Mapped[str | None]    = mapped_column(Text,        nullable=True)
+    hat_conf:        Mapped[float | None]  = mapped_column(Float,       nullable=True)
+    hat_desc_conf:   Mapped[float | None]  = mapped_column(Float,       nullable=True)
 
-    hat_desc:     Mapped[str | None] = mapped_column(Text, nullable=True)
-    hat_presence: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    hat_type:     Mapped[str | None] = mapped_column(String(128), nullable=True)
-    hat_conf:     Mapped[float | None] = mapped_column(Float, nullable=True)
+    # ── Mask ────────────────────────────────────────────────────────────
+    mask_presence:   Mapped[str]           = mapped_column(String(16), nullable=False, default="unknown")
+    mask_conf:       Mapped[float | None]  = mapped_column(Float,      nullable=True)
 
-    # Spatial (BEV)
+    # ── Hair ────────────────────────────────────────────────────────────
+    hair_style:      Mapped[str]           = mapped_column(String(64), nullable=False, default="unknown")
+    hair_style_conf: Mapped[float | None]  = mapped_column(Float,      nullable=True)
+    hair_color:      Mapped[str]           = mapped_column(String(64), nullable=False, default="unknown")
+    hair_color_conf: Mapped[float | None]  = mapped_column(Float,      nullable=True)
+
+    # ── Free-text whole-person summary ──────────────────────────────────
+    appearance_summary:      Mapped[str]          = mapped_column(Text,  nullable=False, default="")
+    appearance_summary_conf: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # ── Spatial (BEV) ───────────────────────────────────────────────────
     bev_x: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     bev_y: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
 
-    # Crop & bbox
-    crop_url: Mapped[str] = mapped_column(String(2048), nullable=False, default="")
-    representative_bbox: Mapped[list] = mapped_column(JSON, nullable=False, default=list)  # [x1, y1, x2, y2]
+    # ── Crop & bbox ─────────────────────────────────────────────────────
+    crop_url:            Mapped[str]  = mapped_column(String(2048), nullable=False, default="")
+    representative_bbox: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
 
-    # Metadata
-    contributing_cameras: Mapped[list] = mapped_column(JSON, nullable=False, default=list)  # cross-camera
-    contributing_video_ids: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
-    batch_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False,
     )
@@ -351,6 +353,10 @@ class Tracklet(Base):
     actions: Mapped[list["TrackletAction"]] = relationship(
         back_populates="tracklet", cascade="all, delete-orphan",
     )
+    observations: Mapped[list["TrackletObservation"]] = relationship(
+        back_populates="tracklet", cascade="all, delete-orphan",
+        order_by="TrackletObservation.frame_index",
+    )
     query_candidate_tracklets: Mapped[list["QueryCandidateTracklet"]] = relationship(
         back_populates="tracklet", cascade="all, delete-orphan",
     )
@@ -363,29 +369,25 @@ class Tracklet(Base):
 
 
 class TrackletEmbedding(Base):
-    """DINOv2 ViT-L/14 Re-ID embedding + SigLIP 2-So400m search embedding per tracklet.
+    """SigLIP 2-So400m embedding per tracklet (1152-dim).
 
-    embedding: 1024-dim (DINOv2 ViT-L/14) — cosine Re-ID similarity
-    siglip_embedding: 1152-dim (SigLIP 2-So400m image encoder) — text-image search
+    The single embedding model in use. Same space as text queries → enables
+    text-to-image search directly via cosine similarity on `siglip_embedding`.
+    Vector is L2-normalized at write time so cosine = dot product.
     """
     __tablename__ = "tracklets_embeddings"
     __table_args__ = (
         UniqueConstraint("tracklet_id", name="uq_tracklets_embeddings_tracklet_id"),
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True,)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
     tracklet_id: Mapped[str] = mapped_column(
         String(255), ForeignKey("tracklets.tracklet_id", ondelete="CASCADE"),
         nullable=False, unique=True,
     )
-    embedding_vector: Mapped[list] = mapped_column(JSON, nullable=False)       # DINOv2 JSON (backward compat)
-    embedding: Mapped[list | None] = mapped_column(
-        PgVector(1024) if _PGVECTOR_AVAILABLE else JSON, nullable=True,
-    )                                                                           # DINOv2 vector(1024)
     siglip_embedding: Mapped[list | None] = mapped_column(
         PgVector(1152) if _PGVECTOR_AVAILABLE else JSON, nullable=True,
-    )                                                                           # SigLIP2 vector(1152) — same space as text queries
-    model_version: Mapped[str] = mapped_column(String(128), nullable=False, default="dinov2_vitl14")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False,
     )
@@ -417,6 +419,35 @@ class TrackletAction(Base):
     )
 
     tracklet: Mapped[Tracklet] = relationship(back_populates="actions")
+
+
+class TrackletObservation(Base):
+    """Per-frame bbox of a tracklet — used to render evidence clips with a
+    bbox that follows the subject across frames (instead of one frozen
+    `representative_bbox`).
+
+    Saved at ingest time from the merged tracklet's `lt.observations`. One row
+    per frame the tracker emitted for this identity.
+    """
+    __tablename__ = "tracklet_observations"
+    __table_args__ = (
+        UniqueConstraint("tracklet_id", "frame_index", name="uq_tracklet_observations_tracklet_frame"),
+        Index("ix_tracklet_obs_tracklet_id", "tracklet_id"),
+        Index("ix_tracklet_obs_tracklet_frame", "tracklet_id", "frame_index"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tracklet_id: Mapped[str] = mapped_column(
+        String(255), ForeignKey("tracklets.tracklet_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    frame_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    timestamp_second: Mapped[float] = mapped_column(Float, nullable=False)
+    # [x1, y1, x2, y2] in original video pixel coordinates
+    bbox: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    tracklet: Mapped[Tracklet] = relationship(back_populates="observations")
 
 
 # ============================================================================

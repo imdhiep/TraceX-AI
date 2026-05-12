@@ -46,6 +46,14 @@ services:
       bash -c "
         set -e
         cd /var/lib/postgresql/data
+        if [ ! -f PG_VERSION ]; then
+          echo 'pgdata is empty — skip repair, postgres will initdb fresh.'
+          chown -R postgres:postgres /var/lib/postgresql/data
+          exit 0
+        fi
+        # Stale lock from an abrupt previous shutdown. Safe to remove because
+        # postgres-init only runs before the postgres container.
+        rm -f postmaster.pid
         for d in pg_notify pg_tblspc pg_replslot pg_stat pg_stat_tmp pg_snapshots pg_commit_ts pg_twophase pg_logical/snapshots pg_logical/mappings; do
           mkdir -p \$$d
         done

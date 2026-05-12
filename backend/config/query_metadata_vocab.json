@@ -1,0 +1,111 @@
+{
+  "_comment": "Vocabulary for parsing user queries into structured (field, value) constraints. Used by query-service/app/services/query_metadata_parse.py. ASCII single-token keywords match on word boundaries; phrases (containing space) and non-ASCII (Vietnamese) keywords match by substring. The garment_color_window controls how many tokens apart a color and a garment can be while still binding to each other.",
+  "_bonus_per_match": 0.04,
+  "_max_metadata_bonus": 0.20,
+  "_garment_color_window": 4,
+  "_action_bonus": 0.05,
+  "_action_confidence_floor": 0.3,
+
+  "gender": {
+    "woman": [
+      "woman", "women", "female", "girl", "lady",
+      "phụ nữ", "phu nu", "nữ", "nu",
+      "con gái", "co gai", "cô gái", "co gai",
+      "chị", "chi", "em gái", "em gai"
+    ],
+    "man": [
+      "man", "men", "male", "boy", "guy", "gentleman",
+      "đàn ông", "dan ong", "nam",
+      "con trai", "anh", "chú", "chu"
+    ]
+  },
+
+  "color": {
+    "red":    ["red", "crimson", "scarlet", "maroon", "đỏ", "do"],
+    "white":  ["white", "trắng", "trang"],
+    "black":  ["black", "đen", "den"],
+    "blue":   ["blue", "navy", "xanh dương", "xanh duong", "xanh nước biển"],
+    "green":  ["green", "olive", "xanh lá", "xanh la", "xanh lá cây"],
+    "yellow": ["yellow", "vàng", "vang"],
+    "orange": ["orange", "cam"],
+    "pink":   ["pink", "hồng", "hong"],
+    "purple": ["purple", "violet", "tím", "tim"],
+    "brown":  ["brown", "beige", "tan", "nâu", "nau"],
+    "gray":   ["gray", "grey", "xám", "xam"],
+    "silver": ["silver", "bạc", "bac"],
+    "gold":   ["gold", "golden", "vàng kim", "vang kim"]
+  },
+
+  "garment": {
+    "upper": [
+      "shirt", "tshirt", "t-shirt", "tee", "blouse", "top",
+      "jacket", "coat", "hoodie", "sweater", "jumper", "cardigan",
+      "uniform", "dress",
+      "áo", "ao", "áo phông", "ao phong", "áo khoác", "ao khoac",
+      "áo sơ mi", "ao so mi", "áo thun", "ao thun"
+    ],
+    "lower": [
+      "pants", "trousers", "jeans", "shorts", "skirt", "dress",
+      "leggings", "tights",
+      "quần", "quan", "quần jean", "quan jean", "quần short",
+      "quần dài", "quan dai", "váy", "vay"
+    ],
+    "shoes": [
+      "shoes", "sneakers", "boots", "sandals", "heels", "flats",
+      "loafers", "footwear",
+      "giày", "giay", "dép", "dep", "ủng", "ung"
+    ],
+    "hat": [
+      "hat", "cap", "beanie", "helmet", "headwear",
+      "mũ", "mu", "nón", "non"
+    ],
+    "bag": [
+      "bag", "backpack", "purse", "handbag", "satchel",
+      "túi", "tui", "ba lô", "ba lo", "balo", "túi xách", "tui xach"
+    ]
+  },
+
+  "actions": {
+    "walking": [
+      "walk", "walking", "walks", "walked",
+      "stroll", "strolling",
+      "đi bộ", "di bo", "đi", "di", "dạo", "dao"
+    ],
+    "running": [
+      "run", "running", "runs", "ran",
+      "jog", "jogging", "sprint", "sprinting",
+      "chạy", "chay", "chạy bộ", "chay bo"
+    ],
+    "standing": [
+      "stand", "standing", "stands",
+      "stationary", "still",
+      "đứng", "dung", "đứng yên", "dung yen"
+    ],
+    "sitting": [
+      "sit", "sitting", "sits", "sat",
+      "seated", "lying", "lie", "lying down",
+      "ngồi", "ngoi", "nằm", "nam"
+    ],
+    "bending": [
+      "bend", "bending", "bends", "bent",
+      "crouch", "crouching", "stoop", "stooping",
+      "cúi", "cui", "khom"
+    ],
+    "carrying": [
+      "carry", "carrying", "carries", "carried",
+      "holding", "hold",
+      "mang", "vác", "vac", "xách", "xach", "cầm", "cam"
+    ],
+    "pushing_pulling": [
+      "push", "pushing", "pushes", "pushed",
+      "pull", "pulling", "pulls", "pulled",
+      "đẩy", "day", "kéo", "keo"
+    ],
+    "sports": [
+      "play", "playing", "plays", "played",
+      "sport", "sports", "exercise", "exercising",
+      "workout", "working out",
+      "chơi", "choi", "tập", "tap", "thể thao", "the thao"
+    ]
+  }
+}

@@ -14,6 +14,7 @@ from .models import (
     Tracklet,
     TrackletAction,
     TrackletEmbedding,
+    TrackletObservation,
     # Query & Results
     EvidenceTracklet,
     EvidenceVideo,
@@ -47,6 +48,7 @@ __all__ = [
     "Tracklet",
     "TrackletEmbedding",
     "TrackletAction",
+    "TrackletObservation",
     # Group 4
     "QueryHistory",
     "QueryCandidate",

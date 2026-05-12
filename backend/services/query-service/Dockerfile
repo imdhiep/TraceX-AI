@@ -29,6 +29,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY backend/services/shared ./shared
 COPY backend/services/query-service/app ./app
+COPY backend/config ./backend/config
 
 ENV PYTHONPATH=/app
 ENV SEAMLESS_MODEL=facebook/seamless-m4t-v2-large

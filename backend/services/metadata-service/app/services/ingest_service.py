@@ -305,7 +305,7 @@ def _save_tracklets_from_gpu_result(
     Parse GPU result and save to v3.3 tables.
     Returns number of tracklets saved.
     """
-    from shared.models import Tracklet, TrackletEmbedding, TrackletAction
+    from shared.models import Tracklet, TrackletEmbedding, TrackletAction, TrackletObservation
 
     tracklets = gpu_result.get("tracklets", [])
     saved = 0
@@ -335,67 +335,75 @@ def _save_tracklets_from_gpu_result(
             start_time=float(t.get("start_time") or 0.0),
             end_time=float(t.get("end_time") or 0.0),
             quality_score=float(t.get("quality_score") or 0.0),
-            occlusion_score=float(t.get("occlusion_score") or 0.0),
+
+            # Demographic
             gender=_s(t.get("gender"), 32),
+            gender_conf=_opt_float(t.get("gender_conf")),
             age_range=_s(t.get("age_range"), 32),
-            # backward compat — populated from VLM upper/lower clothing color
-            top_color=_s(t.get("top_color") or t.get("upper_clothing_color"), 64),
-            bottom_color=_s(t.get("bottom_color") or t.get("lower_clothing_color"), 64),
-            shoes_color=_s(t.get("shoes_color"), 64),
-            hat_color=_s(t.get("hat_color"), 64),
-            bag_type=_s(t.get("bag_type"), 64),
-            is_wearing_mask=_s(t.get("is_wearing_mask"), 16),
-            hair_style=_s(t.get("hair_style"), 64),
-            hair_color=_s(t.get("hair_color"), 64),
-            appearance_summary=str(t.get("appearance_summary") or ""),
-            # open-vocabulary VLM metadata
-            upper_clothing_desc=t.get("upper_clothing_desc"),
-            upper_clothing_color=t.get("upper_clothing_color"),
-            upper_clothing_type=t.get("upper_clothing_type"),
-            upper_clothing_conf=_opt_float(t.get("upper_clothing_conf")),
-            lower_clothing_desc=t.get("lower_clothing_desc"),
-            lower_clothing_color=t.get("lower_clothing_color"),
-            lower_clothing_type=t.get("lower_clothing_type"),
-            lower_clothing_conf=_opt_float(t.get("lower_clothing_conf")),
+            age_range_conf=_opt_float(t.get("age_range_conf")),
+
+            # Upper
+            upper_color=_s(t.get("upper_color"), 64, "unknown") if t.get("upper_color") else None,
+            upper_type=_s(t.get("upper_type"), 128, "unknown") if t.get("upper_type") else None,
+            upper_desc=t.get("upper_desc"),
+            upper_conf=_opt_float(t.get("upper_conf")),
+            upper_desc_conf=_opt_float(t.get("upper_desc_conf")),
+
+            # Lower
+            lower_color=_s(t.get("lower_color"), 64, "unknown") if t.get("lower_color") else None,
+            lower_type=_s(t.get("lower_type"), 128, "unknown") if t.get("lower_type") else None,
+            lower_desc=t.get("lower_desc"),
+            lower_conf=_opt_float(t.get("lower_conf")),
+            lower_desc_conf=_opt_float(t.get("lower_desc_conf")),
+
+            # Shoes
+            shoes_color=_s(t.get("shoes_color"), 64, "unknown") if t.get("shoes_color") else None,
+            shoes_type=_s(t.get("shoes_type"), 128, "unknown") if t.get("shoes_type") else None,
             shoes_desc=t.get("shoes_desc"),
-            shoes_type=t.get("shoes_type"),
-            bag_desc=t.get("bag_desc"),
+            shoes_conf=_opt_float(t.get("shoes_conf")),
+            shoes_desc_conf=_opt_float(t.get("shoes_desc_conf")),
+
+            # Bag
             bag_presence=_s(t.get("bag_presence"), 16, "unknown") if t.get("bag_presence") else None,
+            bag_type=_s(t.get("bag_type"), 64, "unknown") if t.get("bag_type") else None,
+            bag_desc=t.get("bag_desc"),
             bag_conf=_opt_float(t.get("bag_conf")),
-            hat_desc=t.get("hat_desc"),
+            bag_desc_conf=_opt_float(t.get("bag_desc_conf")),
+
+            # Hat
             hat_presence=_s(t.get("hat_presence"), 16, "unknown") if t.get("hat_presence") else None,
-            hat_type=_s(t.get("hat_type"), 128) if t.get("hat_type") else None,
+            hat_color=_s(t.get("hat_color"), 64, "unknown") if t.get("hat_color") else None,
+            hat_type=_s(t.get("hat_type"), 128, "unknown") if t.get("hat_type") else None,
+            hat_desc=t.get("hat_desc"),
             hat_conf=_opt_float(t.get("hat_conf")),
+            hat_desc_conf=_opt_float(t.get("hat_desc_conf")),
+
+            # Mask / hair
+            mask_presence=_s(t.get("mask_presence"), 16),
+            mask_conf=_opt_float(t.get("mask_conf")),
+            hair_style=_s(t.get("hair_style"), 64),
+            hair_style_conf=_opt_float(t.get("hair_style_conf")),
+            hair_color=_s(t.get("hair_color"), 64),
+            hair_color_conf=_opt_float(t.get("hair_color_conf")),
+
+            # Summary
+            appearance_summary=str(t.get("appearance_summary") or ""),
+            appearance_summary_conf=_opt_float(t.get("appearance_summary_conf")),
+
+            # Spatial / crop
             bev_x=float(t.get("bev_x") or 0.0),
             bev_y=float(t.get("bev_y") or 0.0),
             crop_url=str(t.get("crop_url") or ""),
             representative_bbox=t.get("representative_bbox") or [],
-            contributing_cameras=t.get("contributing_cameras") or [],
-            contributing_video_ids=t.get("contributing_video_ids") or [],
-            gender_conf=_opt_float(t.get("gender_conf")),
-            top_color_conf=_opt_float(t.get("top_color_conf") or t.get("upper_clothing_conf")),
-            bottom_color_conf=_opt_float(t.get("bottom_color_conf") or t.get("lower_clothing_conf")),
-            shoes_conf=_opt_float(t.get("shoes_conf")),
-            accessory_conf=_opt_float(t.get("accessory_conf")),
-            age_range_conf=_opt_float(t.get("age_range_conf")),
-            hat_color_conf=_opt_float(t.get("hat_color_conf") or t.get("hat_conf")),
-            bag_type_conf=_opt_float(t.get("bag_type_conf") or t.get("bag_conf")),
-            mask_conf=_opt_float(t.get("mask_conf")),
-            hair_style_conf=_opt_float(t.get("hair_style_conf") or t.get("hair_conf")),
-            hair_color_conf=_opt_float(t.get("hair_color_conf") or t.get("hair_conf")),
         )
         session.add(tracklet)
 
-        # Embedding (DINOv2 1024-dim + SigLIP2 1152-dim)
-        embedding_vec = t.get("embedding_vector") or []
+        # Embedding (SigLIP2 1152-dim only)
         siglip_vec = t.get("siglip_embedding") or []
-        if embedding_vec or siglip_vec:
+        if siglip_vec:
             session.add(TrackletEmbedding(
                 tracklet_id=tracklet_id,
-                embedding_vector=embedding_vec or [],   # DINOv2 JSON fallback
-                embedding=embedding_vec or None,        # DINOv2 vector(1024)
-                siglip_embedding=siglip_vec or None,    # SigLIP2 vector(1152)
-                model_version="dinov2_vitl14+siglip2",
+                siglip_embedding=siglip_vec,
             ))
 
         # Action (VideoMAE V2)
@@ -406,6 +414,43 @@ def _save_tracklets_from_gpu_result(
                 action_label=action_label,
                 kinetics_label=str(t.get("kinetics_label") or ""),
                 confidence=float(t.get("action_confidence") or 0.0),
+            ))
+
+        # Per-frame observations (bbox timeline) for trace-service evidence rendering
+        obs_list = t.get("observations") or []
+        obs_by_frame: dict[int, dict] = {}
+        for o in obs_list:
+            try:
+                bbox = o.get("bbox") or []
+                if not bbox or len(bbox) < 4:
+                    continue
+                frame_index = int(o.get("frame_index") or 0)
+                confidence = float(o.get("confidence") or 0.0)
+                normalized = {
+                    "timestamp_second": float(o.get("timestamp_second") or 0.0),
+                    "bbox": [int(v) for v in bbox[:4]],
+                    "confidence": confidence or None,
+                }
+                existing_obs = obs_by_frame.get(frame_index)
+                existing_conf = float(existing_obs.get("confidence") or 0.0) if existing_obs else -1.0
+                if existing_obs is None or confidence >= existing_conf:
+                    obs_by_frame[frame_index] = normalized
+            except Exception as exc:
+                logger.warning("[ingest] skip bad observation for %s: %s", tracklet_id, exc)
+
+        if len(obs_by_frame) < len(obs_list):
+            logger.debug(
+                "[ingest] dedup observations for %s: %d -> %d unique frames",
+                tracklet_id, len(obs_list), len(obs_by_frame),
+            )
+
+        for frame_index, o in sorted(obs_by_frame.items()):
+            session.add(TrackletObservation(
+                tracklet_id=tracklet_id,
+                frame_index=frame_index,
+                timestamp_second=o["timestamp_second"],
+                bbox=o["bbox"],
+                confidence=o["confidence"],
             ))
 
         saved += 1

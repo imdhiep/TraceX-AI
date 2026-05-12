@@ -5,6 +5,7 @@ from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ...config import settings
@@ -48,6 +49,14 @@ def _build_trace_service(session: Session) -> TraceService:
     return TraceService(session)
 
 
+def _get_query(session: Session, query_id: UUID | str) -> QueryHistory | None:
+    return session.scalar(select(QueryHistory).where(QueryHistory.query_id == str(query_id)))
+
+
+def _get_candidate(session: Session, candidate_id: str) -> QueryCandidate | None:
+    return session.scalar(select(QueryCandidate).where(QueryCandidate.candidate_id == str(candidate_id)))
+
+
 @router.post("/select", response_model=SelectCandidateResponse)
 def select_candidate(
     request: SelectCandidateRequest,
@@ -60,15 +69,15 @@ def select_candidate(
     service = _build_trace_service(session)
 
     # Verify query exists
-    query = session.get(QueryHistory, request.query_id)
+    query = _get_query(session, request.query_id)
     if not query:
         raise HTTPException(status_code=404, detail="Query not found")
 
     # Verify candidate exists and belongs to query
-    candidate = session.get(QueryCandidate, request.candidate_id)
+    candidate = _get_candidate(session, request.candidate_id)
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
-    if candidate.query_id != request.query_id:
+    if candidate.query_id != str(request.query_id):
         raise HTTPException(status_code=400, detail="Candidate does not belong to this query")
 
     # Deselect all other candidates for this query
@@ -80,7 +89,7 @@ def select_candidate(
     candidate.selected_at = now
 
     # Update query status
-    query.selected_candidate_id = request.candidate_id
+    query.selected_candidate_id = str(request.candidate_id)
     query.updated_at = now
 
     session.commit()
@@ -107,17 +116,17 @@ def build_trace(
     service = _build_trace_service(session)
 
     # Verify query exists
-    query = session.get(QueryHistory, request.query_id)
+    query = _get_query(session, request.query_id)
     if not query:
         raise HTTPException(status_code=404, detail="Query not found")
 
     # Verify candidate exists and is selected
-    candidate = session.get(QueryCandidate, request.candidate_id)
+    candidate = _get_candidate(session, request.candidate_id)
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
     if not candidate.is_selected:
         raise HTTPException(status_code=400, detail="Candidate is not selected. Please select it first.")
-    if candidate.query_id != request.query_id:
+    if candidate.query_id != str(request.query_id):
         raise HTTPException(status_code=400, detail="Candidate does not belong to this query")
 
     # Delete old evidence for this candidate (cache overwrite behavior)
@@ -137,7 +146,11 @@ def build_trace(
         raise HTTPException(status_code=404, detail="No tracklets found for candidate in time window")
 
     # Build trace segments
-    segments = service.build_trace_segments(tracklets)
+    segments = service.build_trace_segments(
+        tracklets,
+        query_id=request.query_id,
+        candidate_id=request.candidate_id,
+    )
 
     # Calculate trace confidence
     trace_confidence = service.calculate_trace_confidence(segments)
@@ -182,7 +195,7 @@ def build_trace(
         segment_count=len(segments),
         total_duration_seconds=int(total_duration),
         segments=segment_responses,
-        merged_video_url=evidence.video_url if request.merge_videos else None,
+        merged_video_url=(evidence.video_url or None) if request.merge_videos else None,
         time_window_start=window_start,
         time_window_end=window_end,
     )
@@ -190,7 +203,7 @@ def build_trace(
 
 @router.get("/status/{evidence_id}", response_model=TraceStatusResponse)
 def get_trace_status(
-    evidence_id: UUID,
+    evidence_id: int,
     session: SessionDep,
 ) -> TraceStatusResponse:
     """Get trace status by evidence ID."""
@@ -201,17 +214,17 @@ def get_trace_status(
     return TraceStatusResponse(
         evidence_id=evidence.id,
         query_id=evidence.query_id,
-        status=evidence.status,
+        status="completed",
         trace_confidence=evidence.trace_confidence,
         segment_count=evidence.segment_count,
         created_at=evidence.created_at,
-        updated_at=evidence.updated_at,
+        updated_at=evidence.created_at,
     )
 
 
 @router.get("/timeline/{evidence_id}", response_model=TraceTimelineResponse)
 def get_trace_timeline(
-    evidence_id: UUID,
+    evidence_id: int,
     session: SessionDep,
 ) -> TraceTimelineResponse:
     """Get trace timeline with camera path."""
@@ -279,7 +292,7 @@ def submit_feedback(
 
         # Link tracklets
         evidence_tracklets = session.query(EvidenceTracklet).filter(
-            EvidenceTracklet.evidence_id == evidence.id
+            EvidenceTracklet.evidence_video_id == evidence.id
         ).all()
 
         for idx, et in enumerate(evidence_tracklets):
@@ -309,14 +322,14 @@ def get_candidate_detail(
     """Get detailed information about a candidate for preview."""
     service = _build_trace_service(session)
 
-    query = session.get(QueryHistory, request.query_id)
+    query = _get_query(session, request.query_id)
     if not query:
         raise HTTPException(status_code=404, detail="Query not found")
 
-    candidate = session.get(QueryCandidate, request.candidate_id)
+    candidate = _get_candidate(session, request.candidate_id)
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
-    if candidate.query_id != request.query_id:
+    if candidate.query_id != str(request.query_id):
         raise HTTPException(status_code=400, detail="Candidate does not belong to this query")
 
     # Get tracklets within 24h window
@@ -337,7 +350,7 @@ def get_candidate_detail(
         video = t.video if t.video_id else None
         tracklet_previews.append(
             CandidateTrackletPreview(
-                tracklet_id=t.id,
+                tracklet_id=t.tracklet_id,
                 camera_id=t.camera_id,
                 time_start=t.video.created_at if t.video else None,
                 time_end=None,
@@ -351,7 +364,7 @@ def get_candidate_detail(
             camera_ids.append(t.camera_id)
 
     return CandidateDetailResponse(
-        candidate_id=candidate.id,
+        candidate_id=candidate.candidate_id,
         candidate_key=candidate.candidate_key,
         fusion_score=candidate.fusion_score,
         vector_score=candidate.vector_score,
@@ -373,21 +386,21 @@ def continue_trace(
     """Continue/retrace with a new time window."""
     service = _build_trace_service(session)
 
-    query = session.get(QueryHistory, request.query_id)
+    query = _get_query(session, request.query_id)
     if not query:
         raise HTTPException(status_code=404, detail="Query not found")
 
-    candidate = session.get(QueryCandidate, request.candidate_id)
+    candidate = _get_candidate(session, request.candidate_id)
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
     if not candidate.is_selected:
         raise HTTPException(status_code=400, detail="Candidate is not selected")
-    if candidate.query_id != request.query_id:
+    if candidate.query_id != str(request.query_id):
         raise HTTPException(status_code=400, detail="Candidate does not belong to this query")
 
     # Get previous evidence
     previous_evidence = session.query(EvidenceVideo).filter(
-        EvidenceVideo.selected_candidate_id == request.candidate_id
+        EvidenceVideo.query_candidate_id == str(request.candidate_id)
     ).order_by(EvidenceVideo.created_at.desc()).first()
 
     if not previous_evidence:
@@ -406,7 +419,11 @@ def continue_trace(
         time_window_end=window_end,
     )
 
-    segments = service.build_trace_segments(tracklets)
+    segments = service.build_trace_segments(
+        tracklets,
+        query_id=request.query_id,
+        candidate_id=request.candidate_id,
+    )
     trace_confidence = service.calculate_trace_confidence(segments)
 
     new_evidence = service.create_evidence_video(

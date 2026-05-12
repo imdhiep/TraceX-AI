@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Query service starting — SeamlessM4T v2-large warmup...")
+    logger.info("Query service starting — model warmup...")
 
     # SeamlessM4T v2-large translation model
     try:
@@ -32,6 +32,16 @@ async def lifespan(app: FastAPI):
         logger.info("SeamlessM4T v2-large ready")
     except Exception as exc:
         logger.warning("SeamlessM4T warmup skipped (non-fatal): %s", exc)
+
+    # SigLIP2 text + image towers — required for vector re-ranking in candidates.search.
+    # Without this, _encode_query_text_siglip() returns [] and fusion silently
+    # falls back to text+quality only (0.7/0.3), ignoring siglip_embedding in DB.
+    try:
+        from .services.model_warmup import warmup_models
+        await warmup_models()
+        logger.info("SigLIP2 ready")
+    except Exception as exc:
+        logger.warning("SigLIP2 warmup skipped (non-fatal): %s", exc)
 
     logger.info("Query service warmup complete")
     yield
