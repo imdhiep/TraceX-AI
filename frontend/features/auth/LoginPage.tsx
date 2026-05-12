@@ -52,6 +52,7 @@ export function LoginPage() {
   const { showToast } = useToast();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [fieldErrors, setFieldErrors] = useState<{ email?: string; password?: string }>({});
 
@@ -201,25 +202,66 @@ export function LoginPage() {
               </label>
               <label className="flex flex-col gap-1.5 text-sm font-medium text-ink">
                 Password
-                <input
-                  type="password"
-                  value={password}
-                  onChange={(e) => {
-                    setPassword(e.target.value);
-                    if (fieldErrors.password) {
-                      setFieldErrors((prev) => ({ ...prev, password: undefined }));
-                    }
-                  }}
-                  autoComplete="current-password"
-                  className={[
-                    "rounded-2xl border px-4 py-3 text-base text-ink shadow-card outline-none ring-accent/25 focus:ring-2",
-                    fieldErrors.password
-                      ? "border-red-300 bg-red-50 focus:border-red-400"
-                      : "border-surface-muted focus:border-accent",
-                  ].join(" ")}
-                  placeholder="••••••••"
-                  aria-invalid={Boolean(fieldErrors.password)}
-                />
+                <div className="relative">
+                  <input
+                    type={showPassword ? "text" : "password"}
+                    value={password}
+                    onChange={(e) => {
+                      setPassword(e.target.value);
+                      if (fieldErrors.password) {
+                        setFieldErrors((prev) => ({ ...prev, password: undefined }));
+                      }
+                    }}
+                    autoComplete="current-password"
+                    className={[
+                      "w-full rounded-2xl border px-4 py-3 pr-12 text-base text-ink shadow-card outline-none ring-accent/25 focus:ring-2",
+                      fieldErrors.password
+                        ? "border-red-300 bg-red-50 focus:border-red-400"
+                        : "border-surface-muted focus:border-accent",
+                    ].join(" ")}
+                    placeholder="••••••••"
+                    aria-invalid={Boolean(fieldErrors.password)}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((current) => !current)}
+                    className="absolute right-3 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-full text-ink-secondary transition hover:bg-slate-100 hover:text-ink focus:outline-none focus:ring-2 focus:ring-accent/30"
+                    aria-label={showPassword ? "Ẩn mật khẩu" : "Hiển thị mật khẩu"}
+                    aria-pressed={showPassword}
+                  >
+                    {showPassword ? (
+                      <svg
+                        aria-hidden="true"
+                        viewBox="0 0 24 24"
+                        className="h-5 w-5"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      >
+                        <path d="m3 3 18 18" />
+                        <path d="M10.58 10.58a2 2 0 0 0 2.83 2.83" />
+                        <path d="M9.88 4.24A10.67 10.67 0 0 1 12 4c5 0 8.5 4.5 9.5 6.5a11.8 11.8 0 0 1-2.31 3.19" />
+                        <path d="M6.61 6.61A13.43 13.43 0 0 0 2.5 10.5C3.5 12.5 7 17 12 17a10.83 10.83 0 0 0 4.18-.82" />
+                      </svg>
+                    ) : (
+                      <svg
+                        aria-hidden="true"
+                        viewBox="0 0 24 24"
+                        className="h-5 w-5"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      >
+                        <path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z" />
+                        <circle cx="12" cy="12" r="3" />
+                      </svg>
+                    )}
+                  </button>
+                </div>
                 {fieldErrors.password ? <span className="text-xs text-red-600">{fieldErrors.password}</span> : null}
               </label>
 
