@@ -101,7 +101,7 @@ export function SearchBar({ className = "" }: SearchBarProps) {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Nhập mô tả người hoặc hành vi cần tìm..."
-          className="min-h-[52px] flex-1 rounded-2xl border border-slate-200/90 bg-gradient-to-br from-white/95 to-blue-50/70 px-5 text-base font-medium text-slate-900 shadow-[0_12px_30px_rgba(15,23,42,0.08)] outline-none ring-sky-300/35 transition-[border-color,box-shadow] duration-200 placeholder:text-slate-400 focus:border-sky-400 focus:ring-2"
+          className="min-h-[52px] flex-1 rounded-2xl border border-slate-200/90 bg-gradient-to-br from-white/95 to-blue-50/70 px-5 text-base font-medium text-slate-900 shadow-[0_12px_30px_rgba(15,23,42,0.08)] outline-none ring-sky-300/35 transition-[border-color,box-shadow] duration-200 placeholder:text-slate-400 focus:border-sky-400 focus:ring-2 dark:border-slate-700/90 dark:bg-gradient-to-br dark:from-slate-900 dark:to-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500 dark:shadow-[0_16px_34px_rgba(2,6,23,0.35)]"
           aria-label="Ô tìm kiếm"
         />
         <input
@@ -115,11 +115,11 @@ export function SearchBar({ className = "" }: SearchBarProps) {
           type="button"
           onClick={() => imageInputRef.current?.click()}
           title="Tải ảnh mẫu (tối đa 5MB)"
-          className="min-h-[52px] shrink-0 cursor-pointer rounded-2xl border border-slate-200/90 bg-white/85 px-4 text-sm font-medium text-slate-700 shadow-[0_12px_30px_rgba(15,23,42,0.08)] transition duration-200 hover:border-sky-300 hover:text-slate-900"
+          className="min-h-[52px] shrink-0 cursor-pointer rounded-2xl border border-slate-200/90 bg-white/85 px-4 text-sm font-medium text-slate-700 shadow-[0_12px_30px_rgba(15,23,42,0.08)] transition duration-200 hover:border-sky-300 hover:text-slate-900 dark:border-slate-700/90 dark:bg-slate-900/85 dark:text-slate-200 dark:shadow-[0_16px_34px_rgba(2,6,23,0.35)] dark:hover:border-sky-500 dark:hover:text-white"
         >
           {image ? (
             <span className="flex items-center gap-1.5">
-              <svg viewBox="0 0 24 24" className="h-4 w-4 text-emerald-600" fill="none" stroke="currentColor" strokeWidth="2">
+              <svg viewBox="0 0 24 24" className="h-4 w-4 text-emerald-600 dark:text-emerald-400" fill="none" stroke="currentColor" strokeWidth="2">
                 <path d="M20 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2Z" />
                 <circle cx="12" cy="13" r="3" />
               </svg>
@@ -136,7 +136,7 @@ export function SearchBar({ className = "" }: SearchBarProps) {
         <button
           type="submit"
           disabled={isLoading}
-          className="min-h-[52px] shrink-0 cursor-pointer rounded-2xl bg-[#0F172A] px-6 text-sm font-semibold text-white shadow-[0_14px_28px_rgba(15,23,42,0.24)] transition duration-200 hover:bg-[#1E293B] disabled:cursor-not-allowed disabled:opacity-50"
+          className="min-h-[52px] shrink-0 cursor-pointer rounded-2xl bg-[#0F172A] px-6 text-sm font-semibold text-white shadow-[0_14px_28px_rgba(15,23,42,0.24)] transition duration-200 hover:bg-[#1E293B] disabled:cursor-not-allowed disabled:opacity-50 dark:bg-blue-600 dark:shadow-[0_16px_32px_rgba(37,99,235,0.3)] dark:hover:bg-blue-500"
         >
           {isLoading ? "Đang tìm..." : "Gửi"}
         </button>
@@ -146,19 +146,19 @@ export function SearchBar({ className = "" }: SearchBarProps) {
         <div className="relative" ref={locationRef}>
           <button
             type="button"
-            className="min-h-[44px] cursor-pointer rounded-xl border border-slate-200/90 bg-white/85 px-4 text-sm font-medium text-slate-700 shadow-[0_8px_20px_rgba(15,23,42,0.06)] transition duration-200 hover:border-sky-300 hover:text-slate-900"
+            className="min-h-[44px] cursor-pointer rounded-xl border border-slate-200/90 bg-white/85 px-4 text-sm font-medium text-slate-700 shadow-[0_8px_20px_rgba(15,23,42,0.06)] transition duration-200 hover:border-sky-300 hover:text-slate-900 dark:border-slate-700/90 dark:bg-slate-900/85 dark:text-slate-200 dark:shadow-[0_12px_26px_rgba(2,6,23,0.32)] dark:hover:border-sky-500 dark:hover:text-white"
             onClick={() => setLocationOpen((prev) => !prev)}
           >
             {selectedCount ? `${selectedSummary} (${selectedCount})` : "Vị trí"}
           </button>
           {locationOpen ? (
-            <div className="absolute left-0 top-[calc(100%+8px)] z-40 w-[320px] rounded-2xl border border-slate-200/90 bg-white/95 p-3 shadow-[0_18px_36px_rgba(15,23,42,0.16)] backdrop-blur-md">
+            <div className="absolute left-0 top-[calc(100%+8px)] z-40 w-[320px] rounded-2xl border border-slate-200/90 bg-white/95 p-3 shadow-[0_18px_36px_rgba(15,23,42,0.16)] backdrop-blur-md dark:border-slate-700/90 dark:bg-slate-950/95 dark:shadow-[0_24px_50px_rgba(2,6,23,0.45)]">
               <input
                 type="text"
                 value={locationKeyword}
                 onChange={(event) => setLocationKeyword(event.target.value)}
                 placeholder="Tìm vị trí..."
-                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 outline-none ring-sky-300/35 focus:border-sky-400 focus:ring-2"
+                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 outline-none ring-sky-300/35 focus:border-sky-400 focus:ring-2 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500"
               />
               <div className="mt-2 max-h-56 space-y-1 overflow-y-auto pr-1">
                 {filteredLocations.map((option) => {
@@ -166,13 +166,13 @@ export function SearchBar({ className = "" }: SearchBarProps) {
                   return (
                     <label
                       key={option.id}
-                      className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-2 text-sm text-slate-700 transition hover:bg-slate-100"
+                      className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-2 text-sm text-slate-700 transition hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
                     >
                       <input
                         type="checkbox"
                         checked={checked}
                         onChange={() => toggleLocation(option.id)}
-                        className="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                        className="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500 dark:border-slate-600 dark:bg-slate-900"
                       />
                       <span className="font-medium">{option.label}</span>
                     </label>
@@ -182,7 +182,7 @@ export function SearchBar({ className = "" }: SearchBarProps) {
               <button
                 type="button"
                 onClick={() => setLocationIds([])}
-                className="mt-2 text-xs font-medium text-sky-700 hover:text-sky-800"
+                className="mt-2 text-xs font-medium text-sky-700 hover:text-sky-800 dark:text-sky-400 dark:hover:text-sky-300"
               >
                 Bỏ chọn vị trí
               </button>
@@ -194,26 +194,26 @@ export function SearchBar({ className = "" }: SearchBarProps) {
           type="datetime-local"
           value={filters.timeFrom}
           onChange={(event) => setTimeFrom(event.target.value)}
-          className="min-h-[44px] rounded-xl border border-slate-200/90 bg-white/85 px-3 text-sm text-slate-700 shadow-[0_8px_20px_rgba(15,23,42,0.06)] outline-none ring-sky-300/35 focus:border-sky-400 focus:ring-2"
+          className="min-h-[44px] rounded-xl border border-slate-200/90 bg-white/85 px-3 text-sm text-slate-700 shadow-[0_8px_20px_rgba(15,23,42,0.06)] outline-none ring-sky-300/35 focus:border-sky-400 focus:ring-2 dark:border-slate-700/90 dark:bg-slate-900/85 dark:text-slate-200 dark:shadow-[0_12px_26px_rgba(2,6,23,0.32)] dark:[color-scheme:dark]"
           aria-label="Thời gian bắt đầu"
         />
         <input
           type="datetime-local"
           value={filters.timeTo}
           onChange={(event) => setTimeTo(event.target.value)}
-          className="min-h-[44px] rounded-xl border border-slate-200/90 bg-white/85 px-3 text-sm text-slate-700 shadow-[0_8px_20px_rgba(15,23,42,0.06)] outline-none ring-sky-300/35 focus:border-sky-400 focus:ring-2"
+          className="min-h-[44px] rounded-xl border border-slate-200/90 bg-white/85 px-3 text-sm text-slate-700 shadow-[0_8px_20px_rgba(15,23,42,0.06)] outline-none ring-sky-300/35 focus:border-sky-400 focus:ring-2 dark:border-slate-700/90 dark:bg-slate-900/85 dark:text-slate-200 dark:shadow-[0_12px_26px_rgba(2,6,23,0.32)] dark:[color-scheme:dark]"
           aria-label="Thời gian kết thúc"
         />
         <button
           type="button"
           onClick={clearFilters}
-          className="min-h-[44px] cursor-pointer rounded-xl border border-slate-200/90 bg-white/85 px-4 text-sm font-medium text-slate-600 transition duration-200 hover:border-slate-300 hover:text-slate-800"
+          className="min-h-[44px] cursor-pointer rounded-xl border border-slate-200/90 bg-white/85 px-4 text-sm font-medium text-slate-600 transition duration-200 hover:border-slate-300 hover:text-slate-800 dark:border-slate-700/90 dark:bg-slate-900/85 dark:text-slate-300 dark:hover:border-slate-600 dark:hover:text-white"
         >
           Xóa lọc
         </button>
       </div>
-      {filterError ? <p className="text-xs font-medium text-red-600">{filterError}</p> : null}
-      {imageError ? <p className="text-xs font-medium text-red-600">{imageError}</p> : null}
+      {filterError ? <p className="text-xs font-medium text-red-600 dark:text-red-400">{filterError}</p> : null}
+      {imageError ? <p className="text-xs font-medium text-red-600 dark:text-red-400">{imageError}</p> : null}
     </form>
   );
 }
