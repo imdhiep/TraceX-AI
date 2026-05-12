@@ -19,7 +19,8 @@ function SidebarFallback() {
 export function MainShell({ children }: { children: ReactNode }) {
   const { hasSearched } = useSearch();
   const pathname = usePathname();
-  const showSearchControls = hasSearched && pathname === "/home";
+  const isHomePage = pathname === "/home";
+  const showSearchControls = hasSearched && isHomePage;
 
   return (
     <div className="flex h-screen overflow-hidden bg-gradient-to-br from-slate-50 via-slate-100 to-blue-50 dark:from-slate-950 dark:via-slate-950 dark:to-slate-900">
@@ -37,7 +38,7 @@ export function MainShell({ children }: { children: ReactNode }) {
           <div className="mx-auto flex max-w-6xl flex-col gap-4">
             <div className="rounded-2xl border border-slate-200/85 bg-white/65 p-3 shadow-[0_12px_30px_rgba(15,23,42,0.07)] backdrop-blur-md dark:border-slate-800/85 dark:bg-slate-900/70 dark:shadow-[0_18px_40px_rgba(2,6,23,0.38)]">
               <div className="flex flex-wrap items-start gap-4">
-                <SearchBar className="min-w-[min(100%,280px)] flex-1" />
+                {isHomePage ? <SearchBar className="min-w-[min(100%,280px)] flex-1" /> : null}
                 <div className="ml-auto flex shrink-0 items-start gap-3 pt-1">
                   {showSearchControls ? <TopKSelect /> : null}
                   <AccountMenu />

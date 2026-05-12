@@ -129,40 +129,40 @@ export function SettingsPage() {
   }, []);
 
   return (
-    <div className="space-y-6">
-      <section className="rounded-2xl border border-surface-muted bg-white p-5 shadow-card">
-        <h1 className="text-xl font-semibold text-ink">Settings</h1>
-        <p className="mt-1 text-sm text-ink-secondary">Quan ly tai khoan, phien dang nhap va thong tin he thong.</p>
+    <div className="space-y-6 text-ink dark:text-slate-100">
+      <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-card dark:border-slate-800 dark:bg-slate-900/90 dark:shadow-[0_20px_40px_rgba(2,6,23,0.34)]">
+        <h1 className="text-xl font-semibold text-slate-950 dark:text-white">Settings</h1>
+        <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">Quan ly tai khoan, phien dang nhap va thong tin he thong.</p>
       </section>
 
       <section className="grid gap-4 md:grid-cols-2">
-        <div className="rounded-2xl border border-surface-muted bg-white p-5 shadow-card">
-          <p className="text-sm font-semibold text-ink">Thong tin tai khoan</p>
-          {loading ? <p className="mt-2 text-sm text-ink-secondary">Dang tai...</p> : null}
+        <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-card dark:border-slate-800 dark:bg-slate-900/90 dark:shadow-[0_20px_40px_rgba(2,6,23,0.34)]">
+          <p className="text-sm font-semibold text-slate-950 dark:text-white">Thong tin tai khoan</p>
+          {loading ? <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">Dang tai...</p> : null}
           {!loading ? (
             <dl className="mt-3 space-y-2 text-sm">
               <div className="flex justify-between gap-3">
-                <dt className="text-ink-secondary">Email</dt>
-                <dd className="font-medium text-ink">{me?.email || sessionUser?.email || "--"}</dd>
+                <dt className="text-slate-500 dark:text-slate-400">Email</dt>
+                <dd className="font-medium text-slate-950 dark:text-slate-100">{me?.email || sessionUser?.email || "--"}</dd>
               </div>
               <div className="flex justify-between gap-3">
-                <dt className="text-ink-secondary">Role</dt>
-                <dd className="font-medium text-ink">{me?.role || sessionUser?.role || "--"}</dd>
+                <dt className="text-slate-500 dark:text-slate-400">Role</dt>
+                <dd className="font-medium text-slate-950 dark:text-slate-100">{me?.role || sessionUser?.role || "--"}</dd>
               </div>
               <div className="flex justify-between gap-3">
-                <dt className="text-ink-secondary">Trang thai</dt>
-                <dd className="font-medium text-ink">{me?.is_active === false ? "Inactive" : "Active"}</dd>
+                <dt className="text-slate-500 dark:text-slate-400">Trang thai</dt>
+                <dd className="font-medium text-slate-950 dark:text-slate-100">{me?.is_active === false ? "Inactive" : "Active"}</dd>
               </div>
               <div className="flex justify-between gap-3">
-                <dt className="text-ink-secondary">Lan dang nhap cuoi</dt>
-                <dd className="font-medium text-ink">{formatDateTime(me?.last_login)}</dd>
+                <dt className="text-slate-500 dark:text-slate-400">Lan dang nhap cuoi</dt>
+                <dd className="font-medium text-slate-950 dark:text-slate-100">{formatDateTime(me?.last_login)}</dd>
               </div>
             </dl>
           ) : null}
         </div>
 
-        <div className="rounded-2xl border border-surface-muted bg-white p-5 shadow-card">
-          <p className="text-sm font-semibold text-ink">Tac vu nhanh</p>
+        <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-card dark:border-slate-800 dark:bg-slate-900/90 dark:shadow-[0_20px_40px_rgba(2,6,23,0.34)]">
+          <p className="text-sm font-semibold text-slate-950 dark:text-white">Tac vu nhanh</p>
           <div className="mt-3 flex flex-col gap-2">
             <button
               type="button"
@@ -170,14 +170,14 @@ export function SettingsPage() {
                 await loadSettingsData();
                 showToast("Da refresh du lieu settings.", "success");
               }}
-              className="rounded-xl border border-surface-muted px-3 py-2 text-left text-sm text-ink transition hover:bg-surface"
+              className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-left text-sm text-slate-800 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-200 dark:hover:bg-slate-800"
             >
               Refresh du lieu
             </button>
             {isAdmin ? (
               <Link
                 href="/admin/users"
-                className="rounded-xl border border-surface-muted px-3 py-2 text-sm text-ink transition hover:bg-surface"
+                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-950/40 dark:text-slate-200 dark:hover:bg-slate-800"
               >
                 Mo User management
               </Link>
@@ -188,7 +188,7 @@ export function SettingsPage() {
                 clearSession();
                 window.location.href = "/login";
               }}
-              className="rounded-xl border border-red-200 px-3 py-2 text-left text-sm text-red-600 transition hover:bg-red-50"
+              className="rounded-xl border border-red-200 bg-white px-3 py-2 text-left text-sm text-red-600 transition hover:bg-red-50 dark:border-red-900/70 dark:bg-red-950/20 dark:text-red-300 dark:hover:bg-red-950/40"
             >
               Dang xuat tai khoan
             </button>
@@ -196,58 +196,58 @@ export function SettingsPage() {
         </div>
       </section>
 
-      <section className="rounded-2xl border border-surface-muted bg-white p-5 shadow-card">
-        <p className="text-sm font-semibold text-ink">Đổi mật khẩu</p>
+      <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-card dark:border-slate-800 dark:bg-slate-900/90 dark:shadow-[0_20px_40px_rgba(2,6,23,0.34)]">
+        <p className="text-sm font-semibold text-slate-950 dark:text-white">Đổi mật khẩu</p>
         <form className="mt-3 flex flex-col gap-3" onSubmit={handleChangePassword}>
           <input
             type="password"
             value={currentPassword}
             onChange={(e) => setCurrentPassword(e.target.value)}
             placeholder="Mật khẩu hiện tại"
-            className="rounded-xl border border-surface-muted px-3 py-2 text-sm outline-none focus:border-accent"
+            className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none ring-sky-300/25 placeholder:text-slate-400 focus:border-accent focus:ring-2 dark:border-slate-700 dark:bg-slate-950/50 dark:text-slate-100 dark:placeholder:text-slate-500"
           />
           <input
             type="password"
             value={newPassword}
             onChange={(e) => setNewPassword(e.target.value)}
             placeholder="Mật khẩu mới (tối thiểu 8 ký tự)"
-            className="rounded-xl border border-surface-muted px-3 py-2 text-sm outline-none focus:border-accent"
+            className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none ring-sky-300/25 placeholder:text-slate-400 focus:border-accent focus:ring-2 dark:border-slate-700 dark:bg-slate-950/50 dark:text-slate-100 dark:placeholder:text-slate-500"
           />
           <input
             type="password"
             value={confirmPassword}
             onChange={(e) => setConfirmPassword(e.target.value)}
             placeholder="Xác nhận mật khẩu mới"
-            className="rounded-xl border border-surface-muted px-3 py-2 text-sm outline-none focus:border-accent"
+            className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none ring-sky-300/25 placeholder:text-slate-400 focus:border-accent focus:ring-2 dark:border-slate-700 dark:bg-slate-950/50 dark:text-slate-100 dark:placeholder:text-slate-500"
           />
           <button
             type="submit"
             disabled={changingPassword}
-            className="rounded-xl bg-accent px-4 py-2 text-sm font-medium text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+            className="rounded-xl bg-accent px-4 py-2 text-sm font-medium text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-blue-600 dark:hover:bg-blue-500"
           >
             {changingPassword ? "Đang xử lý..." : "Đổi mật khẩu"}
           </button>
         </form>
       </section>
 
-      <section className="rounded-2xl border border-surface-muted bg-white p-5 shadow-card">
-        <p className="text-sm font-semibold text-ink">Thong tin he thong</p>
+      <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-card dark:border-slate-800 dark:bg-slate-900/90 dark:shadow-[0_20px_40px_rgba(2,6,23,0.34)]">
+        <p className="text-sm font-semibold text-slate-950 dark:text-white">Thong tin he thong</p>
         <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <div className="rounded-xl border border-surface-muted bg-surface px-3 py-2">
-            <p className="text-xs text-ink-secondary">Users</p>
-            <p className="text-lg font-semibold text-ink">{overview?.metrics?.total_users ?? "--"}</p>
+          <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 dark:border-slate-700 dark:bg-slate-950/45">
+            <p className="text-xs text-slate-500 dark:text-slate-400">Users</p>
+            <p className="text-lg font-semibold text-slate-950 dark:text-slate-100">{overview?.metrics?.total_users ?? "--"}</p>
           </div>
-          <div className="rounded-xl border border-surface-muted bg-surface px-3 py-2">
-            <p className="text-xs text-ink-secondary">Managed videos</p>
-            <p className="text-lg font-semibold text-ink">{overview?.metrics?.total_managed_videos ?? "--"}</p>
+          <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 dark:border-slate-700 dark:bg-slate-950/45">
+            <p className="text-xs text-slate-500 dark:text-slate-400">Managed videos</p>
+            <p className="text-lg font-semibold text-slate-950 dark:text-slate-100">{overview?.metrics?.total_managed_videos ?? "--"}</p>
           </div>
-          <div className="rounded-xl border border-surface-muted bg-surface px-3 py-2">
-            <p className="text-xs text-ink-secondary">Queries</p>
-            <p className="text-lg font-semibold text-ink">{overview?.metrics?.total_queries ?? "--"}</p>
+          <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 dark:border-slate-700 dark:bg-slate-950/45">
+            <p className="text-xs text-slate-500 dark:text-slate-400">Queries</p>
+            <p className="text-lg font-semibold text-slate-950 dark:text-slate-100">{overview?.metrics?.total_queries ?? "--"}</p>
           </div>
-          <div className="rounded-xl border border-surface-muted bg-surface px-3 py-2">
-            <p className="text-xs text-ink-secondary">Queue videos</p>
-            <p className="text-lg font-semibold text-ink">{overview?.metrics?.total_queue_videos ?? "--"}</p>
+          <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 dark:border-slate-700 dark:bg-slate-950/45">
+            <p className="text-xs text-slate-500 dark:text-slate-400">Queue videos</p>
+            <p className="text-lg font-semibold text-slate-950 dark:text-slate-100">{overview?.metrics?.total_queue_videos ?? "--"}</p>
           </div>
         </div>
       </section>
