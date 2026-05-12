@@ -10,8 +10,11 @@ Flow:
 from __future__ import annotations
 
 import heapq
+import json
 import logging
 import math
+import os
+import time
 import uuid
 from collections import defaultdict
 from datetime import datetime
@@ -85,6 +88,94 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/search", tags=["search"])
 
 _translation_warmed_up = False
+
+
+def _get_positive_env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %d", name, raw, default)
+        return default
+
+
+_QUERY_LOG_TOP_N = _get_positive_env_int("QUERY_LOG_TOP_N", 10)
+_QUERY_LOG_GROUP_N = _get_positive_env_int("QUERY_LOG_GROUP_N", 10)
+_QUERY_LOG_MEMBER_N = _get_positive_env_int("QUERY_LOG_MEMBER_N", 8)
+
+
+def _short_text(value: object, limit: int = 160) -> str:
+    text_value = " ".join(str(value or "").split())
+    if len(text_value) <= limit:
+        return text_value
+    return text_value[: max(0, limit - 3)] + "..."
+
+
+def _parsed_query_log_dict(parsed: ParsedQueryMetadata) -> dict[str, list[str]]:
+    return {
+        "gender": parsed.gender,
+        "upper_color": parsed.upper_color,
+        "lower_color": parsed.lower_color,
+        "shoes_color": parsed.shoes_color,
+        "hat_color": parsed.hat_color,
+        "bag_type": parsed.bag_type,
+        "actions": parsed.actions,
+        "unbound_colors": parsed.unbound_colors,
+    }
+
+
+def _tracklet_log_item(
+    tracklet: Tracklet,
+    *,
+    text_score: float | None = None,
+    vector_score: float | None = None,
+) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "tracklet_id": tracklet.tracklet_id,
+        "camera_id": tracklet.camera_id,
+        "track_id": tracklet.track_id,
+        "time": [
+            round(float(tracklet.start_time or 0.0), 2),
+            round(float(tracklet.end_time or 0.0), 2),
+        ],
+        "gender": tracklet.gender,
+        "upper": tracklet.upper_color,
+        "lower": tracklet.lower_color,
+        "shoes": tracklet.shoes_color,
+        "quality": round(float(tracklet.quality_score or 0.0), 4),
+        "summary": _short_text(tracklet.appearance_summary),
+    }
+    if text_score is not None:
+        item["text"] = round(float(text_score), 4)
+    if vector_score is not None:
+        item["vec"] = round(float(vector_score), 4)
+    return item
+
+
+def _score_stats(scores: list[float]) -> dict[str, Any]:
+    if not scores:
+        return {"count": 0}
+    nonzero = [s for s in scores if s > 0.0]
+    return {
+        "count": len(scores),
+        "nonzero": len(nonzero),
+        "min": round(min(scores), 4),
+        "max": round(max(scores), 4),
+        "avg": round(sum(scores) / len(scores), 4),
+    }
+
+
+def _jdump(obj: Any) -> str:
+    """JSON-encode a log payload preserving Vietnamese characters and using a
+    `default=str` fallback so datetimes / Decimal / etc. don't blow up the
+    logger. Output is a single line — friendlier than Python's repr() of
+    nested dicts/lists in `docker logs` while still grep-able."""
+    try:
+        return json.dumps(obj, ensure_ascii=False, default=str)
+    except Exception:
+        return repr(obj)
 
 
 def _ensure_translation_warmed_up():
@@ -558,6 +649,7 @@ def _merge_by_similarity(ranked_tracklets: list[Tracklet]) -> list[list[Tracklet
 @router.post("")
 def search_candidates(body: SearchRequest) -> dict[str, Any]:
     """Search candidates with GPU re-ranking. Accepts JSON body."""
+    request_t0 = time.perf_counter()
     query = body.query or body.text or ""
     top_k = body.top_k
     offset = body.offset
@@ -567,11 +659,33 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
 
     db = SessionLocal()
     try:
+        qid = str(uuid.uuid4())
+        logger.info(
+            "[query:%s] start user_id=%s top_k=%d offset=%d camera_ids=%s "
+            "time_from=%s time_to=%s image_query=%s query=%r",
+            qid,
+            body.user_id,
+            top_k,
+            offset,
+            camera_ids,
+            time_from,
+            time_to,
+            bool(body.query_image_url),
+            query,
+        )
+
         # Translate if Vietnamese
+        translate_t0 = time.perf_counter()
         search_query = _translate_query(query) if query else ""
+        logger.info(
+            "[query:%s] translation elapsed=%.3fs translated=%s search_query=%r",
+            qid,
+            time.perf_counter() - translate_t0,
+            search_query != query,
+            search_query,
+        )
 
         # ── Luồng 20.5: Create QueryHistory record ──────────────────────
-        qid = str(uuid.uuid4())
         qh = QueryHistory(
             query_id=qid,
             user_id=body.user_id,
@@ -586,46 +700,151 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
         # garments / actions). Drives both the gender hard-filter at the
         # prefilter stage and the metadata bonus during rerank.
         parsed_query = parse_query_metadata(search_query)
+        logger.info("[query:%s] parsed_metadata=%s", qid, _jdump(_parsed_query_log_dict(parsed_query)))
 
         # Stage A — Text-shortlist (SQL ILIKE on materialized attributes).
         # Recall up to 200 candidates. This is still text-based, so it can miss
         # tracklets whose appearance_summary phrasing doesn't share tokens with
         # the query — Stage B (SigLIP rerank below) compensates by re-scoring
         # ALL shortlisted items in a shared text↔image embedding space.
+        prefilter_t0 = time.perf_counter()
         shortlist, text_score_map = _local_prefilter(
             db, search_query, camera_ids, time_from, time_to, limit=200,
             parsed=parsed_query,
         )
+        logger.info(
+            "[query:%s] prefilter rows=%d elapsed=%.3fs text_score_stats=%s",
+            qid,
+            len(shortlist),
+            time.perf_counter() - prefilter_t0,
+            _score_stats([float(v) for v in text_score_map.values()]),
+        )
+        if shortlist and logger.isEnabledFor(logging.DEBUG):
+            preview = [
+                _tracklet_log_item(t, text_score=text_score_map.get(t.tracklet_id, 0.0))
+                for t in shortlist[:_QUERY_LOG_TOP_N]
+            ]
+            logger.debug("[query:%s] prefilter_top_%d=%s", qid, len(preview), _jdump(preview))
 
         if not shortlist:
             qh.status = "candidates_found"
             qh.result_count = 0
             db.commit()
+            logger.info(
+                "[query:%s] completed raw_tracklets=0 merged_candidates=0 returned=0 elapsed=%.3fs",
+                qid,
+                time.perf_counter() - request_t0,
+            )
             return {"results": [], "query_id": qid}
 
         # Stage B — Encode the query once with SigLIP. Image takes priority
         # over text when both are supplied; text is the fallback.
         query_vec: list[float] = []
+        query_vec_source: str | None = None
+        encode_t0 = time.perf_counter()
         if body.query_image_url:
             query_vec = _encode_query_image_siglip(body.query_image_url)
             if query_vec:
+                query_vec_source = "image"
                 logger.info("[search] query encoded via SigLIP image tower")
         if not query_vec and search_query:
             query_vec = _encode_query_text_siglip(search_query)
             if query_vec:
+                query_vec_source = "text"
                 logger.info("[search] query encoded via SigLIP text tower (len=%d)", len(search_query))
+        if query_vec:
+            logger.info(
+                "[query:%s] vector_encode source=%s dim=%d elapsed=%.3fs",
+                qid,
+                query_vec_source,
+                len(query_vec),
+                time.perf_counter() - encode_t0,
+            )
+        else:
+            logger.warning(
+                "[query:%s] vector_encode unavailable; fallback=text_quality elapsed=%.3fs",
+                qid,
+                time.perf_counter() - encode_t0,
+            )
 
         # Pre-compute vec-score per tracklet for the whole shortlist.
         # If the SigLIP encoder is unavailable or query is empty, all scores
         # default to 0 and ranking falls back to text + quality.
         per_tracklet_vec_score: dict[str, float] = {}
         if query_vec:
+            vec_t0 = time.perf_counter()
             for t in shortlist:
                 emb = _tracklet_embedding(t)
                 per_tracklet_vec_score[t.tracklet_id] = _vec_score(query_vec, emb)
+            vec_scores = list(per_tracklet_vec_score.values())
+            logger.info(
+                "[query:%s] vector_scores stats=%s elapsed=%.3fs",
+                qid,
+                _score_stats(vec_scores),
+                time.perf_counter() - vec_t0,
+            )
+            if logger.isEnabledFor(logging.DEBUG):
+                top_vec_tracklets = sorted(
+                    shortlist,
+                    key=lambda t: per_tracklet_vec_score.get(t.tracklet_id, 0.0),
+                    reverse=True,
+                )[:_QUERY_LOG_TOP_N]
+                logger.debug(
+                    "[query:%s] vector_top_%d=%s",
+                    qid,
+                    len(top_vec_tracklets),
+                    _jdump([
+                        _tracklet_log_item(
+                            t,
+                            text_score=text_score_map.get(t.tracklet_id, 0.0),
+                            vector_score=per_tracklet_vec_score.get(t.tracklet_id, 0.0),
+                        )
+                        for t in top_vec_tracklets
+                    ]),
+                )
 
         # Stage C — Identity merge (union-find on tracklet-tracklet SigLIP sim).
+        merge_t0 = time.perf_counter()
         groups = _merge_by_similarity(shortlist)
+        merged_groups = [g for g in groups if len(g) > 1]
+        logger.info(
+            "[query:%s] merge groups=%d merged_groups=%d singletons=%d max_group_size=%d elapsed=%.3fs",
+            qid,
+            len(groups),
+            len(merged_groups),
+            len(groups) - len(merged_groups),
+            max((len(g) for g in groups), default=0),
+            time.perf_counter() - merge_t0,
+        )
+        if merged_groups and logger.isEnabledFor(logging.DEBUG):
+            # Cosine recomputation per (rep, member) is expensive on a 1152-d
+            # vector in pure Python (~3 ms / pair) so we gate the entire
+            # preview behind DEBUG. INFO-level summary above is enough for
+            # production health monitoring.
+            group_preview = []
+            for group in merged_groups[:_QUERY_LOG_GROUP_N]:
+                rep_emb = _tracklet_embedding(group[0])
+                member_items = []
+                for member in group[:_QUERY_LOG_MEMBER_N]:
+                    member_item = _tracklet_log_item(
+                        member,
+                        text_score=text_score_map.get(member.tracklet_id, 0.0),
+                        vector_score=per_tracklet_vec_score.get(member.tracklet_id, 0.0)
+                        if query_vec else None,
+                    )
+                    member_emb = _tracklet_embedding(member)
+                    member_item["merge_sim_to_rep"] = (
+                        round(_cosine_sim(rep_emb, member_emb), 4)
+                        if rep_emb and member_emb else None
+                    )
+                    member_items.append(member_item)
+                group_preview.append({
+                    "size": len(group),
+                    "rep_tracklet": group[0].tracklet_id,
+                    "rep_camera": group[0].camera_id,
+                    "members": member_items,
+                })
+            logger.debug("[query:%s] merged_group_preview=%s", qid, _jdump(group_preview))
 
         # Stage C.5 — Per-tracklet action labels (Tier A: soft bonus, no filter).
         # Aggregated to a deduped set per candidate so a query mentioning
@@ -641,6 +860,13 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                 .where(TrackletAction.confidence >= ACTION_CONFIDENCE_FLOOR)
             ).all()
             action_by_tracklet = {tid: label for tid, label in act_rows}
+        logger.info(
+            "[query:%s] actions query_actions=%s loaded_tracklet_actions=%d confidence_floor=%.2f",
+            qid,
+            sorted(query_actions),
+            len(action_by_tracklet),
+            ACTION_CONFIDENCE_FLOOR,
+        )
 
         # Stage D — Score each candidate.
         # New fusion (when query_vec available):
@@ -648,6 +874,7 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
         #          + 0.20 * text_overlap   ← legacy SQL token overlap
         #          + 0.15 * quality
         # Fallback (no query_vec): 0.7 * text_overlap + 0.3 * quality (old behaviour).
+        score_t0 = time.perf_counter()
         merged: list[dict] = []
         for group in groups:
             rep = group[0]
@@ -685,8 +912,9 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
             # never a hard filter. Helps surface candidates whose action
             # matches even when appearance similarity is borderline.
             matched_actions = candidate_actions & query_actions if query_actions else set()
+            action_bonus = ACTION_BONUS_SCORE if matched_actions else 0.0
             if matched_actions:
-                fusion_score += ACTION_BONUS_SCORE
+                fusion_score += action_bonus
 
             # Per-field metadata bonus: each parsed (field, value) that matches
             # at least one member tracklet of this candidate adds
@@ -749,8 +977,10 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                     matched_metadata["gender"] = list(parsed_query.gender)
                     metadata_bonus += METADATA_BONUS_PER_MATCH
 
+            metadata_bonus_applied = 0.0
             if metadata_bonus > 0.0:
-                fusion_score += min(metadata_bonus, METADATA_MAX_BONUS)
+                metadata_bonus_applied = min(metadata_bonus, METADATA_MAX_BONUS)
+                fusion_score += metadata_bonus_applied
 
             fusion_score = round(fusion_score, 4)
 
@@ -775,6 +1005,10 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                 "fusion_score": fusion_score,
                 "text_score": text_score,
                 "vector_score": round(vec_score, 4) if query_vec else None,
+                "quality_score": round(quality_score, 4),
+                "score_mode": "vector_text_quality" if query_vec else "text_quality",
+                "action_bonus": round(action_bonus, 4),
+                "metadata_bonus": round(metadata_bonus_applied, 4),
                 "member_links": member_links,
                 "actions": sorted(candidate_actions),
                 "matched_actions": sorted(matched_actions),
@@ -782,6 +1016,13 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
             })
 
         merged.sort(key=lambda item: (-item["fusion_score"], -item["rep"].id))
+        logger.info(
+            "[query:%s] score candidates=%d elapsed=%.3fs mode=%s",
+            qid,
+            len(merged),
+            time.perf_counter() - score_t0,
+            "vector_text_quality" if query_vec else "text_quality",
+        )
 
         for rank_idx, item in enumerate(merged, start=1):
             rep = item["rep"]
@@ -812,6 +1053,73 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
         qh.status = "candidates_found"
         qh.result_count = len(paged)
         db.commit()
+        # INFO-level: one compact line per ranked candidate so health/QA can
+        # spot-check ranking without parsing the per-member DEBUG payload.
+        top_summary = [
+            {
+                "rank": offset + idx + 1,
+                "cand": mc["candidate_id"],
+                "fusion": mc["fusion_score"],
+                "vec": mc["vector_score"],
+                "text": round(float(mc["text_score"] or 0.0), 4),
+                "qual": mc["quality_score"],
+                "act_bonus": mc["action_bonus"],
+                "meta_bonus": mc["metadata_bonus"],
+                "matched_actions": mc["matched_actions"],
+                "matched_metadata": mc["matched_metadata"],
+                "n_tracklets": len(mc["group"]),
+                "rep_cam": mc["rep"].camera_id,
+            }
+            for idx, mc in enumerate(paged)
+        ]
+        logger.info("[query:%s] top_%d=%s", qid, len(top_summary), _jdump(top_summary))
+
+        if paged and logger.isEnabledFor(logging.DEBUG):
+            top_detail = []
+            for rank_idx, mc in enumerate(paged, start=offset + 1):
+                rep = mc["rep"]
+                member_by_id = {m.tracklet_id: m for m in mc["group"]}
+                top_member_links = sorted(
+                    mc["member_links"],
+                    key=lambda link: link["match_score"],
+                    reverse=True,
+                )[:_QUERY_LOG_MEMBER_N]
+                top_members = []
+                for link in top_member_links:
+                    member = member_by_id.get(link["tracklet_id"])
+                    if member is None:
+                        top_members.append(link)
+                        continue
+                    member_item = _tracklet_log_item(
+                        member,
+                        text_score=text_score_map.get(member.tracklet_id, 0.0),
+                        vector_score=per_tracklet_vec_score.get(member.tracklet_id, 0.0)
+                        if query_vec else None,
+                    )
+                    member_item["match_score"] = link["match_score"]
+                    top_members.append(member_item)
+                top_detail.append({
+                    "rank": rank_idx,
+                    "candidate_id": mc["candidate_id"],
+                    "fusion": mc["fusion_score"],
+                    "vector": mc["vector_score"],
+                    "text": round(float(mc["text_score"] or 0.0), 4),
+                    "quality": mc["quality_score"],
+                    "mode": mc["score_mode"],
+                    "action_bonus": mc["action_bonus"],
+                    "metadata_bonus": mc["metadata_bonus"],
+                    "tracklet_count": len(mc["group"]),
+                    "rep": _tracklet_log_item(
+                        rep,
+                        text_score=text_score_map.get(rep.tracklet_id, 0.0),
+                        vector_score=per_tracklet_vec_score.get(rep.tracklet_id, 0.0)
+                        if query_vec else None,
+                    ),
+                    "matched_actions": mc["matched_actions"],
+                    "matched_metadata": mc["matched_metadata"],
+                    "members": top_members,
+                })
+            logger.debug("[query:%s] top_detail=%s", qid, _jdump(top_detail))
 
         results = []
         for mc in paged:
@@ -840,9 +1148,13 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                 "query_id": qid,
             })
 
-        logger.debug(
-            "search completed: query_id=%s raw_tracklets=%d merged_candidates=%d results=%d",
-            qid, len(shortlist), len(merged), len(results),
+        logger.info(
+            "[query:%s] completed raw_tracklets=%d merged_candidates=%d returned=%d elapsed=%.3fs",
+            qid,
+            len(shortlist),
+            len(merged),
+            len(results),
+            time.perf_counter() - request_t0,
         )
         return {"results": results, "query_id": qid}
 
