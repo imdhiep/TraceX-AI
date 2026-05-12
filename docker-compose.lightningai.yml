@@ -33,6 +33,30 @@
 services:
 
   # ──────────────────────────────────────────────────────────────────────────
+  # postgres-init — repairs missing PGDATA subdirs before postgres starts.
+  # Necessary because bind-mount + abrupt container kill corrupts the layout.
+  # ──────────────────────────────────────────────────────────────────────────
+  postgres-init:
+    image: postgres:16
+    container_name: tracex-postgres-init
+    user: root
+    volumes:
+      - ./storage/pgdata:/var/lib/postgresql/data
+    entrypoint: >
+      bash -c "
+        set -e
+        cd /var/lib/postgresql/data
+        for d in pg_notify pg_tblspc pg_replslot pg_stat pg_stat_tmp pg_snapshots pg_commit_ts pg_twophase pg_logical/snapshots pg_logical/mappings; do
+          mkdir -p \$$d
+        done
+        chown -R postgres:postgres /var/lib/postgresql/data
+        echo 'pgdata repaired.'
+      "
+    restart: "no"
+    networks:
+      - tracex-backend
+
+  # ──────────────────────────────────────────────────────────────────────────
   # postgres — database nội bộ, KHÔNG expose ra ngoài
   # ──────────────────────────────────────────────────────────────────────────
   postgres:
@@ -54,6 +78,9 @@ services:
     restart: unless-stopped
     networks:
       - tracex-backend
+    depends_on:
+      postgres-init:
+        condition: service_completed_successfully
 
   # ──────────────────────────────────────────────────────────────────────────
   # metadata-service — port 8002 (LightningAI cloudspace exposes 8002)
@@ -105,7 +132,8 @@ services:
       - TRANSFORMERS_OFFLINE=0
       - HF_TOKEN=${HF_TOKEN:-}
       - QWEN2VL_MODEL_ID=${QWEN2VL_MODEL_ID:-}
-      - VLM_BATCH_SIZE=${VLM_BATCH_SIZE:-1}
+      - VLM_BATCH_SIZE=${VLM_BATCH_SIZE:-4}
+      - VLM_BATCH_MAX_SIZE=${VLM_BATCH_MAX_SIZE:-8}
       - VLM_BATCH_MAX_NEW_TOKENS_PER_CROP=${VLM_BATCH_MAX_NEW_TOKENS_PER_CROP:-512}
       # LightningAI public URL (để tạo download links)
       - NEXT_PUBLIC_API_GATEWAY_URL=${LIGHTNINGAI_PUBLIC_URL:-}

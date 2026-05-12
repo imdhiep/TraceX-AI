@@ -24,6 +24,7 @@ import re
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -62,13 +63,30 @@ def _get_positive_env_int(name: str, default: int) -> int:
         return default
 
 
+def _get_env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %.3f", name, raw, default)
+        return default
+
+
 DEFAULT_SAMPLE_INTERVAL = 15
 DEFAULT_MIN_BBOX_AREA = 400
 MAX_WORKERS = int(os.getenv("BATCH_MAX_WORKERS", "8"))
-VLM_BATCH_SIZE = _get_positive_env_int("VLM_BATCH_SIZE", 1)
+VLM_BATCH_SIZE = _get_positive_env_int("VLM_BATCH_SIZE", 4)
+VLM_BATCH_MAX_SIZE = _get_positive_env_int("VLM_BATCH_MAX_SIZE", 8)
+VLM_BATCH_GROW_STEP = _get_positive_env_int("VLM_BATCH_GROW_STEP", 1)
+VLM_BATCH_STABLE_STEPS = _get_positive_env_int("VLM_BATCH_STABLE_STEPS", 3)
 VLM_BATCH_MAX_NEW_TOKENS_PER_CROP = _get_positive_env_int(
     "VLM_BATCH_MAX_NEW_TOKENS_PER_CROP", 512
 )
+FRAGMENT_MERGE_SIM_THRESHOLD = _get_env_float("FRAGMENT_MERGE_SIM_THRESHOLD", 0.85)
+FRAGMENT_MERGE_MAX_GAP_SECONDS = _get_env_float("FRAGMENT_MERGE_MAX_GAP_SECONDS", 60.0)
+FRAGMENT_MERGE_COMPONENT_MARGIN = _get_env_float("FRAGMENT_MERGE_COMPONENT_MARGIN", 0.03)
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +159,46 @@ def _detect_persons_rtdetr(
     all_dets: list[list[dict]] = []
     autocast_ctx = torch.autocast("cuda", dtype=dtype)
 
+    def _infer_one(batch_frames: list, inputs_raw, sizes, depth: int = 0) -> list[list[dict]]:
+        """Run inference on one (sub-)batch. On CUDA OOM, split in half and recurse."""
+        try:
+            inputs = {k: v.to(device=device, dtype=dtype) if v.is_floating_point() else v.to(device)
+                      for k, v in inputs_raw.items()}
+            with torch.no_grad(), autocast_ctx:
+                outputs = model(**inputs)
+            results = processor.post_process_object_detection(
+                outputs, threshold=threshold,
+                target_sizes=torch.tensor(sizes, device=device),
+            )
+        except torch.cuda.OutOfMemoryError as exc:
+            torch.cuda.empty_cache()
+            n = len(batch_frames)
+            if depth >= 3 or n <= 4:
+                logger.error("[rtdetr] OOM at batch_size=%d depth=%d, dropping: %s", n, depth, exc)
+                return [[] for _ in batch_frames]
+            mid = n // 2
+            logger.warning("[rtdetr] OOM at batch_size=%d depth=%d, splitting to %d/%d",
+                           n, depth, mid, n - mid)
+            left_inputs, left_sizes = _preprocess(batch_frames[:mid])
+            right_inputs, right_sizes = _preprocess(batch_frames[mid:])
+            return (_infer_one(batch_frames[:mid], left_inputs, left_sizes, depth + 1) +
+                    _infer_one(batch_frames[mid:], right_inputs, right_sizes, depth + 1))
+        except Exception as exc:
+            logger.warning("[rtdetr] batch failed (non-OOM): %s", exc)
+            return [[] for _ in batch_frames]
+
+        out: list[list[dict]] = []
+        for res in results:
+            dets = []
+            for score, label, box in zip(res["scores"], res["labels"], res["boxes"]):
+                if label.item() not in person_ids:
+                    continue
+                x1, y1, x2, y2 = box.tolist()
+                dets.append({"bbox": [float(x1), float(y1), float(x2), float(y2)],
+                             "score": float(score), "label": "person"})
+            out.append(dets)
+        return out
+
     with ThreadPoolExecutor(max_workers=2) as ex:
         # Submit first batch preprocessing
         futures = [ex.submit(_preprocess, b) for b in batches[:2]]
@@ -151,46 +209,133 @@ def _detect_persons_rtdetr(
                 futures.append(ex.submit(_preprocess, batches[idx + 2]))
 
             inputs_raw, sizes = futures[idx].result()
-            inputs = {k: v.to(device=device, dtype=dtype) if v.is_floating_point() else v.to(device)
-                      for k, v in inputs_raw.items()}
+            all_dets.extend(_infer_one(batch, inputs_raw, sizes))
+
+    return all_dets
+
+
+def _sanitize_dets_inplace(
+    dets_per_frame: list[list[dict]],
+    frames: list[np.ndarray],
+    min_w: int = 6,
+    min_h: int = 12,
+) -> list[list[dict]]:
+    """Clip bboxes into frame bounds and drop bboxes smaller than min_w/min_h.
+
+    Conservative: only removes clearly broken bboxes (out-of-frame or pixel-noise sized).
+    No aspect-ratio or score-based filter — those risk dropping crouching/sitting persons.
+    Per-frame numpy vectorization keeps overhead negligible.
+    """
+    out: list[list[dict]] = []
+    for dets, frame in zip(dets_per_frame, frames):
+        if not dets:
+            out.append(dets)
+            continue
+        H, W = frame.shape[:2]
+        arr = np.asarray([d["bbox"] for d in dets], dtype=np.float32)        # [N, 4]
+        arr[:, 0] = np.clip(arr[:, 0], 0.0, W - 1)
+        arr[:, 2] = np.clip(arr[:, 2], 0.0, W)
+        arr[:, 1] = np.clip(arr[:, 1], 0.0, H - 1)
+        arr[:, 3] = np.clip(arr[:, 3], 0.0, H)
+        keep = ((arr[:, 2] - arr[:, 0]) >= min_w) & ((arr[:, 3] - arr[:, 1]) >= min_h)
+        if bool(keep.all()):
+            for d, row in zip(dets, arr):
+                d["bbox"] = row.tolist()
+            out.append(dets)
+            continue
+        kept = []
+        for d, row, k in zip(dets, arr, keep):
+            if not k:
+                continue
+            d["bbox"] = row.tolist()
+            kept.append(d)
+        out.append(kept)
+    return out
+
+
+def _detect_persons_batch(frames: list[np.ndarray], threshold: float = 0.25) -> list[list[dict]]:
+    """Person detection: RT-DETR primary (fast), GDINO fallback."""
+    rtdetr_threshold = float(os.getenv("RTDETR_PERSON_THRESHOLD", str(max(threshold, 0.4))))
+    rtdetr_result = _detect_persons_rtdetr(frames, threshold=rtdetr_threshold)
+    if rtdetr_result is not None:
+        rtdetr_result = _sanitize_dets_inplace(rtdetr_result, frames)
+        n_dets = sum(len(d) for d in rtdetr_result)
+        logger.debug("[detect] RT-DETR: %d frames → %d detections", len(frames), n_dets)
+        return rtdetr_result
+
+    # GDINO fallback
+    model = get_model("gdino16")
+    processor = get_model("gdino16_processor")
+    if model is None or processor is None:
+        logger.error(
+            "[detect] RT-DETR unavailable AND GDINO not loaded — "
+            "returning 0 detections for %d frames. "
+            "Check GPU OOM or model warmup logs.",
+            len(frames),
+        )
+        return [[] for _ in frames]
+
+    device = _get_device()
+    dtype = torch.float16
+    autocast_ctx = torch.autocast("cuda", dtype=dtype)
+
+    def _preprocess(batch_frames: list[np.ndarray]):
+        pil_imgs = []
+        sizes = []
+        for f in batch_frames:
+            h, w = f.shape[:2]
+            sizes.append((h, w))
+            pil_imgs.append(Image.fromarray(f[:, :, ::-1]))
+        texts = ["person."] * len(pil_imgs)
+        inputs = processor(images=pil_imgs, text=texts, return_tensors="pt", padding=True)
+        return inputs, sizes
+
+    BATCH_SIZE = 64
+    batches = [frames[i: i + BATCH_SIZE] for i in range(0, len(frames), BATCH_SIZE)]
+    if not batches:
+        return []
+
+    all_dets: list[list[dict]] = []
+    prefetch_exec = ThreadPoolExecutor(max_workers=1)
+
+    prefetch_fut = prefetch_exec.submit(_preprocess, batches[0])
+    try:
+        for b_idx, batch in enumerate(batches):
+            inputs_cpu, sizes = prefetch_fut.result()
+            if b_idx + 1 < len(batches):
+                prefetch_fut = prefetch_exec.submit(_preprocess, batches[b_idx + 1])
 
             try:
+                inputs = {k: v.to(device, non_blocking=True) for k, v in inputs_cpu.items()}
+                target_sizes = torch.tensor(sizes, dtype=torch.int64).to(device)
                 with torch.no_grad(), autocast_ctx:
                     outputs = model(**inputs)
-                results = processor.post_process_object_detection(
-                    outputs, threshold=threshold,
-                    target_sizes=torch.tensor(sizes, device=device),
+                results = processor.post_process_grounded_object_detection(
+                    outputs, inputs["input_ids"],
+                    box_threshold=threshold, text_threshold=threshold,
+                    target_sizes=target_sizes,
                 )
-            except Exception as exc:
-                logger.warning("[rtdetr] batch failed: %s", exc)
-                all_dets.extend([[] for _ in batch])
+            except Exception:
+                results = None
+
+            if results is None:
+                for f in batch:
+                    all_dets.append(_detect_persons(f, threshold))
                 continue
 
             for res in results:
                 dets = []
                 for score, label, box in zip(res["scores"], res["labels"], res["boxes"]):
-                    if label.item() not in person_ids:
+                    if float(score) < threshold or label.lower() != "person":
                         continue
                     x1, y1, x2, y2 = box.tolist()
                     dets.append({"bbox": [float(x1), float(y1), float(x2), float(y2)],
-                                 "score": float(score), "label": "person"})
+                                 "score": float(score), "label": label})
                 all_dets.append(dets)
+    finally:
+        prefetch_exec.shutdown(wait=False)
 
-    return all_dets
-
-
-def _detect_persons_batch(frames: list[np.ndarray], threshold: float = 0.25) -> list[list[dict]]:
-    """Person detection via RT-DETR. Raises RuntimeError if model is unavailable."""
-    rtdetr_result = _detect_persons_rtdetr(frames, threshold=max(threshold, 0.4))
-    if rtdetr_result is not None:
-        n_dets = sum(len(d) for d in rtdetr_result)
-        logger.debug("[detect] RT-DETR: %d frames → %d detections", len(frames), n_dets)
-        return rtdetr_result
-
-    raise RuntimeError(
-        "[detect] RT-DETR unavailable — model not loaded. "
-        "Check GPU OOM or model warmup logs."
-    )
+    return _sanitize_dets_inplace(all_dets, frames)
 
 
 # ---------------------------------------------------------------------------
@@ -660,7 +805,7 @@ def _caption_crop_vlm(crop: "Image.Image") -> dict:
         with torch.no_grad():
             output_ids = model.generate(
                 **inputs,
-                max_new_tokens=512,
+                max_new_tokens=VLM_BATCH_MAX_NEW_TOKENS_PER_CROP,
                 do_sample=False,
                 temperature=None,
                 top_p=None,
@@ -689,36 +834,65 @@ def _vlm_progress_bar(done: int, total: int, width: int = 25) -> str:
 
 
 def _caption_crops_vlm_batch(crops: list, batch_size: int = VLM_BATCH_SIZE, tag: str = "") -> list:
-    """Batch Qwen2-VL captioning — sends up to batch_size crops per call (~3-4x faster).
-
-    Retries failed batches with smaller sub-batches before falling back to singles.
-    """
+    """Adaptive Qwen2-VL captioning with OOM-aware batch backoff."""
     model = get_model("qwen2vl")
     processor = get_model("qwen2vl_processor")
     if model is None or processor is None:
         return [_default_attributes() for _ in crops]
 
-    batch_size = max(1, batch_size)
     device = _get_device()
     results: list = []
     total = len(crops)
     log_every = max(1, total // 20)  # log every ~5%
     _vlm_t0 = time.perf_counter()
 
-    for i in range(0, total, batch_size):
-        batch = crops[i:i + batch_size]
+    start_batch_size = max(1, min(batch_size, VLM_BATCH_MAX_SIZE, total or 1))
+    current_batch_size = start_batch_size
+    stable_windows = 0
+    i = 0
+
+    def _log_progress(done: int, batch_used: int) -> None:
+        if done == 1 or done % log_every == 0 or done == total:
+            elapsed = time.perf_counter() - _vlm_t0
+            eta = (elapsed / done * (total - done)) if done else 0
+            logger.info(
+                "[vlm] %s %s  %.0fs elapsed  ETA %.0fs  batch=%d current=%d start=%d max=%d tokens/crop=%d",
+                tag,
+                _vlm_progress_bar(done, total),
+                elapsed,
+                eta,
+                batch_used,
+                current_batch_size,
+                start_batch_size,
+                VLM_BATCH_MAX_SIZE,
+                VLM_BATCH_MAX_NEW_TOKENS_PER_CROP,
+            )
+
+    def _maybe_grow_batch() -> None:
+        nonlocal current_batch_size, stable_windows
+        if stable_windows >= VLM_BATCH_STABLE_STEPS and current_batch_size < VLM_BATCH_MAX_SIZE:
+            current_batch_size = min(
+                VLM_BATCH_MAX_SIZE,
+                current_batch_size + VLM_BATCH_GROW_STEP,
+            )
+            stable_windows = 0
+
+    while i < total:
+        batch = crops[i:i + current_batch_size]
         n = len(batch)
 
         if n == 1:
             results.append(_caption_crop_vlm(batch[0]))
-            done = len(results)
-            if done == 1 or done % log_every == 0 or done == total:
-                elapsed = time.perf_counter() - _vlm_t0
-                eta = (elapsed / done * (total - done)) if done else 0
-                logger.info("[vlm] %s %s  %.0fs elapsed  ETA %.0fs",
-                            tag, _vlm_progress_bar(done, total), elapsed, eta)
+            i += 1
+            stable_windows += 1
+            _log_progress(len(results), n)
+            _maybe_grow_batch()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
             continue
 
+        inputs = None
+        output_ids = None
         try:
             prompt = _VLM_BATCH_PROMPT_TEMPLATE.format(n=n)
             content = [{"type": "image", "image": c} for c in batch]
@@ -748,22 +922,76 @@ def _caption_crops_vlm_batch(crops: list, batch_size: int = VLM_BATCH_SIZE, tag:
             logger.debug("[vlm] batch(%d) OK at offset %d", n, i)
             for obj in parsed_list:
                 results.append(_parse_vlm_attrs(obj))
+            i += n
+            stable_windows += 1
+            _log_progress(len(results), n)
+            _maybe_grow_batch()
 
-        except Exception as exc:
-            next_batch_size = min(max(1, batch_size // 2), max(1, (n + 1) // 2))
-            if n > 1 and next_batch_size < n:
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            if "out of memory" in msg and current_batch_size > 1:
+                next_batch_size = max(1, current_batch_size // 2)
                 logger.warning(
-                    "[vlm] batch(%d) failed: %s — retrying with smaller batches of %d",
+                    "[vlm] %s OOM at %d/%d (batch=%d) -> retry batch=%d",
+                    tag,
+                    i,
+                    total,
+                    current_batch_size,
+                    next_batch_size,
+                )
+                current_batch_size = next_batch_size
+                stable_windows = 0
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                continue
+            if current_batch_size > 1:
+                next_batch_size = max(1, current_batch_size // 2)
+                logger.warning(
+                    "[vlm] %s batch(%d) failed at %d/%d: %s -> retry batch=%d",
+                    tag,
                     n,
+                    i,
+                    total,
                     exc,
                     next_batch_size,
                 )
-                results.extend(_caption_crops_vlm_batch(batch, batch_size=next_batch_size, tag=tag))
+                current_batch_size = next_batch_size
+                stable_windows = 0
+                continue
+            logger.warning("[vlm] single crop failed at %d/%d: %s", i, total, exc)
+            results.append(_default_attributes())
+            i += 1
+            _log_progress(len(results), 1)
+
+        except Exception as exc:
+            if current_batch_size > 1:
+                next_batch_size = max(1, current_batch_size // 2)
+                logger.warning(
+                    "[vlm] %s batch(%d) failed at %d/%d: %s -> retry batch=%d",
+                    tag,
+                    n,
+                    i,
+                    total,
+                    exc,
+                    next_batch_size,
+                )
+                current_batch_size = next_batch_size
+                stable_windows = 0
                 continue
 
-            logger.warning("[vlm] batch(%d) failed: %s — falling back to single crops", n, exc)
-            for crop in batch:
-                results.append(_caption_crop_vlm(crop))
+            logger.warning("[vlm] single crop failed at %d/%d: %s", i, total, exc)
+            results.append(_default_attributes())
+            i += 1
+            _log_progress(len(results), 1)
+
+        finally:
+            try:
+                del inputs
+                del output_ids
+            except Exception:
+                pass
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
     return results
 
@@ -895,28 +1123,52 @@ async def process_video_stream(
                 pass
 
 
+def _best_observation(obs: list):
+    """Pick the observation that maximizes frame quality for SigLIP/Qwen crops.
+
+    Score = 0.5 * bbox_area_ratio + 0.3 * laplacian_norm + 0.2 * confidence
+    where bbox_area_ratio and laplacian_norm are normalised to [0, 1] across obs.
+    Falls back to median frame if scoring fails.
+    """
+    if not obs:
+        return None
+    if len(obs) == 1:
+        return obs[0]
+    try:
+        areas = []
+        for o in obs:
+            x1, y1, x2, y2 = o.bbox
+            areas.append(max(0.0, (x2 - x1) * (y2 - y1)))
+        laps = [float(getattr(o, "laplacian_score", 0.0) or 0.0) for o in obs]
+        confs = [float(getattr(o, "confidence", 0.0) or 0.0) for o in obs]
+
+        max_area = max(areas) or 1.0
+        max_lap  = max(laps)  or 1.0
+
+        best, best_score = obs[len(obs) // 2], -1.0
+        for o, area, lap, conf in zip(obs, areas, laps, confs):
+            score = 0.5 * (area / max_area) + 0.3 * (lap / max_lap) + 0.2 * conf
+            if score > best_score:
+                best_score = score
+                best = o
+        return best
+    except Exception:
+        return obs[len(obs) // 2]
+
+
 def _batch_siglip_embeddings(
     t_data: list,
 ) -> tuple[list, list, list]:
     """
-    Batch SigLIP2 GPU inference — runs BEFORE fragment merge.
-    Encodes 5 evenly-spaced frames per raw fragment → pool average for merge similarity.
-    Also encodes single representative crop for DB storage.
-
-    Args:
-        t_data: list of (local_tracklet, t_idx, rep_bbox_float, t_frames)
-
+    Batch SigLIP2 embeddings only. DINOv2 removed — SigLIP2 is the sole embedding model.
     Returns: (siglip_multi_feats, all_rep_crops, all_siglip_embeddings)
-      siglip_multi_feats: list of 1152-dim pool-avg embeddings per fragment (for merge)
-      all_rep_crops: list of PIL Images (384×384) per fragment
-      all_siglip_embeddings: list of 1152-dim single-crop embeddings per fragment (for DB)
+      siglip_multi_feats: multi-frame pool-avg per fragment (for fragment merge)
+      all_rep_crops: PIL Images 384×384 from best-quality frame (for Qwen/storage)
+      all_siglip_embeddings: single-crop embedding per fragment (for DB)
     """
-
-
     device = _get_device()
     dtype = torch.float16
 
-    # ── Helper: crop + pad to square ─────────────────────────────────────────
     def _extract_crop(frame, bbox, size):
         x1, y1, x2, y2 = map(int, bbox)
         h, w = frame.shape[:2]
@@ -936,20 +1188,101 @@ def _batch_siglip_embeddings(
         )
         return cv2.resize(pad, (size, size), interpolation=cv2.INTER_LINEAR)
 
-    # ── Build representative crops (384×384) ──────────────────────────────────
+    # ── Representative crops (384×384) from best-quality frame ───────────────
+    # best_obs is determined once here; the same crop feeds both SigLIP and Qwen.
     all_rep_crops: list[Image.Image] = []
     for lt, t_idx, rep_bbox, t_frames in t_data:
-        mid_idx = len(t_frames) // 2
-        c = _extract_crop(t_frames[mid_idx], rep_bbox, 384) if t_frames else None
+        best_obs = _best_observation(lt.observations)
+        if best_obs is not None:
+            rep_bbox = [float(x) for x in best_obs.bbox]
+            # t_frames is indexed by position; find the frame matching best_obs
+            best_frame_idx = next(
+                (i for i, o in enumerate(lt.observations) if o is best_obs), len(t_frames) // 2
+            )
+            best_frame = t_frames[best_frame_idx] if best_frame_idx < len(t_frames) else t_frames[len(t_frames) // 2]
+        else:
+            best_frame = t_frames[len(t_frames) // 2] if t_frames else None
+        c = _extract_crop(best_frame, rep_bbox, 384) if best_frame is not None else None
         all_rep_crops.append(
             Image.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB)) if c is not None
             else Image.fromarray(np.zeros((384, 384, 3), dtype=np.uint8))
         )
 
-    # ── SigLIP2 multi-frame pool-avg — for fragment merge ─────────────────────
-    siglip_multi_feats = [[] for _ in t_data]
     model_sip = get_model("siglip2")
     proc_sip = get_model("siglip2_processor")
+    _t0 = time.perf_counter()
+
+    siglip_init_batch = _get_positive_env_int("SIGLIP_BATCH_INIT", 128)
+    siglip_max_batch = _get_positive_env_int("SIGLIP_BATCH_MAX", 256)
+    siglip_batch_step = _get_positive_env_int("SIGLIP_BATCH_GROW_STEP", 16)
+
+    def _encode_siglip_images_adaptive(images: list[Image.Image], phase: str) -> torch.Tensor | None:
+        if not images or model_sip is None or proc_sip is None:
+            return None
+        batch = max(1, min(siglip_init_batch, siglip_max_batch, len(images)))
+        feats_chunks: list[torch.Tensor] = []
+        idx = 0
+        stable_windows = 0
+
+        while idx < len(images):
+            end = min(len(images), idx + batch)
+            window = images[idx:end]
+            try:
+                inputs = proc_sip(images=window, return_tensors="pt", padding=True)
+                inputs = {
+                    k: v.to(device, dtype=dtype) if v.is_floating_point() else v.to(device)
+                    for k, v in inputs.items()
+                }
+                amp_ctx = (
+                    torch.autocast(device_type="cuda", dtype=dtype)
+                    if device.type == "cuda"
+                    else nullcontext()
+                )
+                with torch.no_grad(), amp_ctx:
+                    feats = model_sip.get_image_features(
+                        **{k: v for k, v in inputs.items() if k in ["pixel_values"]}
+                    )
+                feats = feats / feats.norm(dim=-1, keepdim=True)
+                feats_chunks.append(feats.detach().cpu().float())
+                idx = end
+                stable_windows += 1
+
+                # Slowly increase after stable windows to keep speed for easy videos.
+                if stable_windows >= 3 and batch < siglip_max_batch:
+                    batch = min(siglip_max_batch, batch + siglip_batch_step, len(images) - idx or batch)
+            except RuntimeError as exc:
+                msg = str(exc).lower()
+                if "out of memory" in msg and batch > 1:
+                    new_batch = max(1, batch // 2)
+                    logger.warning(
+                        "[pipeline] %s: SigLIP %s OOM at %d/%d (batch=%d) -> retry batch=%d",
+                        video_id,
+                        phase,
+                        idx,
+                        len(images),
+                        batch,
+                        new_batch,
+                    )
+                    batch = new_batch
+                    stable_windows = 0
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    continue
+                raise
+            finally:
+                try:
+                    del inputs
+                except Exception:
+                    pass
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+        if not feats_chunks:
+            return None
+        return torch.cat(feats_chunks, dim=0)
+
+    # ── SigLIP2 multi-frame pool-avg — for fragment merge ────────────────────
+    siglip_multi_feats = [[] for _ in t_data]
     if model_sip and proc_sip and t_data:
         try:
             siglip_crops, siglip_slices = [], []
@@ -964,37 +1297,21 @@ def _batch_siglip_embeddings(
                 siglip_slices.append((start, len(siglip_crops)))
 
             if siglip_crops:
-                inputs = proc_sip(images=siglip_crops, return_tensors="pt", padding=True)
-                inputs = {k: v.to(device, dtype=dtype) if v.is_floating_point() else v.to(device)
-                          for k, v in inputs.items()}
-                with torch.no_grad(), torch.autocast(device_type="cuda", dtype=dtype):
-                    feats = model_sip.get_image_features(**{k: v for k, v in inputs.items()
-                                                                 if k in ["pixel_values"]})
-                feats = feats / feats.norm(dim=-1, keepdim=True)
-                # Pool-average per tracklet using slices
-                siglip_multi_feats = [[] for _ in t_data]
-                cur = 0
-                for t_i, (lt, t_idx, rep_bbox, t_frames) in enumerate(t_data):
-                    n = min(5, len(t_frames))
-                    if cur + n <= len(feats):
-                        avg = feats[cur:cur + n].mean(0)
-                        siglip_multi_feats[t_i] = avg.cpu().float().tolist()
-                    cur += n
+                feats = _encode_siglip_images_adaptive(siglip_crops, phase="multi-frame")
+                if feats is not None:
+                    for t_i, (s, e) in enumerate(siglip_slices):
+                        if e > s:
+                            avg = feats[s:e].mean(0)
+                            siglip_multi_feats[t_i] = (avg / avg.norm()).cpu().float().tolist()
         except Exception as exc:
             logger.warning("[pipeline] SigLIP2 multi-frame encoding failed: %s", exc)
             siglip_multi_feats = [[] for _ in t_data]
 
-    # ── SigLIP2 single-crop — representative crop for DB storage ───────────────
+    # ── SigLIP2 single-crop embedding — for DB storage ───────────────────────
     img_feats = None
     if model_sip and proc_sip and t_data:
         try:
-            img_inputs = proc_sip(images=all_rep_crops, return_tensors="pt", padding=True)
-            img_inputs = {k: v.to(device, dtype=dtype) if v.is_floating_point() else v.to(device)
-                          for k, v in img_inputs.items()}
-            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=dtype):
-                img_feats = model_sip.get_image_features(**{k: v for k, v in img_inputs.items()
-                                                             if k in ["pixel_values"]})
-            img_feats = img_feats / img_feats.norm(dim=-1, keepdim=True)  # [N, D]
+            img_feats = _encode_siglip_images_adaptive(all_rep_crops, phase="single-crop")
         except Exception as exc:
             logger.warning("[pipeline] SigLIP image encoding failed: %s", exc)
             img_feats = None
@@ -1008,218 +1325,11 @@ def _batch_siglip_embeddings(
     except Exception:
         all_siglip_embeddings = [[]] * len(t_data)
 
-    logger.info("[pipeline] SigLIP2 done: %d fragments | merge_emb=%d | DB_emb=%d",
-                len(t_data), sum(1 for e in siglip_multi_feats if e),
+    logger.info("[pipeline] %s: SigLIP2 done in %.1fs — %d fragments | merge_emb=%d | DB_emb=%d",
+                video_id, time.perf_counter() - _t0, len(t_data),
+                sum(1 for e in siglip_multi_feats if e),
                 sum(1 for e in all_siglip_embeddings if e))
     return siglip_multi_feats, all_rep_crops, all_siglip_embeddings
-
-
-def _batch_caption_and_classify(
-    t_data: list,
-    all_rep_crops: list[Image.Image],
-) -> tuple[list[dict], list[dict], list]:
-    """
-    Batch Qwen2-VL + VideoMAE GPU inference — runs AFTER fragment merge.
-    Attribute captioning (Qwen2-VL) and action classification (VideoMAE) on merged tracklets.
-
-    Args:
-        t_data: list of (merged_tracklet, t_idx, rep_bbox_float, t_frames)
-        all_rep_crops: list of PIL Images (384×384) per merged tracklet
-
-    Returns: (all_attributes, all_attr_confs, all_actions)
-      all_attributes[i]: dict with keys gender, age_range, upper_clothing_color, ...
-      all_attr_confs[i]: dict with per-field confidence scores
-      all_actions[i]: tuple (action_str, confidence, kinetics_label)
-    """
-    device = _get_device()
-    dtype = torch.float16
-
-    # ── Qwen2-VL-7B-Instruct: open-vocabulary attribute captioning ────────────
-    logger.info(
-        "[vlm] captioning %d representative crops with batch_size=%d",
-        len(all_rep_crops),
-        VLM_BATCH_SIZE,
-    )
-    all_attributes: list[dict] = _caption_crops_vlm_batch(
-        all_rep_crops,
-        batch_size=VLM_BATCH_SIZE,
-    )
-    all_attr_confs: list[dict] = []
-    for attrs in all_attributes:
-        all_attr_confs.append({
-            "gender_conf":       attrs.get("gender_conf"),
-            "age_range_conf":    attrs.get("age_range_conf"),
-            "upper_clothing_conf": attrs.get("upper_clothing_conf"),
-            "lower_clothing_conf": attrs.get("lower_clothing_conf"),
-            "shoes_conf":        attrs.get("shoes_conf"),
-            "accessory_conf":    max(
-                attrs.get("bag_conf") or 0.0,
-                attrs.get("hat_conf") or 0.0,
-            ) or None,
-            "hat_color_conf":    attrs.get("hat_conf"),
-            "bag_type_conf":     attrs.get("bag_conf"),
-            "mask_conf":         attrs.get("mask_conf"),
-            "hair_style_conf":   attrs.get("hair_conf"),
-            "hair_color_conf":   attrs.get("hair_conf"),
-        })
-
-    # ── VideoMAE TRUE BATCH: stack all merged tracklet clips → 1 forward pass ──
-    all_actions: list[tuple] = []
-    model_vmae = get_model("videomae")
-    proc_vmae = get_model("videomae_processor")
-    if model_vmae and proc_vmae and t_data:
-        try:
-            all_clips: list[list[np.ndarray]] = []
-            for lt, t_idx, rep_bbox, t_frames in t_data:
-                x1, y1, x2, y2 = (max(0, int(v)) for v in rep_bbox)
-                n_f = len(t_frames)
-                idx_list = np.linspace(0, n_f - 1, min(16, n_f), dtype=int)
-                frames_224 = []
-                for fi in idx_list:
-                    f = t_frames[fi]
-                    h, w = f.shape[:2]
-                    x2c, y2c = min(w, x2), min(h, y2)
-                    crop = f[y1:y2c, x1:x2c] if x2c > x1 and y2c > y1 else f
-                    frames_224.append(cv2.resize(crop if crop.size > 0 else f,
-                                                  (224, 224), interpolation=cv2.INTER_LINEAR))
-                while len(frames_224) < 16:
-                    frames_224.append(frames_224[-1] if frames_224 else np.zeros((224, 224, 3), dtype=np.uint8))
-                all_clips.append(frames_224[:16])
-
-            vmae_dtype = torch.float16
-            inputs = proc_vmae(all_clips, return_tensors="pt")
-            inputs = {k: v.to(device=device, dtype=vmae_dtype) if v.is_floating_point() else v.to(device)
-                       for k, v in inputs.items()}
-            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=vmae_dtype):
-                outputs = model_vmae(**inputs)
-            logits = outputs.logits.float()  # [N, num_classes]
-            probs = torch.softmax(logits, dim=-1)
-            top_probs, top_indices = probs.topk(1, dim=-1)
-            top_idx = top_indices.squeeze(1).tolist()
-            top_conf = top_probs.squeeze(1).tolist()
-            id2label = getattr(model_vmae.config, "id2label", {})
-            for idx, conf in zip(top_idx, top_conf):
-                label = id2label.get(idx, "")
-                action = _map_kinetics_to_tracex_action(label) if label else "unknown"
-                all_actions.append((action, float(conf), label))
-        except Exception as exc:
-            logger.warning("[pipeline] VideoMAE batch failed on merged tracklets: %s", exc)
-            all_actions = [(_run_videomae_actions(t[3], t[2]), 0.0, "") for t in t_data]
-    else:
-        all_actions = [("unknown", 0.0, "")] * len(t_data)
-
-    logger.info("[pipeline] Qwen2-VL + VideoMAE done: %d merged tracklets | actions=%d",
-                len(t_data), sum(1 for a in all_actions if a and a[0] != "unknown"))
-    return all_attributes, all_attr_confs, all_actions
-    model_sip = get_model("siglip2")
-    proc_sip = get_model("siglip2_processor")
-    if model_sip and proc_sip and t_data:
-        try:
-            img_inputs = proc_sip(images=all_rep_crops, return_tensors="pt", padding=True)
-            img_inputs = {k: v.to(device, dtype=dtype) if v.is_floating_point() else v.to(device)
-                          for k, v in img_inputs.items()}
-            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=dtype):
-                img_feats = model_sip.get_image_features(**{k: v for k, v in img_inputs.items()
-                                                             if k in ["pixel_values"]})
-            img_feats = img_feats / img_feats.norm(dim=-1, keepdim=True)  # [N, D]
-        except Exception as exc:
-            logger.warning("[pipeline] SigLIP image encoding failed: %s", exc)
-            img_feats = None
-    logger.info("[pipeline] %s: SigLIP done in %.1fs", video_id, time.perf_counter() - _t0)
-
-    # ── Qwen2-VL-7B-Instruct: open-vocabulary attribute captioning ────────────
-    logger.info(
-        "[vlm] captioning %d representative crops with batch_size=%d",
-        len(all_rep_crops),
-        VLM_BATCH_SIZE,
-    )
-    all_attributes: list[dict] = _caption_crops_vlm_batch(
-        all_rep_crops,
-        batch_size=VLM_BATCH_SIZE,
-    )
-    all_attr_confs: list[dict] = []
-    for attrs in all_attributes:
-        all_attr_confs.append({
-            "gender_conf":       attrs.get("gender_conf"),
-            "age_range_conf":    attrs.get("age_range_conf"),
-            "upper_clothing_conf": attrs.get("upper_clothing_conf"),
-            "lower_clothing_conf": attrs.get("lower_clothing_conf"),
-            "shoes_conf":        attrs.get("shoes_conf"),
-            "accessory_conf":    max(
-                attrs.get("bag_conf") or 0.0,
-                attrs.get("hat_conf") or 0.0,
-            ) or None,
-            "hat_color_conf":    attrs.get("hat_conf"),
-            "bag_type_conf":     attrs.get("bag_conf"),
-            "mask_conf":         attrs.get("mask_conf"),
-            "hair_style_conf":   attrs.get("hair_conf"),
-            "hair_color_conf":   attrs.get("hair_conf"),
-        })
-
-    # ── VideoMAE TRUE BATCH: stack all tracklet clips → 1 forward pass ───────
-    all_actions = []
-    model_vmae = get_model("videomae")
-    proc_vmae = get_model("videomae_processor")
-    if model_vmae and proc_vmae and t_data:
-        try:
-            # Build 16-frame clip for every tracklet
-            all_clips: list[list[np.ndarray]] = []
-            for lt, t_idx, rep_bbox, t_frames in t_data:
-                x1, y1, x2, y2 = (max(0, int(v)) for v in rep_bbox)
-                n_f = len(t_frames)
-                idx_list = np.linspace(0, n_f - 1, min(16, n_f), dtype=int)
-                frames_224 = []
-                for fi in idx_list:
-                    f = t_frames[fi]
-                    h, w = f.shape[:2]
-                    x2c, y2c = min(w, x2), min(h, y2)
-                    crop = f[y1:y2c, x1:x2c] if x2c > x1 and y2c > y1 else f
-                    frames_224.append(cv2.resize(crop if crop.size > 0 else f,
-                                                  (224, 224), interpolation=cv2.INTER_LINEAR))
-                while len(frames_224) < 16:
-                    frames_224.append(frames_224[-1] if frames_224 else np.zeros((224, 224, 3), dtype=np.uint8))
-                all_clips.append(frames_224[:16])
-
-            # Batch all clips: proc_vmae expects list-of-frames per video
-            # Stack into [N, 16, H, W, C] then process
-            vmae_dtype = torch.float16
-            inputs = proc_vmae(all_clips, return_tensors="pt")
-            inputs = {k: v.to(device=device, dtype=vmae_dtype) if v.is_floating_point() else v.to(device)
-                       for k, v in inputs.items()}
-            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=vmae_dtype):
-                outputs = model_vmae(**inputs)
-            logits = outputs.logits.float()  # [N, num_classes]
-            probs = torch.softmax(logits, dim=-1)
-            top_probs, top_indices = probs.topk(1, dim=-1)
-            top_idx = top_indices.squeeze(1).tolist()
-            top_conf = top_probs.squeeze(1).tolist()
-            id2label = getattr(model_vmae.config, "id2label", {})
-            for idx, conf in zip(top_idx, top_conf):
-                label = id2label.get(idx, "")
-                action = _map_kinetics_to_tracex_action(label) if label else "unknown"
-                all_actions.append((action, float(conf), label))
-        except Exception as exc:
-            logger.warning("[pipeline] VideoMAE true-batch failed: %s — fallback", exc)
-            all_actions = [(_run_videomae_actions(t[3], t[2]), 0.0, "") for t in t_data]
-    else:
-        all_actions = [("unknown", 0.0, "")] * len(t_data)
-
-    # Capture SigLIP2 image embeddings (already computed above as img_feats)
-    # These are in the same embedding space as SigLIP2 text queries → usable for text search
-    all_siglip_embeddings: list[list[float]] = []
-    try:
-        if img_feats is not None:
-            all_siglip_embeddings = [img_feats[i].cpu().float().tolist() for i in range(len(t_data))]
-        else:
-            all_siglip_embeddings = [[]] * len(t_data)
-    except Exception:
-        all_siglip_embeddings = [[]] * len(t_data)
-
-    logger.info("[pipeline] batch features done: %d tracklets | SigLIP2 merge_emb=%d | SigLIP2 DB=%d | VideoMAE=%d",
-                len(t_data), sum(1 for e in siglip_multi_feats if e),
-                sum(1 for e in all_siglip_embeddings if e),
-                sum(1 for a in all_actions if a and a != "unknown"))
-    return siglip_multi_feats, all_attributes, all_attr_confs, all_actions, all_rep_crops, all_siglip_embeddings
 
 
 def _process_video_sync(
@@ -1329,21 +1439,32 @@ def _process_video_sync(
 
     t_data_raw = []
     for t_idx, lt in enumerate(accepted):
-        obs = lt.observations
-        mid = obs[len(obs) // 2]
-        rep_bbox_float = [float(x) for x in mid.bbox]
-        t_frames = [frame_lookup[o.frame_index] for o in obs if o.frame_index in frame_lookup] or [sampled_frames[0].image]
-        t_data_raw.append((lt, t_idx, rep_bbox_float, t_frames))
+        best = _best_observation(lt.observations)
+        rep_bbox_float = [float(x) for x in best.bbox]
+        t_frames = [frame_lookup[o.frame_index] for o in lt.observations if o.frame_index in frame_lookup] or [sampled_frames[0].image]
+        t_data.append((lt, t_idx, rep_bbox_float, t_frames))
 
-    siglip_multi_feats, all_rep_crops, all_siglip_embeddings = _batch_siglip_embeddings(t_data_raw)
+    siglip_multi_feats, all_rep_crops, all_siglip_embeddings = _batch_siglip_embeddings(t_data, video_id)
 
-    # Stage 6: Post-hoc fragment merging via SigLIP2 cosine similarity.
-    # SigLIP embeddings from Stage 5 → decide which raw fragments belong to same person.
+    # Stage 8: Post-hoc fragment merging via SigLIP2 cosine similarity.
     import numpy as _np
 
-    _merger = TrackletFragmentMerger(similarity_threshold=0.85, max_gap_seconds=60.0)
+    _n_raw = len(accepted)
+    logger.info(
+        "[merge] %s: %s  0/%d — merging fragments (emb=SigLIP2, threshold=%.2f, max_gap=%.0fs)",
+        video_id, _vlm_progress_bar(0, _n_raw), _n_raw,
+        FRAGMENT_MERGE_SIM_THRESHOLD, FRAGMENT_MERGE_MAX_GAP_SECONDS,
+    )
+
+    _merger = TrackletFragmentMerger(
+        similarity_threshold=FRAGMENT_MERGE_SIM_THRESHOLD,
+        max_gap_seconds=FRAGMENT_MERGE_MAX_GAP_SECONDS,
+        component_similarity_margin=FRAGMENT_MERGE_COMPONENT_MARGIN,
+    )
     _orig_accepted = list(accepted)
+    _t_merge = time.perf_counter()
     accepted, _groups = _merger.merge(list(accepted), siglip_multi_feats)
+    _merge_elapsed = time.perf_counter() - _t_merge
 
     _n_merged = sum(len(g) - 1 for g in _groups if len(g) > 1)
     if _n_merged > 0:
@@ -1359,67 +1480,125 @@ def _process_video_sync(
             return []
         return _np.array(valid, dtype=_np.float32).mean(axis=0).tolist()
 
-    siglip_multi_feats_merged = [_pool_avg([siglip_multi_feats[i] for i in g]) for g in _groups]
-    siglip_embeddings_merged  = [_pool_avg([all_siglip_embeddings[i] for i in g]) for g in _groups]
+    def _richest(g: list[int]) -> int:
+        return max(g, key=lambda i: len(_orig_accepted[i].observations))
 
-    # Rebuild t_data for merged tracklets — pick best frame by detection confidence for Qwen/VMAE
-    def _best_obs_for_merged(g: list[int]):
-        """Return FrameDetection with highest detection confidence from all fragments in group."""
-        best = None
-        best_conf = -1.0
-        for frag_idx in g:
-            for obs in _orig_accepted[frag_idx].observations:
-                if obs.confidence > best_conf:
-                    best_conf = obs.confidence
-                    best = obs
-        if best is None and g and _orig_accepted[g[0]].observations:
-            best = _orig_accepted[g[0]].observations[0]
-        return best
+    all_siglip_embeddings = [_pool_avg([all_siglip_embeddings[i] for i in g]) for g in _groups]
+    all_rep_crops         = [all_rep_crops[_richest(g)]          for g in _groups]
 
-    t_data_merged = []
-    rep_crops_merged = []
+    # Rebuild t_data aligned to merged tracklets — use _best_observation for rep frame
+    t_data = []
     for new_idx, mt in enumerate(accepted):
-        group_indices = _groups[new_idx]
-        best_obs = _best_obs_for_merged(group_indices)
-        if best_obs is None:
-            logger.warning("[pipeline] %s: merged group %d has no observations", video_id, new_idx)
-            best_obs = _orig_accepted[group_indices[0]].observations[0]
-        rep_bbox_float = [float(x) for x in best_obs.bbox]
-        # Collect all frames from all fragments in this group (up to 16 for VideoMAE)
-        all_frames = []
-        for frag_idx in group_indices:
-            frag_frames = [
-                frame_lookup[o.frame_index]
-                for o in _orig_accepted[frag_idx].observations
-                if o.frame_index in frame_lookup
-            ]
-            all_frames.extend(frag_frames)
-        # Deduplicate while preserving order
-        seen, unique_frames = set(), []
-        for f in all_frames:
-            fid = id(f)
-            if fid not in seen:
-                seen.add(fid)
-                unique_frames.append(f)
-        t_data_merged.append((mt, new_idx, rep_bbox_float, unique_frames))
-        # Representative crop from best_obs frame
-        best_frame = frame_lookup.get(best_obs.frame_index, sampled_frames[0].image)
-        x1, y1 = max(0, int(best_obs.bbox[0])), max(0, int(best_obs.bbox[1]))
-        x2, y2 = min(best_frame.shape[1], int(best_obs.bbox[2])), min(best_frame.shape[0], int(best_obs.bbox[3]))
-        crop = best_frame[y1:y2, x1:x2]
+        best = _best_observation(mt.observations)
+        rep_bbox_float = [float(x) for x in best.bbox]
+        t_frames = (
+            [frame_lookup[o.frame_index] for o in mt.observations if o.frame_index in frame_lookup]
+            or [sampled_frames[0].image]
+        )
+        t_data.append((mt, new_idx, rep_bbox_float, t_frames))
+
+    # Rebuild all_rep_crops for Qwen from best-quality frame of each merged tracklet.
+    # _richest() above picks the fragment with most obs, but _best_observation() within
+    # the merged tracklet's observations is the correct frame for appearance captioning.
+    def _make_rep_crop_384(frame, bbox):
+        x1, y1 = max(0, int(bbox[0])), max(0, int(bbox[1]))
+        x2, y2 = min(frame.shape[1], int(bbox[2])), min(frame.shape[0], int(bbox[3]))
+        crop = frame[y1:y2, x1:x2] if x2 > x1 and y2 > y1 else frame
         if crop.size == 0:
-            crop = best_frame
+            crop = frame
         max_dim = max(crop.shape[0], crop.shape[1])
         top = (max_dim - crop.shape[0]) // 2
-        bottom = max_dim - crop.shape[0] - top
-        left = (max_dim - crop.shape[1]) // 2
-        right = max_dim - crop.shape[1] - left
-        square = cv2.copyMakeBorder(crop, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
-        resized = cv2.resize(square, (384, 384), interpolation=cv2.INTER_LINEAR)
-        rep_crops_merged.append(Image.fromarray(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)))
+        sq = cv2.copyMakeBorder(
+            crop, top, max_dim - crop.shape[0] - top,
+            (max_dim - crop.shape[1]) // 2, max_dim - crop.shape[1] - (max_dim - crop.shape[1]) // 2,
+            cv2.BORDER_CONSTANT, value=(114, 114, 114),
+        )
+        return Image.fromarray(cv2.cvtColor(cv2.resize(sq, (384, 384), interpolation=cv2.INTER_LINEAR), cv2.COLOR_BGR2RGB))
 
-    # Stage 7: Qwen2-VL + VideoMAE — AFTER fragment merge, on merged tracklets
-    all_attributes, all_attr_confs, all_actions = _batch_caption_and_classify(t_data_merged, rep_crops_merged)
+    all_rep_crops = []
+    for mt, new_idx, rep_bbox_float, t_frames in t_data:
+        best = _best_observation(mt.observations)
+        best_frame = frame_lookup.get(best.frame_index, t_frames[0] if t_frames else sampled_frames[0].image)
+        all_rep_crops.append(_make_rep_crop_384(best_frame, best.bbox))
+
+    # ── VLM: Qwen2-VL-7B trên ~25 merged tracklets ───────────────────────────
+    logger.info(
+        "[vlm] %s: captioning %d merged tracklets (start_batch=%d, max_batch=%d, tokens/crop=%d)",
+        video_id,
+        len(all_rep_crops),
+        VLM_BATCH_SIZE,
+        VLM_BATCH_MAX_SIZE,
+        VLM_BATCH_MAX_NEW_TOKENS_PER_CROP,
+    )
+    all_attributes: list[dict] = _caption_crops_vlm_batch(
+        all_rep_crops, batch_size=VLM_BATCH_SIZE, tag=video_id,
+    )
+    all_attr_confs: list[dict] = []
+    for attrs in all_attributes:
+        all_attr_confs.append({
+            "gender_conf":       attrs.get("gender_conf"),
+            "age_range_conf":    attrs.get("age_range_conf"),
+            "top_color_conf":    attrs.get("upper_clothing_conf"),
+            "bottom_color_conf": attrs.get("lower_clothing_conf"),
+            "shoes_conf":        attrs.get("shoes_conf"),
+            "accessory_conf":    max(
+                attrs.get("bag_conf") or 0.0,
+                attrs.get("hat_conf") or 0.0,
+            ) or None,
+            "hat_color_conf":    attrs.get("hat_conf"),
+            "bag_type_conf":     attrs.get("bag_conf"),
+            "mask_conf":         attrs.get("mask_conf"),
+            "hair_style_conf":   attrs.get("hair_conf"),
+            "hair_color_conf":   attrs.get("hair_conf"),
+        })
+
+    # ── VideoMAE true-batch trên ~25 merged tracklets ────────────────────────
+    device = _get_device()
+    all_actions: list = []
+    model_vmae = get_model("videomae")
+    proc_vmae  = get_model("videomae_processor")
+    if model_vmae and proc_vmae and t_data:
+        try:
+            all_clips: list[list[np.ndarray]] = []
+            for lt, t_idx, rep_bbox, t_frames in t_data:
+                x1, y1, x2, y2 = (max(0, int(v)) for v in rep_bbox)
+                n_f = len(t_frames)
+                idx_list = np.linspace(0, n_f - 1, min(16, n_f), dtype=int)
+                frames_224 = []
+                for fi in idx_list:
+                    f = t_frames[fi]
+                    h, w = f.shape[:2]
+                    x2c, y2c = min(w, x2), min(h, y2)
+                    crop = f[y1:y2c, x1:x2c] if x2c > x1 and y2c > y1 else f
+                    frames_224.append(cv2.resize(
+                        crop if crop.size > 0 else f, (224, 224), interpolation=cv2.INTER_LINEAR))
+                while len(frames_224) < 16:
+                    frames_224.append(frames_224[-1] if frames_224 else np.zeros((224, 224, 3), dtype=np.uint8))
+                all_clips.append(frames_224[:16])
+            inputs = proc_vmae(all_clips, return_tensors="pt")
+            inputs = {k: v.to(device=device, dtype=torch.float16) if v.is_floating_point() else v.to(device)
+                      for k, v in inputs.items()}
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
+                outputs = model_vmae(**inputs)
+            logits = outputs.logits.float()
+            probs = torch.softmax(logits, dim=-1)
+            top_probs, top_indices = probs.topk(1, dim=-1)
+            id2label = getattr(model_vmae.config, "id2label", {})
+            for idx, conf in zip(top_indices.squeeze(1).tolist(), top_probs.squeeze(1).tolist()):
+                label  = id2label.get(idx, "")
+                action = _map_kinetics_to_tracex_action(label) if label else "unknown"
+                all_actions.append((action, float(conf), label))
+            logger.info("[pipeline] %s: VideoMAE done — %d actions", video_id, len(all_actions))
+        except Exception as exc:
+            logger.warning("[pipeline] VideoMAE true-batch failed: %s — fallback", exc)
+            all_actions = [(_run_videomae_actions(t[3], t[2]), 0.0, "") for t in t_data]
+    else:
+        all_actions = [("unknown", 0.0, "")] * len(t_data)
+
+    # Project representative bboxes to BEV coordinates
+    cal_path = os.getenv("CAMERA_CALIBRATION_PATH")
+    _bev_inputs = [{"bbox": rep_bbox_float} for _, _, rep_bbox_float, _ in t_data]
+    _bev_inputs = _project_to_bev_single(_bev_inputs, camera_id, cal_path)
 
     _CROPS_DIR = Path("/workspace/storage/crops")
     _CROPS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1428,7 +1607,7 @@ def _process_video_sync(
     for t_idx, (lt, _, rep_bbox_float, t_frames) in enumerate(t_data_merged):
         obs = lt.observations
         attributes = all_attributes[t_idx]
-        siglip_emb = siglip_embeddings_merged[t_idx] if t_idx < len(siglip_embeddings_merged) else []
+        siglip_emb = all_siglip_embeddings[t_idx] if t_idx < len(all_siglip_embeddings) else []
         action_tuple = all_actions[t_idx]
         if isinstance(action_tuple, tuple) and len(action_tuple) >= 3:
             action, action_conf, kinetics_raw = str(action_tuple[0]), float(action_tuple[1]), str(action_tuple[2])
@@ -1488,6 +1667,9 @@ def _process_video_sync(
             hat_desc=attributes.get("hat_desc"),
             hat_conf=attributes.get("hat_conf"),
             representative_bbox=[int(x) for x in rep_bbox_float],
+            bev_x=_bev_inputs[t_idx].get("bev_x", 0.0),
+            bev_y=_bev_inputs[t_idx].get("bev_y", 0.0),
+            embedding_vector=[],
             siglip_embedding=siglip_emb or [],
             action=action,
             action_confidence=action_conf,
@@ -1569,17 +1751,96 @@ def process_batch(req: BatchProcessRequest) -> BatchProcessResponse:
             except Exception as exc:
                 errors.append(f"{futures[future]}: {exc}")
                 continue
+            for det in group:
+                if det.get("video_id") != vid:
+                    continue
+                fidx = det.get("frame_idx", 0)
+                if 0 <= fidx < len(frames):
+                    all_track_frames.append(frames[fidx])
+                    all_track_bboxes.append(det["bbox"])
 
-            per_video_results.append(result)
-            camera_stats[result.camera_id] = camera_stats.get(result.camera_id, 0) + int(
-                result.total_detections or 0
-            )
+        if not all_track_frames:
+            continue
 
-    tracklets: list[TrackletResult] = []
-    total_detections = 0
-    for result in per_video_results:
-        total_detections += int(result.total_detections or 0)
-        tracklets.extend(result.tracklets or [])
+        # Representative detection: highest score across group
+        rep_det = max(group, key=lambda d: d.get("score", 0))
+        rep_bbox = rep_det["bbox"]
+        rep_bev_x = rep_det.get("bev_x", 0.0)
+        rep_bev_y = rep_det.get("bev_y", 0.0)
+        rep_cam = rep_det.get("camera_id", "unknown")
+        rep_vid = rep_det.get("video_id", contributing_vids[0] if contributing_vids else "unknown")
+
+        # VLM open-vocabulary attribute captioning
+        mid_frame = all_track_frames[len(all_track_frames) // 2]
+        rep_crop_cv = _extract_crop_for_vlm(mid_frame, rep_bbox)
+        rep_crop_pil = (
+            Image.fromarray(cv2.cvtColor(rep_crop_cv, cv2.COLOR_BGR2RGB))
+            if rep_crop_cv is not None
+            else Image.fromarray(np.zeros((384, 384, 3), dtype=np.uint8))
+        )
+        attributes = _caption_crop_vlm(rep_crop_pil)
+
+        # VideoMAE action
+        action = _run_videomae_actions(all_track_frames, rep_bbox)
+
+        # Time range from group
+        timestamps = [d.get("timestamp", 0) for d in group if d.get("timestamp") is not None]
+        start_time = min(timestamps) if timestamps else 0.0
+        end_time = max(timestamps) if timestamps else 0.0
+
+        summary = _build_appearance_summary(attributes)
+        global_tracklet_id = f"{tracklet_id_prefix}_{group_idx}"
+
+        tracklets.append(TrackletResult(
+            tracklet_id=global_tracklet_id,
+            video_id=rep_vid,
+            camera_id=rep_cam,
+            track_id=group_idx,
+            start_time=start_time,
+            end_time=end_time,
+            quality_score=float(rep_det.get("score", 0.5)),
+            gender=attributes.get("gender", "unknown"),
+            age_range=attributes.get("age_range", "unknown"),
+            top_color=attributes.get("top_color", "unknown"),
+            bottom_color=attributes.get("bottom_color", "unknown"),
+            shoes_color=attributes.get("shoes_color", "unknown"),
+            hat_color=attributes.get("hat_color", "unknown"),
+            bag_type=attributes.get("bag_type", "unknown"),
+            is_wearing_mask=attributes.get("is_wearing_mask", "unknown"),
+            hair_style=attributes.get("hair_style", "unknown"),
+            hair_color=attributes.get("hair_color", "unknown"),
+            appearance_summary=summary,
+            upper_clothing_desc=attributes.get("upper_clothing_desc"),
+            upper_clothing_color=attributes.get("upper_clothing_color"),
+            upper_clothing_type=attributes.get("upper_clothing_type"),
+            upper_clothing_conf=attributes.get("upper_clothing_conf"),
+            lower_clothing_desc=attributes.get("lower_clothing_desc"),
+            lower_clothing_color=attributes.get("lower_clothing_color"),
+            lower_clothing_type=attributes.get("lower_clothing_type"),
+            lower_clothing_conf=attributes.get("lower_clothing_conf"),
+            shoes_desc=attributes.get("shoes_desc"),
+            shoes_type=attributes.get("shoes_type"),
+            bag_presence=attributes.get("bag_presence"),
+            bag_desc=attributes.get("bag_desc"),
+            bag_conf=attributes.get("bag_conf"),
+            hat_presence=attributes.get("hat_presence"),
+            hat_type=attributes.get("hat_type"),
+            hat_desc=attributes.get("hat_desc"),
+            hat_conf=attributes.get("hat_conf"),
+            gender_conf=attributes.get("gender_conf"),
+            age_range_conf=attributes.get("age_range_conf"),
+            mask_conf=attributes.get("mask_conf"),
+            hair_style_conf=attributes.get("hair_conf"),
+            hair_color_conf=attributes.get("hair_conf"),
+            representative_bbox=[int(x) for x in rep_bbox],
+            bev_x=rep_bev_x,
+            bev_y=rep_bev_y,
+            embedding_vector=[],
+            action=action,
+            occlusion_score=0.0,
+            contributing_cameras=sorted(set(contributing_cams)),
+            contributing_video_ids=sorted(contributing_vids),
+        ))
 
     elapsed = time.time() - start
     logger.info(

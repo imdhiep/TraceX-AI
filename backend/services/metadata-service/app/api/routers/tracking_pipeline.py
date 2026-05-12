@@ -238,7 +238,7 @@ class BodyPartAdaptiveTracker:
         low_thresh: float = 0.10,
         new_track_threshold: float = 0.45,
         max_match_cost: float = 0.80,
-        max_buffer_match_cost: float = 0.90,
+        max_buffer_match_cost: float = 0.80,
         max_head_center_distance: float = 120.0,
         max_foot_distance: float = 150.0,
         max_predicted_distance: float = 180.0,
@@ -250,6 +250,7 @@ class BodyPartAdaptiveTracker:
         min_head_height: int = 30,
         min_track_frames: int = 3,
         min_track_density: float = 0.05,
+        min_buffer_iou: float = 0.30,
     ):
         self.track_thresh = track_thresh
         self.low_thresh = low_thresh
@@ -267,6 +268,7 @@ class BodyPartAdaptiveTracker:
         self.min_head_height = min_head_height
         self.min_track_frames = min_track_frames
         self.min_track_density = min_track_density
+        self.min_buffer_iou = min_buffer_iou
         self._reset()
 
     def _reset(self) -> None:
@@ -303,20 +305,13 @@ class BodyPartAdaptiveTracker:
         pred = (hc[0] + vx * steps, hc[1] + vy * steps)
         return hbox, hc, pred, last_bbox, fc, hv
 
-    def _match_frame_greedy(
+    def _build_cost_matrix(
         self,
         det_bboxes: list[tuple],
         states: dict,
-        candidates: set,
-        max_cost: float,
-    ) -> list[Optional[tuple[str, float]]]:
-        """Vectorized adaptive greedy matching."""
-        if not candidates or not det_bboxes:
-            return [None] * len(det_bboxes)
-
-        track_ids = list(candidates)
-        M = len(det_bboxes)
-
+        track_ids: list[str],
+    ) -> np.ndarray:
+        """Adaptive cost matrix [M, N] with spatial gating applied (gated cells = 1e9)."""
         det_arr  = np.array(det_bboxes, dtype=np.float32)                              # [M, 4]
 
         t_hboxes = np.array([states[tid][0] for tid in track_ids], dtype=np.float32)  # [N, 4]
@@ -357,8 +352,38 @@ class BodyPartAdaptiveTracker:
         # Spatial gating: suppress only when BOTH primary signals exceed max distance
         too_far = (hcd > self.max_head_center_distance) & (fcd > self.max_foot_distance * 1.2)
         cost = np.where(too_far, 1e9, cost)
+        return cost
+
+    def _match_frame_greedy(
+        self,
+        det_bboxes: list[tuple],
+        states: dict,
+        candidates: set,
+        max_cost: float,
+    ) -> list[Optional[tuple[str, float]]]:
+        """Adaptive matching. Hungarian when M>=2 and N>=2 (avoids order-dependent
+        ID switches when persons cross); greedy otherwise (equivalent and cheaper)."""
+        if not candidates or not det_bboxes:
+            return [None] * len(det_bboxes)
+
+        track_ids = list(candidates)
+        M, N = len(det_bboxes), len(track_ids)
+        cost = self._build_cost_matrix(det_bboxes, states, track_ids)
 
         results: list[Optional[tuple[str, float]]] = [None] * M
+
+        if M >= 2 and N >= 2:
+            try:
+                from scipy.optimize import linear_sum_assignment
+                row_ind, col_ind = linear_sum_assignment(cost)
+                for r, c in zip(row_ind, col_ind):
+                    if cost[r, c] <= max_cost:
+                        results[r] = (track_ids[c], float(cost[r, c]))
+                return results
+            except Exception as exc:
+                # Fall through to greedy on any scipy issue — semantics preserved.
+                pass
+
         used: list[int] = []
         for m in range(M):
             row = cost[m].copy()
@@ -462,6 +487,47 @@ class BodyPartAdaptiveTracker:
                         active_unmatched.discard(tid)
                         states.pop(tid, None)
 
+            # Buffer reactivation: re-attach high-confidence dets to recently-lost tracks
+            # so the same person keeps the original track_id across short occlusions.
+            #
+            # Conservative: same cost ceiling as active match (max_match_cost), no
+            # relaxation of spatial gates, AND require last_bbox IoU ≥ min_buffer_iou
+            # to prevent cross-person re-attachment that would poison the SigLIP
+            # embedding pool downstream and cause over-merging in TrackletFragmentMerger.
+            if unmatched_high and self.buffer:
+                buffer_tids = list(self.buffer.keys())
+                buffer_states = {
+                    tid: self._build_state(self.buffer[tid], self.buffer_last_bbox[tid], fk)
+                    for tid in buffer_tids
+                }
+                matches = self._match_frame_greedy(
+                    [d.bbox for d in unmatched_high],
+                    buffer_states,
+                    set(buffer_tids),
+                    min(self.max_buffer_match_cost, self.max_match_cost),
+                )
+
+                still_unmatched: list[FrameDetection] = []
+                for det, m in zip(unmatched_high, matches):
+                    if not m:
+                        still_unmatched.append(det)
+                        continue
+                    tid, _ = m
+                    # Spatial sanity check: last_bbox of the lost track must overlap
+                    # the new det. Without this a det that drifted to a different
+                    # person's location can be re-attached to the wrong track.
+                    if _bbox_iou(det.bbox, self.buffer_last_bbox[tid]) < self.min_buffer_iou:
+                        still_unmatched.append(det)
+                        continue
+                    obs = self.buffer.pop(tid)
+                    self.buffer_last_bbox.pop(tid, None)
+                    self.buffer_entry_frame.pop(tid, None)
+                    obs.append(self._make_obs(det, ts))
+                    self.active[tid] = obs
+                    self.active_last_bbox[tid] = det.bbox
+                    self.active_last_frame[tid] = fk
+                unmatched_high = still_unmatched
+
             for det in unmatched_high:
                 if det.confidence >= self.new_track_threshold:
                     tid = str(self.next_id)
@@ -531,9 +597,15 @@ class TrackletQualityScorer:
 def _cosine_sim_matrix(embeddings: list[list[float]]) -> np.ndarray:
     """Pairwise cosine similarity for N embeddings → [N, N] float32."""
     n = len(embeddings)
-    if n == 0 or not embeddings[0]:
+    if n == 0:
         return np.zeros((n, n), dtype=np.float32)
-    arr = np.array(embeddings, dtype=np.float32)
+    dim = next((len(e) for e in embeddings if e), 0)
+    if dim == 0:
+        return np.zeros((n, n), dtype=np.float32)
+    arr = np.zeros((n, dim), dtype=np.float32)
+    for i, emb in enumerate(embeddings):
+        if emb and len(emb) == dim:
+            arr[i] = np.asarray(emb, dtype=np.float32)
     norms = np.linalg.norm(arr, axis=1, keepdims=True)
     norms = np.maximum(norms, 1e-8)
     normed = arr / norms
@@ -549,7 +621,8 @@ class TrackletFragmentMerger:
       2. The temporal gap is within max_gap_seconds / max_gap_frames.
       3. Their appearance embeddings have cosine similarity ≥ similarity_threshold.
 
-    Union-Find handles transitive chains (A~B and B~C → A merged into C).
+    Union-Find is guarded at component level so a weak bridge cannot collapse
+    many different people into one large merged tracklet.
 
     Returns the merged LocalTracklet list and a groups list so the caller can
     pool the corresponding feature arrays (embeddings, attributes, actions).
@@ -560,10 +633,12 @@ class TrackletFragmentMerger:
         similarity_threshold: float = 0.85,
         max_gap_seconds: float = 480.0,
         max_gap_frames: int = 1920,
+        component_similarity_margin: float = 0.03,
     ):
         self.sim_thresh     = similarity_threshold
         self.max_gap_s      = max_gap_seconds
         self.max_gap_frames = max_gap_frames
+        self.component_floor = max(0.0, similarity_threshold - component_similarity_margin)
 
     def merge(
         self,
@@ -592,6 +667,12 @@ class TrackletFragmentMerger:
 
         # ── Union-Find ────────────────────────────────────────────────────────
         parent = list(range(n))
+        members: dict[int, set[int]] = {i: {i} for i in range(n)}
+
+        starts_f = [tracklets[order[i]].observations[0].frame_index for i in range(n)]
+        ends_f   = [tracklets[order[i]].observations[-1].frame_index for i in range(n)]
+        starts_t = [tracklets[order[i]].observations[0].timestamp_second for i in range(n)]
+        ends_t   = [tracklets[order[i]].observations[-1].timestamp_second for i in range(n)]
 
         def find(x: int) -> int:
             while parent[x] != x:
@@ -599,10 +680,41 @@ class TrackletFragmentMerger:
                 x = parent[x]
             return x
 
+        def components_temporally_compatible(px: int, py: int) -> bool:
+            for a in members[px]:
+                for b in members[py]:
+                    early, late = (a, b) if starts_t[a] <= starts_t[b] else (b, a)
+                    # Same-person fragments should not be visible concurrently.
+                    if starts_t[late] - ends_t[early] < -1.0:
+                        return False
+                    if starts_f[late] - ends_f[early] < -4:
+                        return False
+            return True
+
+        def components_appearance_compatible(px: int, py: int) -> bool:
+            left = sorted(members[px])
+            right = sorted(members[py])
+            cross = sim[np.ix_(left, right)]
+            if cross.size == 0:
+                return False
+            return (
+                float(cross.mean()) >= self.sim_thresh
+                and float(cross.min()) >= self.component_floor
+            )
+
         def union(x: int, y: int) -> None:
             px, py = find(x), find(y)
-            if px != py:
-                parent[py] = px  # px is the earlier-start member (x < y in sorted order)
+            if px == py:
+                return
+            if not components_temporally_compatible(px, py):
+                return
+            if not components_appearance_compatible(px, py):
+                return
+            # Keep the earliest-start member as the root for stable output order.
+            if min(members[py]) < min(members[px]):
+                px, py = py, px
+            parent[py] = px
+            members[px].update(members.pop(py))
 
         for i in range(n):
             ti        = tracklets[order[i]]
