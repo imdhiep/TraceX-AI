@@ -39,6 +39,7 @@ os.environ.pop("TRANSFORMERS_OFFLINE", None)
 from .api.routers import auth, search, users, videos, ingest, history
 from .api.routers.candidates import router as candidates_router
 from .api.routers.finetune import router as finetune_router
+from .api.routers.trace import router as trace_router
 from .api.routers.video_process import router as video_process_router
 from .config import settings
 
@@ -118,6 +119,7 @@ app.include_router(video_process_router, prefix="/api/v1/video", tags=["video"])
 app.include_router(ingest.router, prefix="/api/v1/ingest", tags=["ingest"])
 app.include_router(finetune_router, prefix="/api/v1/finetune", tags=["finetune"])
 app.include_router(history.router, prefix="/api/v1/history", tags=["history"])
+app.include_router(trace_router, prefix="/api/v1/trace", tags=["trace"])
 # /api/v1/admin/users/{user_id}/queries — admin view of per-user query history
 app.include_router(users.router, prefix="/api/v1/admin/users", tags=["admin"])
 
@@ -125,6 +127,11 @@ app.include_router(users.router, prefix="/api/v1/admin/users", tags=["admin"])
 _CROPS_DIR = Path("/workspace/storage/crops")
 _CROPS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static/crops", StaticFiles(directory=str(_CROPS_DIR)), name="crops")
+
+# Serve evidence clips written by trace-service (same shared volume).
+_TRACES_DIR = Path("/workspace/storage/traces")
+_TRACES_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/static/traces", StaticFiles(directory=str(_TRACES_DIR)), name="traces")
 
 @app.get("/health")
 async def health_check():
