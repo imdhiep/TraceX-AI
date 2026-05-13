@@ -6,6 +6,7 @@ import { useSearchParams } from "next/navigation";
 import { useToast } from "@/components/ui/ToastProvider";
 import { VideoGrid } from "@/components/video/VideoGrid";
 import { VideoList } from "@/components/video/VideoList";
+import { CandidateDetailModal } from "@/features/candidate/CandidateDetailModal";
 import { useSearch } from "@/features/search/SearchContext";
 import { getSearchHistory, getVideoDetail, triggerIngest, type SearchHistoryItem } from "@/lib/api";
 import { loadSessionUser, type AuthUser } from "@/lib/auth";
@@ -17,7 +18,7 @@ import {
   HOME_GUIDE_TITLE,
   HOME_GUIDE_UNSUPPORTED_EXAMPLES,
 } from "@/lib/content/homeGuide";
-import type { VideoClip } from "@/lib/types";
+import type { VideoClip, VideoItem } from "@/lib/types";
 
 const PAGE_SIZE = GRID_BATCH_SIZE;
 
@@ -75,6 +76,7 @@ function HomeViewInner() {
   const [historyItems, setHistoryItems] = useState<SearchHistoryItem[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [selectedHistoryClips, setSelectedHistoryClips] = useState<VideoClip[]>([]);
+  const [selectedCandidate, setSelectedCandidate] = useState<{ queryId: string; candidateId: string } | null>(null);
 
   // Admin import state
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
@@ -142,6 +144,14 @@ function HomeViewInner() {
       setTimeout(() => setImportMessage(null), 6000);
     }
   }, [isImporting, showToast]);
+
+  const handleCandidateClick = useCallback((video: VideoItem) => {
+    if (!video.queryId) {
+      showToast("Không tìm thấy query_id cho candidate này.", "error");
+      return;
+    }
+    setSelectedCandidate({ queryId: video.queryId, candidateId: video.id });
+  }, [showToast]);
 
   // ── History view ────────────────────────────────────────────────────────────
   if (view === "history") {
@@ -345,7 +355,7 @@ function HomeViewInner() {
           Không tìm thấy kết quả phù hợp.
         </p>
       ) : null}
-      <VideoGrid items={pageItems} />
+      <VideoGrid items={pageItems} onItemClick={handleCandidateClick} />
 
       <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-[0_10px_28px_rgba(15,23,42,0.06)] dark:border-slate-800 dark:bg-slate-900/90 dark:shadow-[0_20px_40px_rgba(2,6,23,0.36)]">
         <div className="flex flex-wrap items-center justify-between gap-4">
@@ -375,6 +385,13 @@ function HomeViewInner() {
       <p className="text-center text-xs font-semibold tracking-wide text-slate-500 dark:text-slate-400">
         Mỗi trang {PAGE_SIZE} kết quả · Top n hiện tại = {topK}
       </p>
+
+      <CandidateDetailModal
+        open={selectedCandidate !== null}
+        queryId={selectedCandidate?.queryId ?? null}
+        candidateId={selectedCandidate?.candidateId ?? null}
+        onClose={() => setSelectedCandidate(null)}
+      />
     </div>
   );
 }
