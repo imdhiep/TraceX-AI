@@ -555,13 +555,18 @@ def _encode_query_image_siglip(image_url: str) -> list[float]:
 
 
 def _vec_score(query_vec: list[float], tracklet_vec: list[float]) -> float:
-    """Cosine similarity in [0, 1]. SigLIP vectors live in [-1, 1] cosine range
-    but for normalized identity-rich embeddings 0 is already 'unrelated';
-    negative cosine is uncommon. We clamp to [0, 1] for fusion stability."""
+    """Map cosine similarity into [0, 1] for fusion.
+
+    SigLIP/SigLIP-2 text↔image cosine values are not in CLIP's "normalized
+    contrastive" regime — the sigmoid training loss leaves typical positive
+    matches at only ~0.05–0.2 and unrelated pairs near 0 or slightly
+    negative. Clamping at 0 made every fusion fall back to text+quality.
+    Linear rescale (c + 1) / 2 preserves ranking and keeps everything in
+    [0, 1] without throwing information away."""
     if not query_vec or not tracklet_vec:
         return 0.0
     c = _cosine_sim(query_vec, tracklet_vec)
-    return max(0.0, min(1.0, c))
+    return max(0.0, min(1.0, (c + 1.0) / 2.0))
 
 
 def _tracklet_embedding(t: Tracklet) -> list[float]:

@@ -3,9 +3,12 @@ uvicorn[standard]==0.27.1
 sqlalchemy==2.0.25
 psycopg2-binary==2.9.9
 httpx==0.26.0
-transformers==4.38.2
+transformers==4.49.0
 torch==2.2.0
-sentencepiece==0.1.99
+# Must match torch 2.2.x (transformers 4.46+ pulls a newer torchvision
+# that requires torch 2.3+, breaking torchvision::nms on import).
+torchvision==0.17.0
+sentencepiece==0.2.0
 pydantic==2.6.1
 pydantic-settings==2.1.0
 python-multipart==0.0.9
