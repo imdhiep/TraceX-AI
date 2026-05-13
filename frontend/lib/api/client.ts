@@ -88,6 +88,13 @@ export function resolveMediaUrl(url: string, apiBaseUrl: string = getApiBaseUrl(
   if (/^https?:\/\//i.test(raw)) {
     return raw;
   }
+  if (raw.startsWith("/static/")) {
+    const mediaBaseUrl = apiBaseUrl.replace(/\/$/, "").replace(/\/api\/v\d+$/i, "");
+    if (!mediaBaseUrl || mediaBaseUrl.startsWith("/")) {
+      return raw;
+    }
+    return `${mediaBaseUrl}${raw}`;
+  }
   if (raw.startsWith("/")) {
     return `${apiBaseUrl}${raw}`;
   }
