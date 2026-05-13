@@ -37,6 +37,12 @@ COPY backend/config ./backend/config
 
 ENV PYTHONPATH=/app
 ENV TRACE_CACHE_ROOT=/workspace/storage/cache
+# Prefer distro ffmpeg (`/usr/bin/ffmpeg`, with libx264) over the Conda build
+# (`/opt/conda/bin/ffmpeg`, libopenh264-only and known to fail with "Incorrect
+# library version loaded"). Python code resolves ffmpeg via clip_render
+# .resolve_ffmpeg(); this PATH override is a defense-in-depth for any other
+# subprocess that might still call "ffmpeg" bare.
+ENV PATH=/usr/bin:${PATH}
 
 EXPOSE 8004
 

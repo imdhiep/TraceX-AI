@@ -163,13 +163,19 @@ class TraceService:
         tracklets: list[Tracklet],
         query_id: UUID | str | None = None,
         candidate_id: UUID | str | None = None,
+        render_clips: bool = True,
     ) -> list[dict[str, Any]]:
         """Build trace segments from tracklets.
 
         Each tracklet becomes a segment. Segments are ordered by time.
-        When `query_id` + `candidate_id` are provided AND the tracklet's source
-        video file is on local disk, an evidence clip is rendered with a moving
-        bbox (from `tracklet_observations`) and the static URL is attached.
+        When `query_id` + `candidate_id` are provided AND `render_clips` is
+        True AND the tracklet's source video file is on local disk, an
+        evidence clip is rendered with a moving bbox (from
+        `tracklet_observations`) and the static URL is attached.
+
+        Set `render_clips=False` to build metadata-only segments (clip URLs
+        left as None) — used by the async /trace/build path which returns
+        immediately and renders in a background task.
         """
         if not tracklets:
             return []
@@ -196,7 +202,7 @@ class TraceService:
             # legacy synthetic URL when (a) we lack query/candidate context, or
             # (b) the source video isn't on local disk, or (c) render fails.
             clip_url = None
-            if query_id and candidate_id and video:
+            if render_clips and query_id and candidate_id and video:
                 obs_payload = [
                     {
                         "frame_index": o.frame_index,
@@ -225,7 +231,7 @@ class TraceService:
                             tracklet.tracklet_id, exc,
                         )
 
-            if clip_url is None:
+            if clip_url is None and render_clips:
                 clip_url = self._get_video_clip_url(tracklet)
 
             segment = {

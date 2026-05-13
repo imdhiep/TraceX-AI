@@ -20,26 +20,50 @@ export function TraceView({ evidenceId, queryId, candidateId }: Props) {
 
   useEffect(() => {
     let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
     setIsLoading(true);
     setError(null);
-    void getTraceTimeline(evidenceId)
-      .then((t) => {
+
+    // Build returns immediately with empty videoClipUrls and renders clips
+    // in a background task. Poll the timeline until every segment has a URL
+    // (or we've waited long enough that something's clearly wrong).
+    const POLL_INTERVAL_MS = 2000;
+    const MAX_POLL_MS = 30 * 60 * 1000;
+    const startedAt = Date.now();
+
+    const tick = async () => {
+      try {
+        const t = await getTraceTimeline(evidenceId);
         if (cancelled) return;
         setTrace(t);
-        setActiveIdx(0);
-      })
-      .catch((err) => {
+        setIsLoading(false);
+        const pending = t.segments.some((s) => !s.videoClipUrl);
+        if (pending && Date.now() - startedAt < MAX_POLL_MS) {
+          timer = setTimeout(tick, POLL_INTERVAL_MS);
+        }
+      } catch (err) {
         if (cancelled) return;
         setError(err instanceof Error ? err.message : "Không thể tải timeline.");
-      })
-      .finally(() => {
-        if (cancelled) return;
         setIsLoading(false);
-      });
+      }
+    };
+
+    void tick();
     return () => {
       cancelled = true;
+      if (timer) clearTimeout(timer);
     };
   }, [evidenceId]);
+
+  useEffect(() => {
+    // Reset the active index only on the first successful load so that
+    // polling updates (which keep `trace` set) don't reset the user's
+    // currently selected segment.
+    if (trace && activeIdx >= trace.segments.length) {
+      setActiveIdx(0);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trace?.segments.length]);
 
   const segments = trace?.segments ?? [];
   const active = segments[activeIdx];
