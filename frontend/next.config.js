@@ -10,10 +10,15 @@ const nextConfig = {
     // process.env here reads the real OS value from .env.local, not the /api-gw override above.
     const upstream = (process.env.NEXT_PUBLIC_API_BASE_URL || "").replace(/\/$/, "");
     if (!upstream || upstream.startsWith("/")) return [];
+    const mediaUpstream = upstream.replace(/\/api\/v\d+$/i, "");
     return [
       {
         source: "/api-gw/:path*",
         destination: `${upstream}/:path*`,
+      },
+      {
+        source: "/static/:path*",
+        destination: `${mediaUpstream}/static/:path*`,
       },
     ];
   },

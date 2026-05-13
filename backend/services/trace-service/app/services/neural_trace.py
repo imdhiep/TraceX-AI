@@ -38,7 +38,19 @@ RIFE_MODEL_PATH = os.getenv("RIFE_MODEL_PATH", "/workspace/models/rife")
 
 
 def _run_ffmpeg(cmd: list[str], timeout: int = 300) -> bool:
-    """Run FFmpeg command. Returns True on success."""
+    """Run FFmpeg command. Returns True on success.
+
+    The first element of `cmd` is treated as the ffmpeg binary placeholder and
+    replaced with the path returned by `resolve_ffmpeg()`. Hardcoding the path
+    avoids picking up Conda's libopenh264-only build via PATH.
+    """
+    from .clip_render import resolve_ffmpeg
+
+    ffmpeg = resolve_ffmpeg()
+    if not ffmpeg:
+        logger.error("FFmpeg binary not found")
+        return False
+    cmd = [ffmpeg, *cmd[1:]]
     try:
         result = subprocess.run(
             cmd,
@@ -46,7 +58,13 @@ def _run_ffmpeg(cmd: list[str], timeout: int = 300) -> bool:
             text=True,
             timeout=timeout,
         )
-        return result.returncode == 0
+        if result.returncode != 0:
+            logger.error(
+                "FFmpeg exited with code %s: %s",
+                result.returncode, result.stderr.strip(),
+            )
+            return False
+        return True
     except (subprocess.TimeoutExpired, Exception) as exc:
         logger.error("FFmpeg failed: %s", exc)
         return False

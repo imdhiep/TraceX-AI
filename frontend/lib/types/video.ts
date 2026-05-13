@@ -3,6 +3,7 @@ export type VideoItem = {
   title: string;
   description: string;
   thumbnailUrl: string;
+  queryId?: string;
 };
 
 export type VideoClip = VideoItem & {

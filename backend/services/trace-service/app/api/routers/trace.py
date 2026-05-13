@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -25,6 +25,8 @@ from ...core.schemas import (
     BuildTraceRequest,
     BuildTraceResponse,
     CandidateDetailResponse,
+    CandidateTrackletAction,
+    CandidateTrackletEmbeddingInfo,
     CandidateTrackletPreview,
     ContinueTraceRequest,
     ContinueTraceResponse,
@@ -108,10 +110,15 @@ def select_candidate(
 def build_trace(
     request: BuildTraceRequest,
     session: SessionDep,
+    background_tasks: BackgroundTasks,
 ) -> BuildTraceResponse:
     """Build a trace from the selected candidate.
 
-    This finds all tracklets within the time window and creates evidence video.
+    Returns immediately with `video_clip_url=None` on each segment. Clip
+    rendering runs in a background task; the frontend polls /trace/status
+    (or /trace/timeline) until every segment has a URL. This split was
+    required because rendering 40+-tracklet candidates took minutes and was
+    exceeding the upstream proxy's response timeout.
     """
     service = _build_trace_service(session)
 
@@ -145,11 +152,13 @@ def build_trace(
     if not tracklets:
         raise HTTPException(status_code=404, detail="No tracklets found for candidate in time window")
 
-    # Build trace segments
+    # Build segment metadata only — clip rendering happens in a background
+    # task after the response is sent.
     segments = service.build_trace_segments(
         tracklets,
         query_id=request.query_id,
         candidate_id=request.candidate_id,
+        render_clips=False,
     )
 
     # Calculate trace confidence
@@ -166,6 +175,12 @@ def build_trace(
     )
 
     session.commit()
+
+    # Kick off background render for every pending clip. The worker dedupes
+    # in-flight evidence IDs and is safe to invoke even if all clips are
+    # already cached on disk.
+    from ...services.render_worker import render_evidence_clips
+    background_tasks.add_task(render_evidence_clips, evidence.id)
 
     # Build response
     segment_responses = [
@@ -205,18 +220,47 @@ def build_trace(
 def get_trace_status(
     evidence_id: int,
     session: SessionDep,
+    background_tasks: BackgroundTasks,
 ) -> TraceStatusResponse:
-    """Get trace status by evidence ID."""
+    """Get trace status by evidence ID.
+
+    Computes progress live from `evidence_tracklets.video_clip_url`: empty
+    string ⇒ pending, non-empty ⇒ rendered. Status flips from `pending` to
+    `rendering` once the first clip lands, then `completed` once they all
+    have URLs. As a self-healing measure, a still-pending evidence row is
+    re-enqueued for rendering (the worker dedupes in-flight IDs so this is
+    cheap).
+    """
     evidence = session.get(EvidenceVideo, evidence_id)
     if not evidence:
         raise HTTPException(status_code=404, detail="Evidence not found")
 
+    rows = (
+        session.query(EvidenceTracklet.video_clip_url)
+        .filter(EvidenceTracklet.evidence_video_id == evidence_id)
+        .all()
+    )
+    total = len(rows)
+    rendered = sum(1 for (url,) in rows if url)
+    if total == 0 or rendered == total:
+        status_str = "completed" if total > 0 else "pending"
+    elif rendered == 0:
+        status_str = "pending"
+    else:
+        status_str = "rendering"
+
+    if status_str != "completed":
+        from ...services.render_worker import render_evidence_clips
+        background_tasks.add_task(render_evidence_clips, evidence.id)
+
     return TraceStatusResponse(
         evidence_id=evidence.id,
         query_id=evidence.query_id,
-        status="completed",
+        status=status_str,
         trace_confidence=evidence.trace_confidence,
         segment_count=evidence.segment_count,
+        rendered_segments=rendered,
+        total_segments=total,
         created_at=evidence.created_at,
         updated_at=evidence.created_at,
     )
@@ -314,12 +358,113 @@ def submit_feedback(
     )
 
 
-@router.get("/candidate-detail", response_model=CandidateDetailResponse)
+def _embedding_info(t: Tracklet) -> CandidateTrackletEmbeddingInfo:
+    emb = t.embedding
+    if emb is None or emb.siglip_embedding is None:
+        return CandidateTrackletEmbeddingInfo(has_embedding=False)
+    try:
+        dim = len(emb.siglip_embedding)
+    except TypeError:
+        dim = None
+    return CandidateTrackletEmbeddingInfo(has_embedding=True, dim=dim)
+
+
+def _tracklet_to_preview(t: Tracklet) -> CandidateTrackletPreview:
+    """Flatten a Tracklet row + its embedding/actions into the wire schema.
+
+    `time_start` / `time_end` are wall-clock anchored to the recording's
+    `recorded_at` (falling back to `created_at`) plus the tracklet's offset
+    within that video. This is what the popup uses to sort across tracklets
+    that came from different videos.
+    """
+    base_dt = None
+    video_id = None
+    if t.video is not None:
+        base_dt = t.video.recorded_at or t.video.created_at
+        video_id = t.video.video_id
+    start_offset = float(t.start_time) if t.start_time is not None else None
+    end_offset = float(t.end_time) if t.end_time is not None else None
+
+    time_start = base_dt + timedelta(seconds=start_offset) if base_dt and start_offset is not None else None
+    time_end = base_dt + timedelta(seconds=end_offset) if base_dt and end_offset is not None else None
+    duration = (end_offset - start_offset) if (start_offset is not None and end_offset is not None) else None
+
+    actions = [
+        CandidateTrackletAction(
+            action_label=a.action_label,
+            kinetics_label=a.kinetics_label,
+            confidence=float(a.confidence or 0.0),
+        )
+        for a in (t.actions or [])
+    ]
+    actions.sort(key=lambda a: a.confidence, reverse=True)
+
+    return CandidateTrackletPreview(
+        tracklet_id=t.tracklet_id,
+        video_id=video_id,
+        camera_id=t.camera_id,
+        track_id=t.track_id,
+        time_start=time_start,
+        time_end=time_end,
+        start_offset_seconds=start_offset,
+        end_offset_seconds=end_offset,
+        duration_seconds=duration,
+        crop_url=t.crop_url or None,
+        representative_bbox=[float(v) for v in (t.representative_bbox or [])] or None,
+        quality_score=float(t.quality_score) if t.quality_score is not None else None,
+        confidence=float(t.quality_score) if t.quality_score is not None else None,
+        gender=t.gender,
+        gender_conf=t.gender_conf,
+        age_range=t.age_range,
+        age_range_conf=t.age_range_conf,
+        upper_color=t.upper_color,
+        upper_type=t.upper_type,
+        upper_desc=t.upper_desc,
+        upper_conf=t.upper_conf,
+        lower_color=t.lower_color,
+        lower_type=t.lower_type,
+        lower_desc=t.lower_desc,
+        lower_conf=t.lower_conf,
+        shoes_color=t.shoes_color,
+        shoes_type=t.shoes_type,
+        shoes_desc=t.shoes_desc,
+        shoes_conf=t.shoes_conf,
+        bag_presence=t.bag_presence,
+        bag_type=t.bag_type,
+        bag_desc=t.bag_desc,
+        bag_conf=t.bag_conf,
+        hat_presence=t.hat_presence,
+        hat_color=t.hat_color,
+        hat_type=t.hat_type,
+        hat_desc=t.hat_desc,
+        hat_conf=t.hat_conf,
+        mask_presence=t.mask_presence,
+        mask_conf=t.mask_conf,
+        hair_style=t.hair_style,
+        hair_style_conf=t.hair_style_conf,
+        hair_color=t.hair_color,
+        hair_color_conf=t.hair_color_conf,
+        appearance_summary=t.appearance_summary or None,
+        appearance_summary_conf=t.appearance_summary_conf,
+        bev_x=float(t.bev_x) if t.bev_x is not None else None,
+        bev_y=float(t.bev_y) if t.bev_y is not None else None,
+        actions=actions,
+        embedding=_embedding_info(t),
+    )
+
+
+@router.post("/candidate-detail", response_model=CandidateDetailResponse)
 def get_candidate_detail(
     request: TraceCandidateDetailRequest,
     session: SessionDep,
 ) -> CandidateDetailResponse:
-    """Get detailed information about a candidate for preview."""
+    """Full detail of a candidate + every tracklet that belongs to it.
+
+    Returns tracklets ordered by wall-clock time (`video.recorded_at +
+    tracklet.start_time`) so the UI can scroll through them chronologically.
+    Each tracklet carries its full appearance/demographic record, top
+    VideoMAE actions, and embedding metadata.
+    """
     service = _build_trace_service(session)
 
     query = _get_query(session, request.query_id)
@@ -332,7 +477,6 @@ def get_candidate_detail(
     if candidate.query_id != str(request.query_id):
         raise HTTPException(status_code=400, detail="Candidate does not belong to this query")
 
-    # Get tracklets within 24h window
     window_start = query.created_at - timedelta(hours=24)
     window_end = query.created_at + timedelta(hours=24)
 
@@ -342,26 +486,17 @@ def get_candidate_detail(
         time_window_end=window_end,
     )
 
-    # Build tracklet previews
-    tracklet_previews = []
-    camera_ids = []
+    previews = [_tracklet_to_preview(t) for t in tracklets]
+    # Order by wall-clock start (None last). Tie-break by tracklet_id for stability.
+    previews.sort(key=lambda p: (
+        p.time_start or datetime.max.replace(tzinfo=timezone.utc),
+        p.tracklet_id,
+    ))
 
-    for t in tracklets:
-        video = t.video if t.video_id else None
-        tracklet_previews.append(
-            CandidateTrackletPreview(
-                tracklet_id=t.tracklet_id,
-                camera_id=t.camera_id,
-                time_start=t.video.created_at if t.video else None,
-                time_end=None,
-                duration_seconds=t.end_time - t.start_time if t.start_time and t.end_time else None,
-                appearance_summary=t.appearance_summary,
-                crop_url=t.crop_url,
-                confidence=t.quality_score,
-            )
-        )
-        if t.camera_id and t.camera_id not in camera_ids:
-            camera_ids.append(t.camera_id)
+    camera_path: list[str] = []
+    for p in previews:
+        if p.camera_id and p.camera_id not in camera_path:
+            camera_path.append(p.camera_id)
 
     return CandidateDetailResponse(
         candidate_id=candidate.candidate_id,
@@ -372,9 +507,9 @@ def get_candidate_detail(
         appearance_summary=candidate.appearance_summary,
         preview_url=candidate.preview_url,
         rank_position=candidate.rank_position,
-        total_tracklets_in_window=len(tracklets),
-        tracklets=tracklet_previews,
-        camera_path=camera_ids,
+        total_tracklets_in_window=len(previews),
+        tracklets=previews,
+        camera_path=camera_path,
     )
 
 

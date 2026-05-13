@@ -14,8 +14,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
-from typing import Iterable
 
 import cv2
 
@@ -27,6 +28,11 @@ _STATIC_PREFIX = "/static/traces"
 # Bbox visual settings (BGR)
 _BBOX_COLOR = (0, 255, 0)
 _BBOX_THICKNESS = 3
+_FFMPEG_PATH = os.getenv("TRACE_CLIP_FFMPEG_PATH")
+_H264_ENCODER = os.getenv("TRACE_CLIP_H264_ENCODER", "libx264")
+_H264_CRF = os.getenv("TRACE_CLIP_H264_CRF", "23")
+_H264_PRESET = os.getenv("TRACE_CLIP_H264_PRESET", "veryfast")
+_H264_BITRATE = os.getenv("TRACE_CLIP_H264_BITRATE", "6000k")
 
 
 def _slugify(value: str) -> str:
@@ -78,6 +84,81 @@ def _interp_bbox(
     return None
 
 
+def resolve_ffmpeg() -> str | None:
+    """Return absolute path to a usable ffmpeg binary, or None.
+
+    The trace-service container ships two ffmpeg builds: distro `/usr/bin/ffmpeg`
+    (with libx264) and Conda `/opt/conda/bin/ffmpeg` (libopenh264-only and known
+    to fail with "Incorrect library version loaded"). PATH starts with the Conda
+    prefix, so `shutil.which("ffmpeg")` resolves to the broken one. We prefer
+    `TRACE_CLIP_FFMPEG_PATH` (operator override), then `/usr/bin/ffmpeg`, then
+    fall back to whatever is on PATH.
+    """
+    if _FFMPEG_PATH:
+        return _FFMPEG_PATH
+    if Path("/usr/bin/ffmpeg").exists():
+        return "/usr/bin/ffmpeg"
+    return shutil.which("ffmpeg")
+
+
+def _open_h264_writer(
+    out_path: Path,
+    *,
+    fps: float,
+    width: int,
+    height: int,
+) -> subprocess.Popen | None:
+    """Open an ffmpeg process that accepts BGR frames and writes H.264 MP4.
+
+    OpenCV's default MP4 writer commonly emits MPEG-4 Part 2 (`mp4v`), which is
+    a valid MP4 file but is not reliably playable in browsers. We stream raw
+    BGR frames into FFmpeg (resolved via `resolve_ffmpeg`) and let it produce
+    browser-friendly H.264/yuv420p.
+    """
+    ffmpeg = resolve_ffmpeg()
+    if not ffmpeg:
+        return None
+
+    args = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-s:v",
+        f"{width}x{height}",
+        "-r",
+        f"{fps:.6f}",
+        "-i",
+        "pipe:0",
+        "-an",
+        "-c:v",
+        _H264_ENCODER,
+    ]
+    if _H264_ENCODER == "libx264":
+        args.extend(["-preset", _H264_PRESET, "-crf", _H264_CRF])
+    else:
+        args.extend(["-b:v", _H264_BITRATE])
+    args.extend([
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-f",
+        "mp4",
+        str(out_path),
+    ])
+    try:
+        return subprocess.Popen(args, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    except Exception as exc:
+        logger.warning("[clip_render] cannot start ffmpeg H.264 writer: %s", exc)
+        return None
+
+
 def render_tracklet_clip(
     *,
     source_video_path: str,
@@ -96,17 +177,27 @@ def render_tracklet_clip(
 
     `observations` shape: [{frame_index, timestamp_second, bbox: [x1,y1,x2,y2], confidence}, ...]
     """
+    safe_query_id = _slugify(str(query_id))
+    safe_candidate_id = _slugify(str(candidate_id))
+    out_dir = _TRACES_ROOT / safe_query_id / safe_candidate_id
+    safe_tracklet_id = _slugify(tracklet_id)
+    out_path = out_dir / f"{safe_tracklet_id}.mp4"
+    rel_url = f"{_STATIC_PREFIX}/{safe_query_id}/{safe_candidate_id}/{safe_tracklet_id}.mp4"
+
+    # Cache hit — clip from a previous render of the same (query, candidate,
+    # tracklet) tuple is reused as-is. Async/parallel callers rely on this so
+    # repeated /trace/build calls (or polling refreshes) don't redo work.
+    if out_path.exists() and out_path.stat().st_size > 0:
+        return rel_url
+
     src = Path(source_video_path)
     if not src.exists():
         logger.warning("[clip_render] source video missing: %s", src)
         return None
 
-    safe_query_id = _slugify(str(query_id))
-    safe_candidate_id = _slugify(str(candidate_id))
-    out_dir = _TRACES_ROOT / safe_query_id / safe_candidate_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    safe_tracklet_id = _slugify(tracklet_id)
-    out_path = out_dir / f"{safe_tracklet_id}.mp4"
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    tmp_path.unlink(missing_ok=True)
 
     cap = cv2.VideoCapture(str(src))
     if not cap.isOpened():
@@ -128,39 +219,61 @@ def render_tracklet_clip(
         obs_map = _build_source_frame_map(observations, float(fps))
         sorted_obs_frames = sorted(obs_map)
 
-        # mp4v works in most environments; switch to avc1 if you have encoder support
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(out_path), fourcc, fps, (width, height))
-        if not writer.isOpened():
-            logger.warning("[clip_render] cannot open writer for %s", out_path)
-            return None
+        ffmpeg_writer = _open_h264_writer(tmp_path, fps=float(fps), width=width, height=height)
+        cv_writer = None
+        if ffmpeg_writer is None:
+            logger.warning("[clip_render] H.264 writer unavailable; falling back to mp4v")
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            cv_writer = cv2.VideoWriter(str(tmp_path), fourcc, fps, (width, height))
+            if not cv_writer.isOpened():
+                logger.warning("[clip_render] cannot open writer for %s", tmp_path)
+                return None
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        for fi in range(start_frame, end_frame + 1):
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                break
+        try:
+            for fi in range(start_frame, end_frame + 1):
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
 
-            if draw_bbox:
-                bbox = obs_map.get(fi) or _interp_bbox(fi, sorted_obs_frames, obs_map)
-                if bbox is not None:
-                    x1, y1, x2, y2 = bbox
-                    x1 = max(0, min(width - 1, x1))
-                    y1 = max(0, min(height - 1, y1))
-                    x2 = max(0, min(width - 1, x2))
-                    y2 = max(0, min(height - 1, y2))
-                    if x2 > x1 and y2 > y1:
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), _BBOX_COLOR, _BBOX_THICKNESS)
+                if draw_bbox:
+                    bbox = obs_map.get(fi) or _interp_bbox(fi, sorted_obs_frames, obs_map)
+                    if bbox is not None:
+                        x1, y1, x2, y2 = bbox
+                        x1 = max(0, min(width - 1, x1))
+                        y1 = max(0, min(height - 1, y1))
+                        x2 = max(0, min(width - 1, x2))
+                        y2 = max(0, min(height - 1, y2))
+                        if x2 > x1 and y2 > y1:
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), _BBOX_COLOR, _BBOX_THICKNESS)
 
-            writer.write(frame)
-
-        writer.release()
+                if ffmpeg_writer is not None:
+                    assert ffmpeg_writer.stdin is not None
+                    ffmpeg_writer.stdin.write(frame.tobytes())
+                else:
+                    assert cv_writer is not None
+                    cv_writer.write(frame)
+        finally:
+            if ffmpeg_writer is not None:
+                assert ffmpeg_writer.stdin is not None
+                ffmpeg_writer.stdin.close()
+                stderr_bytes = ffmpeg_writer.stderr.read() if ffmpeg_writer.stderr else b""
+                return_code = ffmpeg_writer.wait()
+                if return_code != 0:
+                    err = stderr_bytes.decode("utf-8", errors="replace").strip()
+                    logger.warning(
+                        "[clip_render] ffmpeg writer exited with code %s: %s",
+                        return_code, err,
+                    )
+                    tmp_path.unlink(missing_ok=True)
+                    return None
+            if cv_writer is not None:
+                cv_writer.release()
     finally:
         cap.release()
 
-    if not out_path.exists() or out_path.stat().st_size == 0:
-        logger.warning("[clip_render] output not produced: %s", out_path)
+    if not tmp_path.exists() or tmp_path.stat().st_size == 0:
+        logger.warning("[clip_render] output not produced: %s", tmp_path)
         return None
-
-    rel = f"{safe_query_id}/{safe_candidate_id}/{safe_tracklet_id}.mp4"
-    return f"{_STATIC_PREFIX}/{rel}"
+    tmp_path.replace(out_path)
+    return rel_url

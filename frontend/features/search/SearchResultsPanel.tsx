@@ -1,10 +1,20 @@
 "use client";
 
+import { useState } from "react";
+
 import { VideoCard } from "@/components/video/VideoCard";
+import { CandidateDetailModal } from "@/features/candidate/CandidateDetailModal";
 import { useSearch } from "@/features/search/SearchContext";
+import type { VideoItem } from "@/lib/types";
 
 export function SearchResultsPanel() {
   const { results, isLoading, error, hasSearched, hasMore, loadMore, query } = useSearch();
+  const [selected, setSelected] = useState<{ queryId: string; candidateId: string } | null>(null);
+
+  const handleCardClick = (item: VideoItem) => {
+    if (!item.queryId) return;
+    setSelected({ queryId: item.queryId, candidateId: item.id });
+  };
 
   if (!hasSearched) return null;
 
@@ -42,7 +52,7 @@ export function SearchResultsPanel() {
         <>
           <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
             {results.map((item) => (
-              <VideoCard key={item.id} video={item} />
+              <VideoCard key={item.id} video={item} onClick={handleCardClick} />
             ))}
           </div>
 
@@ -60,6 +70,13 @@ export function SearchResultsPanel() {
           )}
         </>
       )}
+
+      <CandidateDetailModal
+        open={selected !== null}
+        queryId={selected?.queryId ?? null}
+        candidateId={selected?.candidateId ?? null}
+        onClose={() => setSelected(null)}
+      />
     </div>
   );
 }
