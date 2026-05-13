@@ -210,6 +210,7 @@ class Video(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     storage_path: Mapped[str] = mapped_column(String(2048), nullable=False)
     storage_backend: Mapped[str] = mapped_column(String(64), nullable=False, default="local_volume")
+    drive_file_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     source_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
     content_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
     duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)

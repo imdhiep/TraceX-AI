@@ -958,7 +958,10 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
         merged: list[dict] = []
         for group in groups:
             rep = group[0]
-            candidate_id = rep.tracklet_id if len(group) == 1 else str(uuid.uuid4())
+            # Candidate IDs are query-scoped persisted records. Reusing a
+            # singleton tracklet_id collides with earlier queries and makes the
+            # returned candidate impossible to select/trace for the current qid.
+            candidate_id = str(uuid.uuid4())
             text_score = float(text_score_map.get(rep.tracklet_id, 0.0))
             quality_score = float(rep.quality_score or 0.0)
 

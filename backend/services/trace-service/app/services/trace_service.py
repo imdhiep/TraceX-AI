@@ -196,7 +196,7 @@ class TraceService:
             # legacy synthetic URL when (a) we lack query/candidate context, or
             # (b) the source video isn't on local disk, or (c) render fails.
             clip_url = None
-            if query_id and candidate_id and video and video.storage_path:
+            if query_id and candidate_id and video:
                 obs_payload = [
                     {
                         "frame_index": o.frame_index,
@@ -206,22 +206,24 @@ class TraceService:
                     }
                     for o in (tracklet.observations or [])
                 ]
-                try:
-                    clip_url = render_tracklet_clip(
-                        source_video_path=str(video.storage_path),
-                        observations=obs_payload,
-                        start_time=float(tracklet.start_time or 0.0),
-                        end_time=float(tracklet.end_time or 0.0),
-                        query_id=str(query_id),
-                        candidate_id=str(candidate_id),
-                        tracklet_id=tracklet.tracklet_id,
-                        draw_bbox=bool(obs_payload),
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "[trace] clip render failed for %s: %s",
-                        tracklet.tracklet_id, exc,
-                    )
+                source_path = self._resolve_source_video_path(video)
+                if source_path:
+                    try:
+                        clip_url = render_tracklet_clip(
+                            source_video_path=source_path,
+                            observations=obs_payload,
+                            start_time=float(tracklet.start_time or 0.0),
+                            end_time=float(tracklet.end_time or 0.0),
+                            query_id=str(query_id),
+                            candidate_id=str(candidate_id),
+                            tracklet_id=tracklet.tracklet_id,
+                            draw_bbox=bool(obs_payload),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[trace] clip render failed for %s: %s",
+                            tracklet.tracklet_id, exc,
+                        )
 
             if clip_url is None:
                 clip_url = self._get_video_clip_url(tracklet)
@@ -415,6 +417,32 @@ class TraceService:
             .delete(synchronize_session=False)
         )
         return count
+
+    def _resolve_source_video_path(self, video) -> str | None:
+        """Return a readable local path to the source MP4, or None.
+
+        Prefers `video.storage_path` if the file actually exists on disk
+        (legacy / shared-volume deployments). Otherwise falls back to
+        downloading from Google Drive via `drive_fetch.fetch_video` when
+        `video.drive_file_id` is set — the canonical path on the current
+        deployment, where ingest streams Drive → GPU without persisting the
+        file locally.
+        """
+        from pathlib import Path
+
+        if video.storage_path:
+            sp = Path(str(video.storage_path))
+            if sp.exists() and sp.stat().st_size > 0:
+                return str(sp)
+
+        drive_id = getattr(video, "drive_file_id", None)
+        if drive_id:
+            from .drive_fetch import fetch_video
+            local = fetch_video(drive_id)
+            if local is not None:
+                return str(local)
+
+        return None
 
     def _get_video_clip_url(self, tracklet: Tracklet | None) -> str | None:
         """Get video clip URL for a tracklet.

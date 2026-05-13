@@ -282,13 +282,13 @@ def _upsert_video(
     if existing is not None:
         return
 
-    view_link = f"https://drive.google.com/file/d/{drive_file_id}/view"
     session.add(Video(
         video_id=video_id,
         camera_id=camera_id,
         title=title,
         storage_path=str(_STORAGE_PATH_METADATA / source_filename),
         storage_backend="google_drive",
+        drive_file_id=drive_file_id,
         source_filename=source_filename,
         processed=False,
     ))

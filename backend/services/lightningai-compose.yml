@@ -219,11 +219,14 @@ services:
       - PROPAINTER_MODEL_PATH=/workspace/models/propaint
       - RIFE_MODEL_PATH=/workspace/models/rife
       - NVIDIA_VISIBLE_DEVICES=0
+      - MCPT_SECRETS_ROOT=${MCPT_SECRETS_ROOT:-/workspace/secrets}
+      - DRIVE_CACHE_MAX_BYTES=${DRIVE_CACHE_MAX_BYTES:-21474836480}
     volumes:
       - mcpt_storage:/workspace/storage
       - model_weights:/workspace/models
       - mtmc_gt:/workspace/datasets/MTMC_Tracking_2024/train:ro
       - a20_root:/workspace/a20-root:ro
+      - /workspace/secrets:/workspace/secrets:ro
     deploy:
       resources:
         reservations:
