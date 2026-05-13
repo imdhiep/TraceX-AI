@@ -203,6 +203,10 @@ services:
       # Search tuning
       - MIN_FUSION_SCORE=${MIN_FUSION_SCORE:-0.0}
       - MAX_CANDIDATES=${MAX_CANDIDATES:-50}
+      # SigLIP2 image-image cosine clusters very tightly (~0.85-1.0 across
+      # all person crops). Identity merge needs a strict cutoff — adjust at
+      # runtime without redeploy via this env. Floor 0.97, sweet spot 0.98.
+      - QUERY_MERGE_THRESHOLD=${QUERY_MERGE_THRESHOLD:-0.98}
       # AI model cache
       - HF_HOME=/workspace/models/huggingface
       - TORCH_HOME=/workspace/models/torch

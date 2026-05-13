@@ -389,7 +389,14 @@ def _local_prefilter(
 
 # ── Identity merge: cosine similarity + temporal/camera guards + union-find ───
 
-_MERGE_THRESHOLD = 0.85       # SigLIP2 cosine similarity to consider same identity
+_MERGE_THRESHOLD = float(os.getenv("QUERY_MERGE_THRESHOLD", "0.98"))
+# SigLIP2 image embeddings of arbitrary person crops cluster very tightly
+# (cosine 0.85–1.0 across different people), so the 0.85 used at ingest's
+# fragment-merge stage (where temporal/spatial guards do the heavy lifting)
+# collapses entire query shortlists into one candidate at search time.
+# Cross-camera identity merge needs a much stricter floor — 0.97 keeps the
+# same-person bridges while breaking the noisy "everyone looks like everyone"
+# edges. Tunable via QUERY_MERGE_THRESHOLD env without redeploy.
 _MERGE_MAX_GAP_S = 86400.0   # max 24-hour gap — matches trace window
 _CONF_THRESHOLD = 0.70        # fallback: below this = uncertain → don't block merge
 
