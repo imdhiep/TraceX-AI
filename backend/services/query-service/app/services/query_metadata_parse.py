@@ -37,11 +37,23 @@ from typing import Iterable
 logger = logging.getLogger(__name__)
 
 
-_CONFIG_PATHS = [
-    Path(os.environ.get("QUERY_METADATA_VOCAB_CONFIG", "")),
-    Path("/app/backend/config/query_metadata_vocab.json"),
-    Path(__file__).resolve().parents[4] / "config" / "query_metadata_vocab.json",
-]
+def _candidate_config_paths() -> list[Path]:
+    paths: list[Path] = []
+
+    env_path = os.environ.get("QUERY_METADATA_VOCAB_CONFIG")
+    if env_path:
+        paths.append(Path(env_path))
+
+    paths.append(Path("/app/backend/config/query_metadata_vocab.json"))
+
+    # Local source tree fallback. In Docker, __file__ is under /app/app/... and
+    # this parent depth may not exist, so keep it best-effort.
+    try:
+        paths.append(Path(__file__).resolve().parents[4] / "config" / "query_metadata_vocab.json")
+    except IndexError:
+        pass
+
+    return paths
 
 # Bare-minimum fallback so the service still boots without the config file.
 _FALLBACK_VOCAB: dict = {
@@ -58,7 +70,7 @@ _FALLBACK_VOCAB: dict = {
 
 
 def _load_vocab() -> dict:
-    for path in _CONFIG_PATHS:
+    for path in _candidate_config_paths():
         if not path or not path.is_file():
             continue
         try:

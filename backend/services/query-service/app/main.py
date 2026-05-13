@@ -7,8 +7,29 @@ Responsibilities:
 - Forward shortlist to trace-service for EVA-02 cosine re-ranking
 """
 
-from contextlib import asynccontextmanager
 import logging
+import os
+import sys
+from contextlib import asynccontextmanager
+
+# ── Timestamp logging ──────────────────────────────────────────────────────────
+# Uvicorn configures uvicorn.* loggers, but the root logger used by app modules
+# can be left at WARNING with no handlers. Configure it before importing routers
+# so query ranking logs from app.api.routers.candidates appear in docker logs.
+_ts_fmt = logging.Formatter(
+    fmt="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+if not logging.root.handlers:
+    _ts_handler = logging.StreamHandler(sys.stdout)
+    _ts_handler.setFormatter(_ts_fmt)
+    logging.root.addHandler(_ts_handler)
+
+_root_level_name = os.getenv("QUERY_SERVICE_LOG_LEVEL", os.getenv("LOG_LEVEL", "INFO")).upper()
+if _root_level_name not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+    _root_level_name = "INFO"
+logging.root.setLevel(getattr(logging, _root_level_name))
+# ──────────────────────────────────────────────────────────────────────────────
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
