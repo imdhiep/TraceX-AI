@@ -16,6 +16,8 @@ import math
 import os
 import time
 import uuid
+
+import numpy as np
 from collections import defaultdict
 from datetime import datetime
 from typing import Any
@@ -390,13 +392,25 @@ def _local_prefilter(
 # ── Identity merge: cosine similarity + temporal/camera guards + union-find ───
 
 _MERGE_THRESHOLD = float(os.getenv("QUERY_MERGE_THRESHOLD", "0.98"))
-# SigLIP2 image embeddings of arbitrary person crops cluster very tightly
+# SigLIP image embeddings of arbitrary person crops cluster very tightly
 # (cosine 0.85–1.0 across different people), so the 0.85 used at ingest's
 # fragment-merge stage (where temporal/spatial guards do the heavy lifting)
 # collapses entire query shortlists into one candidate at search time.
 # Cross-camera identity merge needs a much stricter floor — 0.97 keeps the
 # same-person bridges while breaking the noisy "everyone looks like everyone"
 # edges. Tunable via QUERY_MERGE_THRESHOLD env without redeploy.
+
+# Component-level guard for the union-find pass. Plain pair-wise union-find is
+# transitive: A↔B 0.99, B↔C 0.99 chains C into A's group even when A↔C is
+# only 0.97. With SigLIP person crops sitting in a narrow band, that chain
+# pulls in increasingly different people one hop at a time. Before unioning
+# two components we require:
+#   - mean cross-cosine ≥ _MERGE_THRESHOLD     (cluster is genuinely tight)
+#   - min cross-cosine  ≥ _MERGE_COMPONENT_FLOOR  (no weak bridge)
+# The floor is _MERGE_THRESHOLD - _MERGE_COMPONENT_MARGIN so a single
+# slightly-worse pair doesn't sink an otherwise solid merge.
+_MERGE_COMPONENT_MARGIN = float(os.getenv("QUERY_MERGE_COMPONENT_MARGIN", "0.01"))
+_MERGE_COMPONENT_FLOOR = max(0.0, _MERGE_THRESHOLD - _MERGE_COMPONENT_MARGIN)
 _MERGE_MAX_GAP_S = 86400.0   # max 24-hour gap — matches trace window
 _CONF_THRESHOLD = 0.70        # fallback: below this = uncertain → don't block merge
 
@@ -614,16 +628,25 @@ def _can_merge(t1: Tracklet, t2: Tracklet) -> bool:
 
 
 def _merge_by_similarity(ranked_tracklets: list[Tracklet]) -> list[list[Tracklet]]:
-    """Group tracklets by embedding cosine similarity using union-find.
+    """Group tracklets by embedding cosine similarity using union-find with
+    a component-level guard.
 
-    Returns groups ordered by best rank (lowest index in ranked_tracklets = highest score).
-    The first element of each group is the representative (highest-ranked tracklet).
-    Tracklets with no embedding are kept as singleton groups.
+    Returns groups ordered by best rank (lowest index in ranked_tracklets =
+    highest score). The first element of each group is the representative
+    (highest-ranked tracklet). Tracklets with no embedding are kept as
+    singleton groups.
+
+    The component guard mirrors TrackletFragmentMerger's logic at ingest:
+    a candidate pair (i, j) only merges if EVERY cross-pair between the two
+    components they'd join clears _MERGE_COMPONENT_FLOOR and the cross-mean
+    clears _MERGE_THRESHOLD. This prevents the union-find chain effect that
+    pulls in increasingly different people through one-hop edges.
     """
     n = len(ranked_tracklets)
     if n == 0:
         return []
     parent = list(range(n))
+    members: dict[int, list[int]] = {i: [i] for i in range(n)}
 
     def find(i: int) -> int:
         while parent[i] != i:
@@ -633,19 +656,64 @@ def _merge_by_similarity(ranked_tracklets: list[Tracklet]) -> list[list[Tracklet
 
     embs = [_tracklet_embedding(t) for t in ranked_tracklets]
 
+    # Build a unit-normalized matrix so cosine is a single dot product.
+    # Rows for tracklets without an embedding are zero — they'll never be
+    # eligible to merge (sim with anything is 0).
+    emb_dim = next((len(e) for e in embs if e), 0)
+    if emb_dim == 0:
+        # No usable embeddings at all → every tracklet is its own group.
+        return [[t] for t in ranked_tracklets]
+
+    emb_matrix = np.zeros((n, emb_dim), dtype=np.float32)
+    for idx, e in enumerate(embs):
+        if e and len(e) == emb_dim:
+            v = np.asarray(e, dtype=np.float32)
+            norm = float(np.linalg.norm(v))
+            if norm > 1e-9:
+                emb_matrix[idx] = v / norm
+    sim = emb_matrix @ emb_matrix.T  # [n, n] cosine matrix
+
+    def cross_clears_component_guard(root_a: int, root_b: int) -> bool:
+        a_idx = np.fromiter(members[root_a], dtype=np.int64)
+        b_idx = np.fromiter(members[root_b], dtype=np.int64)
+        cross = sim[np.ix_(a_idx, b_idx)]
+        if cross.size == 0:
+            return False
+        return (
+            float(cross.mean()) >= _MERGE_THRESHOLD
+            and float(cross.min())  >= _MERGE_COMPONENT_FLOOR
+        )
+
+    # Candidate edges first — only the ones that already pass the pair-wise
+    # threshold are worth considering. Sorting by descending sim makes the
+    # union-find pick the tightest bridges first, which keeps the
+    # component-mean stable as the cluster grows.
+    candidate_edges: list[tuple[float, int, int]] = []
     for i in range(n):
         if not embs[i]:
             continue
         for j in range(i + 1, n):
-            if find(i) == find(j) or not embs[j]:
+            if not embs[j]:
                 continue
-            if _cosine_sim(embs[i], embs[j]) < _MERGE_THRESHOLD:
+            s = float(sim[i, j])
+            if s < _MERGE_THRESHOLD:
                 continue
-            if not _can_merge(ranked_tracklets[i], ranked_tracklets[j]):
-                continue
-            pi, pj = find(i), find(j)
-            if pi != pj:
-                parent[pi] = pj
+            candidate_edges.append((s, i, j))
+    candidate_edges.sort(reverse=True)
+
+    for _, i, j in candidate_edges:
+        pi, pj = find(i), find(j)
+        if pi == pj:
+            continue
+        if not _can_merge(ranked_tracklets[i], ranked_tracklets[j]):
+            continue
+        if not cross_clears_component_guard(pi, pj):
+            continue
+        # Keep the earliest-rank member as the root for stable output order.
+        if min(members[pj]) < min(members[pi]):
+            pi, pj = pj, pi
+        parent[pj] = pi
+        members[pi].extend(members.pop(pj))
 
     root_to_idxs: dict[int, list[int]] = defaultdict(list)
     for i in range(n):
