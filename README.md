@@ -8,6 +8,16 @@ TraceX-AI hiện được tổ chức theo hướng **frontend tách riêng kh�
 - **LightningAI** chạy toàn bộ backend: PostgreSQL, metadata-service, query-service và trace-service.
 - Video và artefact xử lý được lưu trong `/workspace/storage` hoặc Google Drive, còn database chỉ lưu metadata, tracklet, embedding, lịch sử query, candidate và evidence.
 
+## Liên kết nhanh
+
+| Tài liệu | Mục đích |
+| -------- | -------- |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Kiến trúc hệ thống, luồng dữ liệu, service responsibilities |
+| [DEPLOY.md](DEPLOY.md) | Hướng dẫn deploy frontend trên VPS và backend trên LightningAI |
+| [WORKLOG.md](WORKLOG.md) | Phân công sprint, task và quyết định kỹ thuật |
+| [JOURNAL.md](JOURNAL.md) | Nhật ký phát triển theo tuần |
+| [docs/RULES_USER_ACCOUNT.md](docs/RULES_USER_ACCOUNT.md) | Quy tắc tài khoản và phân quyền người dùng |
+
 ---
 
 ## Mục lục
@@ -20,12 +30,13 @@ TraceX-AI hiện được tổ chức theo hướng **frontend tách riêng kh�
 6. [AI pipeline](#ai-pipeline)
 7. [Database](#database)
 8. [API chính](#api-chính)
-9. [Cài đặt và chạy](#cài-đặt-và-chạy)
-10. [Deploy](#deploy)
-11. [Biến môi trường quan trọng](#biến-môi-trường-quan-trọng)
-12. [Troubleshooting](#troubleshooting)
-13. [Ghi chú bảo mật](#ghi-chú-bảo-mật)
-14. [Thành viên](#thành-viên)
+9. [Hướng dẫn sử dụng sản phẩm](#hướng-dẫn-sử-dụng-sản-phẩm)
+10. [Cài đặt và chạy](#cài-đặt-và-chạy)
+11. [Deploy](#deploy)
+12. [Biến môi trường quan trọng](#biến-môi-trường-quan-trọng)
+13. [Troubleshooting](#troubleshooting)
+14. [Ghi chú bảo mật](#ghi-chú-bảo-mật)
+15. [Thành viên](#thành-viên)
 
 ---
 
@@ -307,6 +318,19 @@ curl http://localhost:8002/health
 curl http://localhost:8003/health
 curl http://localhost:8004/health
 ```
+
+---
+
+## Hướng dẫn sử dụng sản phẩm
+
+Trong sản phẩm đã có video hướng dẫn tại trang **Hướng dẫn**. Sau khi đăng nhập, người dùng có thể mở mục **Hướng dẫn** trên sidebar để xem cách thao tác các luồng chính:
+
+- tìm kiếm bằng mô tả hoặc ảnh;
+- lọc theo camera và thời gian;
+- xem candidate và toàn bộ tracklet;
+- chọn candidate để trace;
+- xem evidence video/timeline;
+- xem lại lịch sử query và candidate.
 
 ---
 
