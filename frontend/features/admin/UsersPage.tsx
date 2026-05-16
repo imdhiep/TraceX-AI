@@ -213,7 +213,9 @@ export function UsersPage() {
       <section className={PANEL_CLASS}>
         {loading ? <p className="text-sm text-slate-500 dark:text-slate-400">Đang tải users...</p> : null}
         <div className="space-y-2">
-          {items.map((user) => {
+          {items
+            .filter((user) => (ROLE_RANK[user.role] ?? 1) < currentUserRank && user.id !== currentUserId)
+            .map((user) => {
             const isSelf = user.id === currentUserId;
             const targetRank = ROLE_RANK[user.role] ?? 1;
             const canManageTarget = targetRank < currentUserRank;
