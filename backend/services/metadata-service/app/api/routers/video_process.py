@@ -107,7 +107,7 @@ VLM_BATCH_MAX_NEW_TOKENS_PER_CROP = _get_positive_env_int(
 # tăng (kỳ vọng 30-50%), nhưng độ tinh khiết group tăng đáng kể.
 # Component margin 0.03 → 0.05 → floor = 0.85 (cùng giá trị threshold cũ),
 # vẫn cho phép expand group qua các fragment trung gian.
-FRAGMENT_MERGE_SIM_THRESHOLD = _get_env_float("FRAGMENT_MERGE_SIM_THRESHOLD", 0.88)
+FRAGMENT_MERGE_SIM_THRESHOLD = _get_env_float("FRAGMENT_MERGE_SIM_THRESHOLD", 0.89)
 FRAGMENT_MERGE_MAX_GAP_SECONDS = _get_env_float("FRAGMENT_MERGE_MAX_GAP_SECONDS", 180.0)
 FRAGMENT_MERGE_COMPONENT_MARGIN = _get_env_float("FRAGMENT_MERGE_COMPONENT_MARGIN", 0.02)
 FRAGMENT_MERGE_MAX_SPEED_PX_PER_S = _get_env_float("FRAGMENT_MERGE_MAX_SPEED_PX_PER_S", 800.0)
@@ -2304,10 +2304,9 @@ def _process_video_sync(
     total_raw = 0
     total_low_quality = 0
     for sf_idx, sf in enumerate(sampled_frames):
-        items = per_frame.get(sf_idx)
-        if not items:
-            continue
-        items.sort(key=lambda x: x[0])  # restore original detection order
+        items = per_frame.get(sf_idx) or []
+        if items:
+            items.sort(key=lambda x: x[0])  # restore original detection order
         frame_dets: list[FrameDetection] = []
         for _d_idx, bbox, crop, crop_lap, low_q, score in items:
             if low_q:
@@ -2331,11 +2330,11 @@ def _process_video_sync(
                        video_id, total_low_quality, total_raw,
                        100.0 * total_low_quality / total_raw)
 
-    logger.warning("[pipeline] %s: %d detections across %d frames", video_id, total_raw, len(detections_by_frame))
+    logger.warning("[pipeline] %s: %d detections across %d sampled frames", video_id, total_raw, len(detections_by_frame))
 
     import torch as _torch
 
-    if not detections_by_frame:
+    if total_raw == 0:
         logger.warning("[pipeline] %s: no persons detected", video_id)
         return ProcessVideoResponse(
             video_id=video_id, camera_id=camera_id,
@@ -2369,8 +2368,14 @@ def _process_video_sync(
         max_foot_distance=150.0 * _fps_ratio_4,
         max_predicted_distance=180.0 * _fps_ratio_4,
         max_center_jump_ratio=2.0 * _fps_ratio_4,
-        # IoU expectation grows with FPS (adjacent frames more similar)
-        min_active_iou_short_gap=min(0.05 * _fps_ratio_4, 0.20),
+        # Fix A: remove the short-gap IoU floor. At 3 FPS, post-scale floor
+        # was 0.0667; fast walkers can legitimately have IoU=0 between adjacent
+        # frames, while G2 margin + center-jump still block obvious handoffs.
+        min_active_iou_short_gap=0.0,
+        # B: one-frame phantom Kalman extension reduces low-FPS track fractures;
+        # cam_0002 bench favored max=1 (purity +0.0099, IDsw -30%), while
+        # max>=2 drifted and hurt purity.
+        max_phantom_frames=1,
         # Buffer counts scaled to ~5s short / ~75s long at any FPS
         track_buffer=max(int(round(20 * _fps_ratio_self)), 8),
         max_buffer_frames=max(int(round(300 * _fps_ratio_self)), 100),

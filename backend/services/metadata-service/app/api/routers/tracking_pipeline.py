@@ -454,15 +454,19 @@ class BodyPartAdaptiveTracker:
         min_track_frames: int = 2,
         min_track_density: float = 0.05,
         min_buffer_iou: float = 0.30,
-        # P1.5 — hard gates for active matching. Relaxed IoU floor 0.10 → 0.05
-        # because at 4 fps a fast walker can shift enough between frames to
-        # drop bbox IoU below 0.10 legitimately (G4 catches the actual handoff
-        # cases). Center-jump and low-conf strict cost kept unchanged — those
-        # catch failure modes G4 cannot (same-frame handoff, low-conf FP).
-        min_active_iou_short_gap: float = 0.05,   # detection same/adjacent frame must IoU≥this
+        # Fix A — do not require short-gap IoU. At 3 FPS a fast walker can have
+        # IoU=0 between adjacent sampled frames; G2 margin + center-jump guard
+        # are the handoff protection, so the IoU floor only fractures tracks.
+        min_active_iou_short_gap: float = 0.00,
         short_gap_frames: int = 2,                # what "short gap" means in frames
         max_lowconf_match_cost: float = 0.50,     # low-conf rescue gets stricter cost cap
         max_center_jump_ratio: float = 2.0,       # bbox-center jump > N × bbox_h flags handoff
+        # B — bounded phantom extension. When a live track misses a detection,
+        # keep a shadow Kalman state for a tiny gap (default: exactly 1 sampled
+        # frame) without adding synthetic observations to the tracklet.
+        # Bench cam_0002: max=1 improved purity by ~0.0099 and reduced IDsw
+        # ~30%; max>=2 drifted away from the true position and hurt purity.
+        max_phantom_frames: int = 1,
         # P3 — Kalman filter for live prediction during matching.
         # DISABLED by default: benchmark on camera_0002 showed the live KF
         # actually HURT purity (67.5% → 72.9% but with 9× cost), while G4
@@ -511,6 +515,7 @@ class BodyPartAdaptiveTracker:
         self.short_gap_frames = short_gap_frames
         self.max_lowconf_match_cost = max_lowconf_match_cost
         self.max_center_jump_ratio = max_center_jump_ratio
+        self.max_phantom_frames = max(0, int(max_phantom_frames))
         self.use_kalman = use_kalman
         self.kalman_gate_chi2 = kalman_gate_chi2
         self.split_post_hoc = split_post_hoc
@@ -528,6 +533,11 @@ class BodyPartAdaptiveTracker:
         # P3: Kalman filter per active track. Reset on track expiry; tracks
         # moved to buffer drop their KF (re-seeded on reactivation).
         self.kf: dict[str, _PersonKalman] = {}
+        # B: Shadow Kalman state for one-frame phantom extension. These do not
+        # create observations and do not mutate active_last_bbox.
+        self._phantom_kf: dict[str, _PersonKalman] = {}
+        self._phantom_streak: dict[str, int] = {}
+        self._real_last_frame: dict[str, int] = {}
         self.next_id = 1
 
     def _hbox(self, bbox: tuple) -> tuple:
@@ -540,10 +550,23 @@ class BodyPartAdaptiveTracker:
         Predicted_center comes from the Kalman filter if available, else falls
         back to a 2-frame linear velocity.
         """
-        hbox = self._hbox(last_bbox)
+        state_bbox = last_bbox
+        phantom_active = False
+        if tid is not None:
+            streak = self._phantom_streak.get(tid, 0)
+            pkf = self._phantom_kf.get(tid)
+            if pkf is not None and 0 < streak <= self.max_phantom_frames:
+                steps = max(target_fk - self.active_last_frame.get(tid, target_fk), 0)
+                state_bbox = pkf.predicted_bbox(n_steps=steps)
+                phantom_active = True
+
+        hbox = self._hbox(state_bbox)
         hc   = _center(hbox)
-        fc   = _foot_point(last_bbox)
-        hv   = _head_visible(last_bbox, self.min_head_aspect, self.min_head_height)
+        fc   = _foot_point(state_bbox)
+        hv   = _head_visible(state_bbox, self.min_head_aspect, self.min_head_height)
+
+        if phantom_active:
+            return hbox, hc, hc, state_bbox, fc, hv
 
         # P3 Kalman branch
         if self.use_kalman and tid is not None and tid in self.kf:
@@ -554,10 +577,10 @@ class BodyPartAdaptiveTracker:
             # predicted bbox the same way an observed bbox would.
             pred_hbox = self._hbox(pred_bbox)
             pred = _center(pred_hbox)
-            return hbox, hc, pred, last_bbox, fc, hv
+            return hbox, hc, pred, state_bbox, fc, hv
 
         if len(obs) < 2:
-            return hbox, hc, hc, last_bbox, fc, hv
+            return hbox, hc, hc, state_bbox, fc, hv
 
         prev_hbox = self._hbox(obs[-2].bbox)
         pc = _center(prev_hbox)
@@ -566,7 +589,42 @@ class BodyPartAdaptiveTracker:
         vy = (hc[1] - pc[1]) / delta
         steps = min(max(target_fk - obs[-1].frame_index, 0), self.track_buffer * 2)
         pred = (hc[0] + vx * steps, hc[1] + vy * steps)
-        return hbox, hc, pred, last_bbox, fc, hv
+        return hbox, hc, pred, state_bbox, fc, hv
+
+    def _mark_real_detection(self, tid: str, bbox: tuple, fk: int, *, seed_phantom: bool = False) -> None:
+        """Record a real detection and refresh the bounded phantom state."""
+        if seed_phantom or tid not in self._phantom_kf:
+            self._phantom_kf[tid] = _PersonKalman(bbox)
+        else:
+            pkf = self._phantom_kf[tid]
+            last_state_frame = self.active_last_frame.get(tid, self._real_last_frame.get(tid, fk))
+            steps = max(fk - last_state_frame, 0)
+            if steps > 0:
+                pkf.predict(n_steps=steps)
+            pkf.update(bbox)
+        self._phantom_streak[tid] = 0
+        self._real_last_frame[tid] = fk
+
+    def _phantom_extend_unmatched(self, track_ids: set[str], fk: int) -> None:
+        """Advance unmatched active tracks without writing fake observations."""
+        if self.max_phantom_frames <= 0:
+            return
+        for tid in track_ids:
+            if tid not in self.active:
+                continue
+            streak = self._phantom_streak.get(tid, 0) + 1
+            self._phantom_streak[tid] = streak
+            if streak > self.max_phantom_frames:
+                continue
+            pkf = self._phantom_kf.get(tid)
+            if pkf is None:
+                pkf = _PersonKalman(self.active_last_bbox[tid])
+                self._phantom_kf[tid] = pkf
+            last_state_frame = self.active_last_frame.get(tid, self._real_last_frame.get(tid, fk))
+            steps = max(fk - last_state_frame, 0)
+            if steps > 0:
+                pkf.predict(n_steps=steps)
+            self.active_last_frame[tid] = fk
 
     def _build_cost_matrix(
         self,
@@ -888,14 +946,20 @@ class BodyPartAdaptiveTracker:
             dets = list(detections_by_frame.get(fk) or [])
             ts   = dets[0].timestamp_second if dets else 0.0
 
-            # Move stale active → buffer
+            # Move stale active → buffer. real_last_frame is the last frame
+            # with a true detector observation; active_last_frame may include a
+            # bounded phantom bump and must not keep a dead track alive forever.
             stale = [tid for tid in self.active
-                     if fk - self.active_last_frame.get(tid, fk) > self.track_buffer]
+                     if fk - self._real_last_frame.get(tid, self.active_last_frame.get(tid, fk))
+                     > self.track_buffer + self.max_phantom_frames]
             for tid in stale:
                 self.buffer[tid] = self.active.pop(tid)
                 self.buffer_last_bbox[tid] = self.active_last_bbox.pop(tid)
                 self.buffer_entry_frame[tid] = fk
                 self.active_last_frame.pop(tid, None)
+                self._real_last_frame.pop(tid, None)
+                self._phantom_streak.pop(tid, None)
+                self._phantom_kf.pop(tid, None)
                 # P3: drop Kalman filter when track goes to buffer. Re-seeded
                 # on reactivation — the long gap means the old velocity is
                 # stale and could mislead matching.
@@ -910,7 +974,9 @@ class BodyPartAdaptiveTracker:
                 self.buffer_last_bbox.pop(tid, None)
                 self.buffer_entry_frame.pop(tid, None)
 
+            matched_this_frame: set[str] = set()
             if not dets:
+                self._phantom_extend_unmatched(set(self.active.keys()), fk)
                 continue
 
             high = [d for d in dets if d.confidence >= self.track_thresh]
@@ -934,7 +1000,7 @@ class BodyPartAdaptiveTracker:
             }
             # Per-track frame gap → used by P1 hard gates in _build_cost_matrix
             gap_by_tid = {
-                tid: max(fk - self.active_last_frame.get(tid, fk), 0)
+                tid: max(fk - self._real_last_frame.get(tid, self.active_last_frame.get(tid, fk)), 0)
                 for tid in active_unmatched
             }
             unmatched_high: list[FrameDetection] = []
@@ -947,6 +1013,8 @@ class BodyPartAdaptiveTracker:
                     if m:
                         tid, _ = m
                         self.active[tid].append(self._make_obs(det, ts))
+                        self._mark_real_detection(tid, det.bbox, fk)
+                        matched_this_frame.add(tid)
                         self.active_last_bbox[tid] = det.bbox
                         self.active_last_frame[tid] = fk
                         active_unmatched.discard(tid)
@@ -973,6 +1041,8 @@ class BodyPartAdaptiveTracker:
                     if m:
                         tid, _ = m
                         self.active[tid].append(self._make_obs(det, ts))
+                        self._mark_real_detection(tid, det.bbox, fk)
+                        matched_this_frame.add(tid)
                         self.active_last_bbox[tid] = det.bbox
                         self.active_last_frame[tid] = fk
                         active_unmatched.discard(tid)
@@ -1027,6 +1097,8 @@ class BodyPartAdaptiveTracker:
                     self.buffer_entry_frame.pop(tid, None)
                     obs.append(self._make_obs(det, ts))
                     self.active[tid] = obs
+                    self._mark_real_detection(tid, det.bbox, fk, seed_phantom=True)
+                    matched_this_frame.add(tid)
                     self.active_last_bbox[tid] = det.bbox
                     self.active_last_frame[tid] = fk
                     if self.use_kalman:
@@ -1040,16 +1112,21 @@ class BodyPartAdaptiveTracker:
                     tid = str(self.next_id)
                     self.next_id += 1
                     self.active[tid] = [self._make_obs(det, ts)]
+                    self._mark_real_detection(tid, det.bbox, fk, seed_phantom=True)
+                    matched_this_frame.add(tid)
                     self.active_last_bbox[tid] = det.bbox
                     self.active_last_frame[tid] = fk
                     if self.use_kalman:
                         self.kf[tid] = _PersonKalman(det.bbox)
+
+            self._phantom_extend_unmatched(set(self.active.keys()) - matched_this_frame, fk)
 
         # Finalize all remaining tracks
         for tid, obs in list(self.active.items()) + list(self.buffer.items()):
             self._finalize_track(video_id, camera_id, tid, list(obs), completed)
         self._reset()
         return tuple(completed)
+
 
 
 # Backward-compatible alias — existing code importing HeadBoxTracker still works.
