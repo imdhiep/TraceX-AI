@@ -56,7 +56,7 @@ def admin_list_users(
     _admin: User = Depends(require_admin),
 ) -> dict:
     try:
-        items = list_users(session)
+        items = list_users(session, actor=_admin)
         return {"count": len(items), "items": items}
     finally:
         session.close()
