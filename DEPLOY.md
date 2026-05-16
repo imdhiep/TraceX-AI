@@ -39,13 +39,21 @@ Browser
 
 ```bash
 # Trên terminal LightningAI
-mkdir -p /workspace/storage/videos
-mkdir -p /workspace/storage/traces
-mkdir -p /workspace/storage/queue
-mkdir -p /workspace/storage/candidate-previews
-mkdir -p /workspace/storage/cache
-mkdir -p /workspace/models/huggingface
-mkdir -p /workspace/models/torch
+cd /home/zeus/content/TraceX-AI
+
+# Các path dưới đây là host bind mount được docker-compose.lightningai.yml dùng.
+mkdir -p storage/pgdata
+mkdir -p storage/videos
+mkdir -p storage/traces
+mkdir -p storage/queue
+mkdir -p storage/candidate-previews
+mkdir -p storage/cache
+mkdir -p storage/model-weights
+mkdir -p secrets
+
+# Cache model dùng trực tiếp từ home của LightningAI.
+mkdir -p /home/zeus/.cache/huggingface
+mkdir -p /home/zeus/.cache/torch
 ```
 
 ### 1.2 Tạo .env.lightningai
@@ -114,7 +122,7 @@ curl http://localhost:8004/health
 curl https://8002-YOUR-WORKSPACE-ID.cloudspaces.litng.ai/health
 ```
 
-Kết quả mong đợi: HTTP 200, `{"status": "ok", ...}`
+Kết quả mong đợi: HTTP 200, `{"status": "healthy", ...}`
 
 ### 1.7 Test kết nối database
 
@@ -130,8 +138,11 @@ docker exec -it tracex-postgres psql -U mcpt_user -d mcpt
 ### 1.8 Ghi lại URL public
 
 ```bash
-# URL này sẽ dùng cho NEXT_PUBLIC_API_BASE_URL trên VPS
-echo "https://8002-$(hostname).cloudspaces.litng.ai/api/v1"
+# URL này sẽ dùng cho NEXT_PUBLIC_API_BASE_URL trên VPS.
+# Lấy URL public của port 8002 trong LightningAI UI, rồi thêm /api/v1.
+# Ví dụ:
+LIGHTNINGAI_API_URL="https://8002-YOUR-WORKSPACE-ID.cloudspaces.litng.ai/api/v1"
+echo "$LIGHTNINGAI_API_URL"
 ```
 
 ---
@@ -155,10 +166,10 @@ NEXT_PUBLIC_API_BASE_URL=https://8002-YOUR-WORKSPACE-ID.cloudspaces.litng.ai/api
 
 ```bash
 # Build (Next.js bake URL vào bundle tại bước này)
-docker compose build frontend
+docker compose --env-file .env build frontend
 
 # Chạy
-docker compose up -d
+docker compose --env-file .env up -d frontend
 ```
 
 ### 2.3 Kiểm tra
@@ -175,7 +186,7 @@ curl http://localhost:3000
 1. Mở `https://tracex-ai.smartnovi.tech` trong trình duyệt
 2. Đăng nhập bằng `BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD`
 3. Dashboard load thành công
-4. Kiểm tra Network tab trong DevTools — API calls đến `8002-XXXX.cloudspaces.litng.ai` trả về 200
+4. Kiểm tra Network tab trong DevTools — browser gọi same-origin `/api-gw/...`; Next.js proxy sang `8002-XXXX.cloudspaces.litng.ai`
 
 ```bash
 # Test login API trực tiếp
@@ -210,7 +221,8 @@ docker compose -f docker-compose.lightningai.yml --env-file .env.lightningai up 
 **Frontend (VPS) — bắt buộc rebuild:**
 ```bash
 git pull
-docker compose build frontend && docker compose up -d frontend
+docker compose --env-file .env build frontend
+docker compose --env-file .env up -d frontend
 ```
 
 ### Khi LightningAI URL thay đổi
@@ -225,7 +237,8 @@ NEW_URL="https://8002-NEW-ID.cloudspaces.litng.ai/api/v1"
 sed -i "s|NEXT_PUBLIC_API_BASE_URL=.*|NEXT_PUBLIC_API_BASE_URL=$NEW_URL|" .env
 
 # 3. Rebuild frontend (bắt buộc — URL được baked vào JS bundle)
-docker compose build frontend && docker compose up -d frontend
+docker compose --env-file .env build frontend
+docker compose --env-file .env up -d frontend
 ```
 
 ### Dừng toàn bộ
