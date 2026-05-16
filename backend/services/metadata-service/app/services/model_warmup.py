@@ -6,11 +6,11 @@ VRAM budget (metadata-service, A100 80GB):
   - DINOv2 ViT-L/14 (appearance embedding, 1024-dim):  ~5GB fp16
   - SigLIP 2-So400m (image encoder for text search):   ~3GB fp16
   - VideoMAE V2 (action recognition):                  ~3GB fp16
-  - Qwen2-VL-7B-Instruct (open-vocabulary metadata):  ~14GB fp16
+  - Qwen2.5-VL-7B-Instruct (open-vocabulary metadata): ~14GB fp16
   Runtime overhead (KV cache, activations):            ~3GB
   Total metadata-service:                              ~31GB / 80GB
 
-Pre-download models: python scripts/download_models.py --models qwen2vl siglip2 videomae
+Pre-download models: python scripts/download_models.py --models qwen25vl siglip2 videomae
 
 Forbidden: YOLO (any version), ByteTrack, Grounding DINO (replaced by RT-DETR).
 """
@@ -29,7 +29,7 @@ _warmup_done = False
 _warmup_error: Optional[str] = None
 
 _MODELS: dict[str, Any] = {}
-DEFAULT_QWEN2VL_MODEL_ID = "Qwen/Qwen2-VL-7B-Instruct"
+DEFAULT_QWEN25VL_MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 
 def get_model(name: str) -> Optional[Any]:
@@ -74,7 +74,7 @@ async def warmup_models() -> None:
     _load_dinov2(device)
     _load_siglip2(device)
     _load_videomae_v2(device)
-    _load_qwen2vl(device)
+    _load_qwen25vl(device)
 
     _warmup_done = True
     if device.type == "cuda":
@@ -253,23 +253,23 @@ def _load_videomae_v2(device: torch.device) -> None:
         logger.warning("VideoMAE V2 load failed (non-fatal): %s", exc)
 
 
-def _load_qwen2vl(device: torch.device) -> None:
-    """Load Qwen2-VL-7B-Instruct for open-vocabulary appearance captioning.
+def _load_qwen25vl(device: torch.device) -> None:
+    """Load Qwen2.5-VL-7B-Instruct for open-vocabulary appearance captioning.
 
-    Loads from /workspace/models/weights/qwen2vl/ if pre-downloaded
-    (host: ./storage/model-weights/qwen2vl/), otherwise downloads from HuggingFace.
-    QWEN2VL_MODEL_ID overrides both the local path and default HuggingFace repo.
-    Pre-download with: python scripts/download_models.py --models qwen2vl
+    Loads from /workspace/models/weights/qwen2_5_vl/ if pre-downloaded
+    (host: ./storage/model-weights/qwen2_5_vl/), otherwise downloads from HuggingFace.
+    QWEN25VL_MODEL_ID overrides both the local path and default HuggingFace repo.
+    Pre-download with: python scripts/download_models.py --models qwen25vl
     """
-    logger.info("Loading Qwen2-VL-7B-Instruct...")
+    logger.info("Loading Qwen2.5-VL-7B-Instruct...")
     try:
-        from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+        from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
         from pathlib import Path
         import numpy as np
         from PIL import Image
 
-        local = Path("/workspace/models/weights/qwen2vl")
-        env_override = os.getenv("QWEN2VL_MODEL_ID", "").strip()
+        local = Path("/workspace/models/weights/qwen2_5_vl")
+        env_override = os.getenv("QWEN25VL_MODEL_ID", "").strip()
         local_available = local.exists() and any(local.iterdir())
         if env_override:
             model_id = env_override
@@ -278,12 +278,12 @@ def _load_qwen2vl(device: torch.device) -> None:
             model_id = str(local)
             source = "local"
         else:
-            model_id = DEFAULT_QWEN2VL_MODEL_ID
+            model_id = DEFAULT_QWEN25VL_MODEL_ID
             source = "HuggingFace"
-        logger.info("  Qwen2-VL source: %s (%s)", model_id, source)
+        logger.info("  Qwen2.5-VL source: %s (%s)", model_id, source)
 
         processor = AutoProcessor.from_pretrained(model_id)
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_id, torch_dtype=torch.float16, device_map="auto"
         )
         model.eval()
@@ -298,12 +298,12 @@ def _load_qwen2vl(device: torch.device) -> None:
         with torch.no_grad():
             _ = model.generate(**inputs, max_new_tokens=16)
 
-        _MODELS["qwen2vl"] = model
-        _MODELS["qwen2vl_processor"] = processor
-        logger.info("  Qwen2-VL-7B-Instruct loaded OK (%s, model: %s)", source, model_id)
+        _MODELS["qwen25vl"] = model
+        _MODELS["qwen25vl_processor"] = processor
+        logger.info("  Qwen2.5-VL-7B-Instruct loaded OK (%s, model: %s)", source, model_id)
 
     except Exception as exc:
-        logger.warning("Qwen2-VL-7B-Instruct load failed (non-fatal): %s", exc)
+        logger.warning("Qwen2.5-VL-7B-Instruct load failed (non-fatal): %s", exc)
 
 
 def is_warmup_done() -> bool:

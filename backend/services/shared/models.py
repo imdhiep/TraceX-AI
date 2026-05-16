@@ -272,13 +272,13 @@ class Tracklet(Base):
     # Quality
     quality_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
 
-    # ── Demographic (Qwen2-VL) ──────────────────────────────────────────
+    # ── Demographic (Qwen2.5-VL) ──────────────────────────────────────────
     gender:         Mapped[str]           = mapped_column(String(32), nullable=False, default="unknown")
     gender_conf:    Mapped[float | None]  = mapped_column(Float, nullable=True)
     age_range:      Mapped[str]           = mapped_column(String(32), nullable=False, default="unknown")
     age_range_conf: Mapped[float | None]  = mapped_column(Float, nullable=True)
 
-    # ── Upper clothing (Qwen2-VL) ───────────────────────────────────────
+    # ── Upper clothing (Qwen2.5-VL) ───────────────────────────────────────
     upper_color:     Mapped[str | None]    = mapped_column(String(64),  nullable=True)
     upper_type:      Mapped[str | None]    = mapped_column(String(128), nullable=True)
     upper_desc:      Mapped[str | None]    = mapped_column(Text,        nullable=True)

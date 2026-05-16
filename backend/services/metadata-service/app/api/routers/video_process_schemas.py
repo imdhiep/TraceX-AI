@@ -55,7 +55,7 @@ class BatchProcessRequest(BaseModel):
       1. Load frames + detect persons in each video independently
       2. Project all detections to BEV
       3. MCBLT Hungarian cross-camera association (ONE call across all cameras)
-      4. DINOv2 Re-ID embeddings + Qwen2-VL metadata + VideoMAE V2 actions
+      4. DINOv2 Re-ID embeddings + Qwen2.5-VL metadata + VideoMAE V2 actions
          per unified cross-camera tracklet (SigLIP2 image encoder for text-image search)
       5. Return unified tracklets (global tracklet IDs across cameras)
 
@@ -76,7 +76,7 @@ class BatchProcessRequest(BaseModel):
 
 class TrackletResult(BaseModel):
     """One tracklet — schema mirrors the refactored DB. All confidence values
-    are derived from Qwen2-VL token logprobs (geometric mean of P(token | ctx))."""
+    are derived from Qwen2.5-VL token logprobs (geometric mean of P(token | ctx))."""
     tracklet_id: str
     video_id: str
     camera_id: str

@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir torch==2.4.0 torchvision==0.19.0 --index-url http
 # Copy requirements first for better Docker caching
 COPY backend/services/metadata-service/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir "transformers>=4.44.0,<4.47" accelerate timm sentencepiece safetensors huggingface-hub uvicorn[standard]==0.32.1
+RUN pip install --no-cache-dir "transformers>=4.49.0,<5.0.0" accelerate timm sentencepiece safetensors huggingface-hub uvicorn[standard]==0.32.1
 
 # Copy application code
 COPY backend/services/shared ./shared

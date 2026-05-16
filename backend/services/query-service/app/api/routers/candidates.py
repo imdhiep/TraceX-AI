@@ -462,7 +462,7 @@ _CONF_THRESHOLD = 0.70        # fallback: below this = uncertain → don't block
 
 # Per-attribute confidence thresholds: both sides must exceed to block merge.
 # These are calibrated for LOGIT-DERIVED confidences (geometric mean of token
-# probabilities under Qwen2-VL), not self-reported numbers. Logit confs are
+# probabilities under Qwen2.5-VL), not self-reported numbers. Logit confs are
 # generally lower than self-report — categorical short values like "man"/"woman"
 # typically sit around 0.5–0.9; long free-text spans drift lower.
 _CONF_THRESHOLDS: dict[str, float] = {

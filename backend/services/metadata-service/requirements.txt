@@ -20,10 +20,10 @@ av==17.0.1
 python-dotenv==1.0.1
 
 # GPU model dependencies — SOTA 2026
-# transformers 4.41.0+ required for Grounding DINO 1.6
+# transformers 4.49.0+ required for Qwen2.5-VL
 # PyTorch 2.3.1+ required
 # Installed via Dockerfile for CUDA compatibility
-transformers>=4.41.0
+transformers>=4.49.0
 accelerate>=0.30.0
 timm>=1.0.3
 sentencepiece>=0.2.0

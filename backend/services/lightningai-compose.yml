@@ -92,7 +92,7 @@ services:
       - HF_HOME=/workspace/models/huggingface
       - TORCH_HOME=/workspace/models/torch
       - TRANSFORMERS_OFFLINE=1
-      - QWEN2VL_MODEL_ID=${QWEN2VL_MODEL_ID:-}
+      - QWEN25VL_MODEL_ID=${QWEN25VL_MODEL_ID:-}
       - VLM_BATCH_SIZE=${VLM_BATCH_SIZE:-4}
       - VLM_BATCH_MAX_SIZE=${VLM_BATCH_MAX_SIZE:-8}
       - VLM_BATCH_MAX_NEW_TOKENS_PER_CROP=${VLM_BATCH_MAX_NEW_TOKENS_PER_CROP:-512}
