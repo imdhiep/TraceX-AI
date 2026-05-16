@@ -14,6 +14,7 @@ TraceX-AI hiện được tổ chức theo hướng **frontend tách riêng kh�
 | -------- | -------- |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Kiến trúc hệ thống, luồng dữ liệu, service responsibilities |
 | [DEPLOY.md](DEPLOY.md) | Hướng dẫn deploy frontend trên VPS và backend trên LightningAI |
+| [EVALUATION_EVIDENCE.md](EVALUATION_EVIDENCE.md) | Minh chứng đánh giá, benchmark nội bộ, test evidence |
 | [WORKLOG.md](WORKLOG.md) | Phân công sprint, task và quyết định kỹ thuật |
 | [JOURNAL.md](JOURNAL.md) | Nhật ký phát triển theo tuần |
 | [docs/RULES_USER_ACCOUNT.md](docs/RULES_USER_ACCOUNT.md) | Quy tắc tài khoản và phân quyền người dùng |
