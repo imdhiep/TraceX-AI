@@ -7,7 +7,7 @@ Production single-video pipeline (`_process_video_sync`):
   4. TrackletQualityScorer (min_frames, density, duration, Laplacian)
   5. SigLIP 2-So400m (1152-dim) — multi-frame pool-avg per fragment
   6. TrackletFragmentMerger (cosine ≥ 0.85, max_gap ≤ 60 s, Union-Find)
-  7. Qwen2-VL-7B-Instruct open-vocabulary attribute captioning
+  7. Qwen2.5-VL-7B-Instruct open-vocabulary attribute captioning
      (only on MERGED tracklets, batch with OOM-aware backoff)
   8. VideoMAE V2 action classification
      (per-frame bbox crops, Kinetics-400 → TraceX taxonomy)
@@ -1454,13 +1454,13 @@ def _extract_json_object(raw: str) -> dict:
 
 
 def _caption_crop_vlm(crop: "Image.Image") -> dict:
-    """Generate open-vocabulary appearance attributes via Qwen2-VL-7B-Instruct (single crop).
+    """Generate open-vocabulary appearance attributes via Qwen2.5-VL-7B-Instruct (single crop).
 
     Returns attrs with logit-derived confidence fields filled in (None for
     values the model didn't emit / didn't match the JSON pattern).
     """
-    model = get_model("qwen2vl")
-    processor = get_model("qwen2vl_processor")
+    model = get_model("qwen25vl")
+    processor = get_model("qwen25vl_processor")
     if model is None or processor is None:
         return _default_attributes()
 
@@ -1514,15 +1514,15 @@ def _vlm_progress_bar(done: int, total: int, width: int = 25) -> str:
 
 
 def _caption_crops_vlm_batch(crops: list, batch_size: int = VLM_BATCH_SIZE, tag: str = "") -> list:
-    """Adaptive Qwen2-VL captioning with independent per-crop prompts.
+    """Adaptive Qwen2.5-VL captioning with independent per-crop prompts.
 
     Each batch item has its own single-image prompt and its own generated JSON
     object. This keeps GPU batching benefits without asking Qwen to reason over
     multiple people in one long JSON-array prompt, which can mix attributes
     between crops and makes parsing more fragile.
     """
-    model = get_model("qwen2vl")
-    processor = get_model("qwen2vl_processor")
+    model = get_model("qwen25vl")
+    processor = get_model("qwen25vl_processor")
     if model is None or processor is None:
         return [_default_attributes() for _ in crops]
 
@@ -2500,7 +2500,7 @@ def _process_video_sync(
         best_frame = frame_lookup.get(best.frame_index, t_frames[0] if t_frames else sampled_frames[0].image)
         all_rep_crops.append(_make_rep_crop_384(best_frame, best.bbox))
 
-    # ── VLM: Qwen2-VL-7B trên ~25 merged tracklets ───────────────────────────
+    # ── VLM: Qwen2.5-VL-7B trên ~25 merged tracklets ───────────────────────────
     logger.info(
         "[vlm] %s: captioning %d merged tracklets (independent_batch_start=%d, max_batch=%d, tokens/crop=%d)",
         video_id,
@@ -2674,7 +2674,7 @@ def process_batch(req: BatchProcessRequest) -> BatchProcessResponse:
 
     Takes up to 100 videos from different cameras (same timestamp),
     runs per-video detection + BEV in parallel, then ONE MCBLT call
-    across all cameras, then DINOv2 + Qwen2-VL + VideoMAE per unified tracklet.
+    across all cameras, then DINOv2 + Qwen2.5-VL + VideoMAE per unified tracklet.
 
     Returns unified cross-camera tracklets with global IDs.
     """
@@ -2765,7 +2765,7 @@ def process_batch(req: BatchProcessRequest) -> BatchProcessResponse:
     groups = _mcblt_associate(detections_by_camera, max_dist=max_dist)
     logger.info("[%s] MCBLT formed %d cross-camera groups", batch_id, len(groups))
 
-    # ---- Stages 5-7: Per unified tracklet → DINOv2 + Qwen2-VL + VideoMAE ----
+    # ---- Stages 5-7: Per unified tracklet → DINOv2 + Qwen2.5-VL + VideoMAE ----
     tracklets: list[TrackletResult] = []
     tracklet_id_prefix = f"{batch_id}_tracklet"
 

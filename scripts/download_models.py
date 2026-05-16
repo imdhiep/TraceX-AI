@@ -3,6 +3,7 @@
 Download all SOTA 2026 models to /workspace/storage/model-weights/
 
 Models:
+  - Qwen2.5-VL-7B-Instruct (~15GB) Qwen/Qwen2.5-VL-7B-Instruct
   - Grounding DINO 1.6      (~4GB)  IDEA-Research/grounding-dino-base
   - EVA-02 ViT-L/14         (~5GB)  Aaronhuang21/eva02_l14_clip
   - SigLIP 2-So400m         (~3GB)  google/siglip2-so400m
@@ -14,7 +15,7 @@ Models:
 
 Usage:
     python scripts/download_models.py --all
-    python scripts/download_models.py --models grounding_dino eva02 siglip videomae
+    python scripts/download_models.py --models qwen25vl siglip2 videomae
     python scripts/download_models.py --check  # verify checksums/paths
 """
 
@@ -36,12 +37,12 @@ WORKSPACE = _DOCKER_PATH if _DOCKER_PATH.exists() or _DOCKER_PATH.parent.exists(
 WORKSPACE.mkdir(parents=True, exist_ok=True)
 
 MODEL_DEFINITIONS = {
-    # Qwen2-VL-7B-Instruct — open-vocabulary appearance captioning
-    "qwen2vl": {
-        "repo_id": "Qwen/Qwen2-VL-7B-Instruct",
-        "local_dir": "qwen2vl",
+    # Qwen2.5-VL-7B-Instruct — open-vocabulary appearance captioning
+    "qwen25vl": {
+        "repo_id": "Qwen/Qwen2.5-VL-7B-Instruct",
+        "local_dir": "qwen2_5_vl",
         "size_mb": 15000,
-        "description": "Qwen2-VL-7B-Instruct (open-vocabulary appearance metadata)",
+        "description": "Qwen2.5-VL-7B-Instruct (open-vocabulary appearance metadata)",
         "files": [],
     },
     # Grounding DINO 1.6 — open-vocabulary person detection
@@ -115,7 +116,7 @@ MODEL_DEFINITIONS = {
 REQUIRED_PACKAGES = [
     "torch>=2.3.0",
     "torchvision>=0.18.0",
-    "transformers>=4.40.0",
+    "transformers>=4.49.0",
     "accelerate>=0.30.0",
     "timm>=1.0.3",
     "sentencepiece>=0.2.0",

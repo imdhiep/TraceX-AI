@@ -155,7 +155,7 @@ services:
       # Caveat: very short actions (<1.5s falls) may lose VideoMAE frames;
       # raise to 4-6 if fall-detection accuracy matters more than raw purity.
       - PIPELINE_SAMPLE_FPS=${PIPELINE_SAMPLE_FPS:-3}
-      - QWEN2VL_MODEL_ID=${QWEN2VL_MODEL_ID:-}
+      - QWEN25VL_MODEL_ID=${QWEN25VL_MODEL_ID:-}
       - VLM_BATCH_SIZE=${VLM_BATCH_SIZE:-4}
       - VLM_BATCH_MAX_SIZE=${VLM_BATCH_MAX_SIZE:-8}
       - VLM_BATCH_MAX_NEW_TOKENS_PER_CROP=${VLM_BATCH_MAX_NEW_TOKENS_PER_CROP:-512}

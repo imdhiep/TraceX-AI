@@ -1,7 +1,7 @@
 """FastAPI application for metadata-service.
 
 Handles queue management, authentication, video metadata, and AI video processing.
-GPU models (RT-DETR R50, DINOv2 ViT-L/14, SigLIP 2, VideoMAE V2, Qwen2-VL-7B) are
+GPU models (RT-DETR R50, DINOv2 ViT-L/14, SigLIP 2, VideoMAE V2, Qwen2.5-VL-7B) are
 loaded at startup and used for the /api/v1/video/process endpoint.
 
 Search/ranking is forwarded to query-service (GPU).
@@ -80,7 +80,7 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("BOOTSTRAP_ADMIN_EMAIL or BOOTSTRAP_ADMIN_PASSWORD not set — skipping admin bootstrap.")
 
-    # 3. Warmup GPU models (RT-DETR, DINOv2, SigLIP 2 image encoder, VideoMAE V2, Qwen2-VL-7B)
+    # 3. Warmup GPU models (RT-DETR, DINOv2, SigLIP 2 image encoder, VideoMAE V2, Qwen2.5-VL-7B)
     logger.info("Starting GPU model warmup...")
     await warmup_models()
     logger.info("GPU models ready.")
@@ -155,7 +155,7 @@ def root():
         "service": "metadata-service",
         "version": "2.0.0",
         "description": "Queue management, authentication, video metadata + SOTA AI processing",
-        "gpu_models": ["RT-DETR R50", "DINOv2 ViT-L/14", "SigLIP 2 (image encoder)", "VideoMAE V2", "Qwen2-VL-7B-Instruct"],
+        "gpu_models": ["RT-DETR R50", "DINOv2 ViT-L/14", "SigLIP 2 (image encoder)", "VideoMAE V2", "Qwen2.5-VL-7B-Instruct"],
     }
 
 

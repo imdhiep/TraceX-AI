@@ -1,9 +1,9 @@
 # BÁO CÁO AUDIT TOÀN DIỆN: TraceX-AI
 
-**Ngày audit:** 2026-05-11 (cập nhật fixes: 2026-05-11)  
-**Auditor:** Senior Backend + ML Systems Auditor  
-**Schema version:** v3.3 (VLM pipeline)  
-**Tổng file Python:** 61  
+**Ngày audit:** 2026-05-11 (cập nhật fixes: 2026-05-11)
+**Auditor:** Senior Backend + ML Systems Auditor
+**Schema version:** v3.3 (VLM pipeline)
+**Tổng file Python:** 61
 **Audit dựa trên:** source code thực tế + git history + docker-compose
 
 ---
@@ -140,16 +140,16 @@ erDiagram
 
 | Column | Type | Nguồn hiện tại | Ghi chú |
 |---|---|---|---|
-| `gender` | String(16) | Qwen2-VL (via `_GENDER_NORM`) | "man"/"woman"/"unknown" |
-| `age_range` | String(32) | Qwen2-VL (via `_AGE_NORM`) | "young_adult" etc. |
+| `gender` | String(16) | Qwen2.5-VL (via `_GENDER_NORM`) | "man"/"woman"/"unknown" |
+| `age_range` | String(32) | Qwen2.5-VL (via `_AGE_NORM`) | "young_adult" etc. |
 | `top_color` | String(32) | Backward compat alias từ `upper_clothing_color` | `ingest_service.py:_save_tracklets` |
 | `bottom_color` | String(32) | Backward compat alias từ `lower_clothing_color` | |
-| `hair_color` | String(32) | Qwen2-VL | |
-| `hair_style` | String(32) | Qwen2-VL | |
-| `shoes_color` | String(32) | Qwen2-VL | |
-| `hat_color` | String(32) | Qwen2-VL | |
-| `bag_type` | String(64) | Qwen2-VL | |
-| `is_wearing_mask` | String(8) | Qwen2-VL | "yes"/"no"/"unknown" |
+| `hair_color` | String(32) | Qwen2.5-VL | |
+| `hair_style` | String(32) | Qwen2.5-VL | |
+| `shoes_color` | String(32) | Qwen2.5-VL | |
+| `hat_color` | String(32) | Qwen2.5-VL | |
+| `bag_type` | String(64) | Qwen2.5-VL | |
+| `is_wearing_mask` | String(8) | Qwen2.5-VL | "yes"/"no"/"unknown" |
 
 ### Nhóm 3: Confidence Scores (legacy)
 
@@ -163,7 +163,7 @@ erDiagram
 | `hat_conf` | Float | |
 | `mask_conf` | Float | |
 
-### Nhóm 4: Open-Vocabulary VLM Columns (MỚI — Qwen2-VL-7B-Instruct)
+### Nhóm 4: Open-Vocabulary VLM Columns (MỚI — Qwen2.5-VL-7B-Instruct)
 
 | Column | Type | Ghi chú |
 |---|---|---|
@@ -193,7 +193,7 @@ erDiagram
 | `occlusion_score` | Float | hardcoded `0.0` | **HARDCODE** — không tính thực |
 | `bev_x` | Float | `0.0` unless `CAMERA_CALIBRATION_PATH` set | BEV = Bird's Eye View homography |
 | `bev_y` | Float | `0.0` unless `CAMERA_CALIBRATION_PATH` set | |
-| `appearance_summary` | Text | Qwen2-VL | One-sentence summary |
+| `appearance_summary` | Text | Qwen2.5-VL | One-sentence summary |
 
 ### Nhóm 6: Indexes trên Tracklets
 
@@ -258,14 +258,14 @@ ix_tracklets_hat_presence    ON tracklets(hat_presence)
 | **BodyPartAdaptiveTracker** | metadata-service | ~0.1GB | `track_id`, `start_time/end_time` | Tracker (không phải neural net) |
 | **DINOv2 ViT-L/14** | metadata-service | ~5GB | `tracklet_embeddings.embedding` (1024-dim) | Re-ID embedding |
 | **SigLIP 2-So400m** | metadata-service + query-service | ~3GB | `tracklet_embeddings.siglip_embedding` (1152-dim) | Text-image search |
-| **Qwen2-VL-7B-Instruct** | metadata-service | ~14GB | `upper_clothing_*`, `lower_clothing_*`, `shoes_*`, `bag_*`, `hat_*`, `gender`, `age_range`, `appearance_summary` | Open-vocab VLM |
+| **Qwen2.5-VL-7B-Instruct** | metadata-service | ~14GB | `upper_clothing_*`, `lower_clothing_*`, `shoes_*`, `bag_*`, `hat_*`, `gender`, `age_range`, `appearance_summary` | Open-vocab VLM |
 | **VideoMAE V2-Large** | metadata-service | ~3GB | `tracklet_actions.action_label/confidence/scores` | Action classification |
 | **SeamlessM4T v2-large** | query-service | ~5GB | Không (translate query text in-flight) | Vietnamese → English query translation |
 | **Real-ESRGAN + ProPainter + RIFE** | trace-service | ~5GB | `evidence_videos.video_url` (merged video) | Video enhancement cho trace output |
 
 **VRAM Budget:**
 ```
-metadata-service:  DINOv2(5) + RT-DETR(3) + SigLIP(3) + Qwen2-VL(14) + VideoMAE(3) + overhead(3) = ~31GB
+metadata-service:  DINOv2(5) + RT-DETR(3) + SigLIP(3) + Qwen2.5-VL(14) + VideoMAE(3) + overhead(3) = ~31GB
 query-service:     SigLIP(3) + SeamlessM4T(5) + overhead(2) = ~10GB
 trace-service:     Real-ESRGAN + ProPainter + RIFE + overhead = ~15GB
 TỔNG:              ~56GB / 80GB A100  ✅ (~24GB headroom)
@@ -314,7 +314,7 @@ Frontend bấm "Import Videos" → `POST /api/v1/ingest/drive` hoặc `POST /api
     │         6d. Extract representative crops (best quality frames per tracklet)
     │         6e. DINOv2 batch → 1024-dim embedding per crop
     │         6f. SigLIP2 image encoder → 1152-dim embedding per crop
-    │         6g. Qwen2-VL-7B (1 crop/call) → JSON metadata:
+    │         6g. Qwen2.5-VL-7B (1 crop/call) → JSON metadata:
     │             {gender, age_range, upper_clothing_*, lower_clothing_*,
     │              shoes_*, bag_*, hat_*, appearance_summary}
     │         6h. VideoMAE V2 → action classification per tracklet
@@ -340,7 +340,7 @@ Frontend bấm "Import Videos" → `POST /api/v1/ingest/drive` hoặc `POST /api
 | RT-DETR detect | `video_process.py` | ~1450 |
 | DINOv2 embed | `video_process.py` | ~1490 |
 | SigLIP2 embed | `video_process.py` | ~1500 |
-| Qwen2-VL caption | `video_process.py` | ~1560 (calls `_caption_crop_vlm`) |
+| Qwen2.5-VL caption | `video_process.py` | ~1560 (calls `_caption_crop_vlm`) |
 | `_caption_crop_vlm` | `video_process.py` | 837 |
 | TrackletFragmentMerger | `video_process.py` | 1515 |
 | `_save_tracklets` | `ingest_service.py` | ~540 |
@@ -480,7 +480,7 @@ Merged:    fusion = 0.5 * text_score + 0.3 * quality_score + 0.2 * vector_score
 QueryHistory(query_id=qid, user_id=1, ...)
 ```
 
-**Mọi search query đều được gán cho user ID=1** — không track được user thực. 
+**Mọi search query đều được gán cho user ID=1** — không track được user thực.
 
 ---
 
@@ -576,16 +576,16 @@ URL này được generate nhưng **file merged.mp4 chưa chắc tồn tại** n
 | `tracklets.quality_score` | RT-DETR | detection confidence | `video_process.py:~1470` |
 | `tracklets.track_id` | BodyPartAdaptiveTracker | track ID | `video_process.py:~1480` |
 | `tracklets.start_time/end_time` | BodyPartAdaptiveTracker | frame timing | `video_process.py:~1485` |
-| `tracklets.gender` | Qwen2-VL + `_GENDER_NORM` | `_caption_crop_vlm` | `video_process.py:837` |
-| `tracklets.age_range` | Qwen2-VL + `_AGE_NORM` | `_caption_crop_vlm` | `video_process.py:837` |
-| `tracklets.upper_clothing_*` | Qwen2-VL | `_caption_crop_vlm` | `video_process.py:837` |
-| `tracklets.lower_clothing_*` | Qwen2-VL | `_caption_crop_vlm` | `video_process.py:837` |
-| `tracklets.shoes_*` | Qwen2-VL | `_caption_crop_vlm` | `video_process.py:837` |
-| `tracklets.bag_*` | Qwen2-VL | `_caption_crop_vlm` | `video_process.py:837` |
-| `tracklets.hat_*` | Qwen2-VL | `_caption_crop_vlm` | `video_process.py:837` |
+| `tracklets.gender` | Qwen2.5-VL + `_GENDER_NORM` | `_caption_crop_vlm` | `video_process.py:837` |
+| `tracklets.age_range` | Qwen2.5-VL + `_AGE_NORM` | `_caption_crop_vlm` | `video_process.py:837` |
+| `tracklets.upper_clothing_*` | Qwen2.5-VL | `_caption_crop_vlm` | `video_process.py:837` |
+| `tracklets.lower_clothing_*` | Qwen2.5-VL | `_caption_crop_vlm` | `video_process.py:837` |
+| `tracklets.shoes_*` | Qwen2.5-VL | `_caption_crop_vlm` | `video_process.py:837` |
+| `tracklets.bag_*` | Qwen2.5-VL | `_caption_crop_vlm` | `video_process.py:837` |
+| `tracklets.hat_*` | Qwen2.5-VL | `_caption_crop_vlm` | `video_process.py:837` |
 | `tracklets.top_color` | Backward compat | `ingest_service.py:_save_tracklets` | upper_clothing_color |
 | `tracklets.bottom_color` | Backward compat | `ingest_service.py:_save_tracklets` | lower_clothing_color |
-| `tracklets.appearance_summary` | Qwen2-VL | `_caption_crop_vlm` | `video_process.py:837` |
+| `tracklets.appearance_summary` | Qwen2.5-VL | `_caption_crop_vlm` | `video_process.py:837` |
 | `tracklets.occlusion_score` | HARDCODE 0.0 | `video_process.py:1636` | không tính thực |
 | `tracklets.bev_x/bev_y` | Calibration | `video_process.py:1556` | 0.0 nếu không có calib |
 | `tracklet_embeddings.embedding` | DINOv2 ViT-L/14 | `_batch_extract_features` | 1024-dim |
@@ -612,18 +612,18 @@ URL này được generate nhưng **file merged.mp4 chưa chắc tồn tại** n
 
 ### Risk #4 — HIGH: Không có Alembic — schema drift nguy hiểm
 
-**Vấn đề:** `create_all()` chỉ tạo bảng mới, **không alter cột đã có**. Nếu thêm column vào `models.py` mà DB đang chạy, column sẽ không xuất hiện trừ khi xóa DB hoặc chạy `ALTER TABLE` thủ công.  
-**Fix đã áp dụng:** Restart metadata-service để trigger `create_all()` cho bảng mới.  
+**Vấn đề:** `create_all()` chỉ tạo bảng mới, **không alter cột đã có**. Nếu thêm column vào `models.py` mà DB đang chạy, column sẽ không xuất hiện trừ khi xóa DB hoặc chạy `ALTER TABLE` thủ công.
+**Fix đã áp dụng:** Restart metadata-service để trigger `create_all()` cho bảng mới.
 **Fix lâu dài:** Migrate sang Alembic.
 
 ### Risk #5 — MEDIUM: EvidenceTracklet FK Mismatch
 
-**File:** `trace-service/app/services/trace_service.py:293` vs `shared/models.py`  
+**File:** `trace-service/app/services/trace_service.py:293` vs `shared/models.py`
 **Vấn đề:** trace-service gọi:
 ```python
 EvidenceTracklet(evidence_id=evidence.id, ...)
 ```
-Nhưng `shared/models.py` định nghĩa column là `evidence_video_id`. Nếu SQLAlchemy không raise error (vì mapping), data có thể lưu sai column.  
+Nhưng `shared/models.py` định nghĩa column là `evidence_video_id`. Nếu SQLAlchemy không raise error (vì mapping), data có thể lưu sai column.
 **Verify:**
 ```bash
 grep -n "evidence_id\|evidence_video_id" backend/services/shared/models.py
@@ -632,49 +632,49 @@ grep -n "evidence_id=" backend/services/trace-service/app/services/trace_service
 
 ### Risk #6 — MEDIUM: Không có ANN index cho pgvector
 
-**Vấn đề:** `tracklet_embeddings` không có HNSW/IVFFlat index. Vector search là Python O(N²). Với 10k tracklets, ổn. Với 100k+, latency > 10s.  
+**Vấn đề:** `tracklet_embeddings` không có HNSW/IVFFlat index. Vector search là Python O(N²). Với 10k tracklets, ổn. Với 100k+, latency > 10s.
 **Fix:**
 ```sql
-CREATE INDEX ix_te_embedding_hnsw ON tracklet_embeddings 
+CREATE INDEX ix_te_embedding_hnsw ON tracklet_embeddings
 USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=64);
-CREATE INDEX ix_te_siglip_hnsw ON tracklet_embeddings 
+CREATE INDEX ix_te_siglip_hnsw ON tracklet_embeddings
 USING hnsw (siglip_embedding vector_cosine_ops) WITH (m=16, ef_construction=64);
 ```
 
 ### Risk #7 — MEDIUM: Drive IDs hardcode và duplicate
 
-**File:** `ingest_service.py:36-37` và `59-60`  
-**Vấn đề:** Same constants defined twice. Thay đổi 1 nơi mà quên nơi kia → silent bug.  
+**File:** `ingest_service.py:36-37` và `59-60`
+**Vấn đề:** Same constants defined twice. Thay đổi 1 nơi mà quên nơi kia → silent bug.
 **Fix:** Xóa lines 59-60 (duplicate), giữ lines 36-37.
 
-### Risk #8 — MEDIUM: Qwen2-VL load failure là non-fatal
+### Risk #8 — MEDIUM: Qwen2.5-VL load failure là non-fatal
 
-**File:** `model_warmup.py`  
-**Vấn đề:** Nếu VLM load fail, `_MODELS["qwen2vl"] = None`. Sau đó `_caption_crop_vlm()` check `if vlm_model is None → _default_attributes()`. Toàn bộ VLM metadata sẽ là "unknown" mà không có alert nào cho user.  
-**Monitor:** Check warmup log: `Qwen2-VL-7B-Instruct loaded OK`
+**File:** `model_warmup.py`
+**Vấn đề:** Nếu VLM load fail, `_MODELS["qwen25vl"] = None`. Sau đó `_caption_crop_vlm()` check `if vlm_model is None → _default_attributes()`. Toàn bộ VLM metadata sẽ là "unknown" mà không có alert nào cho user.
+**Monitor:** Check warmup log: `Qwen2.5-VL-7B-Instruct loaded OK`
 
 ### Risk #9 — LOW: Merged video URL không kiểm tra file tồn tại
 
-**File:** `trace_service.py:399-410`  
+**File:** `trace_service.py:399-410`
 **Vấn đề:** `_generate_merged_video_url()` trả về URL nhưng không verify file `.mp4` thực sự tồn tại. Frontend sẽ nhận URL → broken video player.
 
 ### ~~Risk #10~~ — ✅ FIXED: Docstrings stale sau migration EVA-02 → DINOv2
 
 **Fix ngày 2026-05-11:** Đã cập nhật trong `shared/models.py`, `shared/core/tracklet.py`, `shared/core/mcblt.py`:
 - `TrackletEmbedding` docstring → "DINOv2 ViT-L/14 Re-ID embedding + SigLIP 2-So400m search embedding"
-- Confidence comment → "from Qwen2-VL-7B-Instruct"
-- `tracklet.py` module docstring → "DINOv2, SigLIP 2, Qwen2-VL, VideoMAE"
+- Confidence comment → "from Qwen2.5-VL-7B-Instruct"
+- `tracklet.py` module docstring → "DINOv2, SigLIP 2, Qwen2.5-VL, VideoMAE"
 - `mcblt.py` Stage 3 → "DINOv2 embeddings"
 
 ### Risk #11 — LOW: Camera neighbor expansion giả định numeric IDs
 
-**File:** `trace_service.py:22-36`  
+**File:** `trace_service.py:22-36`
 **Vấn đề:** Nếu camera IDs không có format `prefix_NNN` (e.g. `entrance-main`, `lobby-a`), `_extract_cam_num()` trả về None → `_neighbor_cameras()` trả về `[primary_cam]` chỉ (không expand). Trace sẽ có ít segments.
 
 ### Risk #12 — INFO: `TRANSFORMERS_OFFLINE=1` trong query-service
 
-**File:** `docker-compose.lightningai.yml:171`  
-**Vấn đề:** query-service chạy offline mode — models phải đã có trong `/workspace/models/`. Nếu cache trống, model load sẽ fail.  
+**File:** `docker-compose.lightningai.yml:171`
+**Vấn đề:** query-service chạy offline mode — models phải đã có trong `/workspace/models/`. Nếu cache trống, model load sẽ fail.
 **Verify:** `ls /home/zeus/.cache/huggingface/hub/`
 
 ---
@@ -684,7 +684,7 @@ USING hnsw (siglip_embedding vector_cosine_ops) WITH (m=16, ef_construction=64);
 ### Check VLM metadata đã lưu vào DB
 
 ```sql
-SELECT 
+SELECT
     tracklet_id,
     upper_clothing_desc,
     upper_clothing_type,
@@ -701,7 +701,7 @@ LIMIT 5;
 ### Check embedding dimensions
 
 ```sql
-SELECT 
+SELECT
     tracklet_id,
     vector_dims(embedding) as dino_dims,
     vector_dims(siglip_embedding) as siglip_dims
@@ -754,7 +754,7 @@ docker exec tracex-metadata-service nvidia-smi --query-gpu=memory.used,memory.to
 ### Warmup log
 
 ```bash
-docker logs tracex-metadata-service 2>&1 | grep -E "loaded OK|load failed|Qwen2-VL|DINOv2|SigLIP"
+docker logs tracex-metadata-service 2>&1 | grep -E "loaded OK|load failed|Qwen2.5-VL|DINOv2|SigLIP"
 ```
 
 ### pgdata persistence check
@@ -784,7 +784,7 @@ TraceX-AI là hệ thống **person Re-ID + trace** cho camera surveillance vớ
 
 ### Điểm mạnh
 
-1. VLM pipeline (Qwen2-VL) đã thay thế label-based SigLIP → metadata phong phú, free-text
+1. VLM pipeline (Qwen2.5-VL) đã thay thế label-based SigLIP → metadata phong phú, free-text
 2. Fusion score cân bằng text similarity + quality + vector similarity
 3. Backward compat: columns cũ (`top_color`, `bottom_color`) vẫn populated
 4. Stream-based DB queries (yield_per=256) tránh OOM
@@ -817,7 +817,7 @@ TraceX-AI là hệ thống **person Re-ID + trace** cho camera surveillance vớ
 
 | # | Bug cũ | Fix đã áp dụng | Evidence |
 |---|---|---|---|
-| 1 | SigLIP label-based metadata bị ép vào 57 labels cố định | Thay bằng Qwen2-VL-7B-Instruct free-text captioning | `video_process.py:837` |
+| 1 | SigLIP label-based metadata bị ép vào 57 labels cố định | Thay bằng Qwen2.5-VL-7B-Instruct free-text captioning | `video_process.py:837` |
 | 2 | Grounding DINO 1.6 sử dụng 4GB VRAM không cần thiết | Đã xóa khỏi `model_warmup.py` | `grep -r "grounding_dino" --include="*.py"` → 0 results |
 | 3 | EVA-02 ViT-L/14 embedding (model cũ) | Thay bằng DINOv2 ViT-L/14 | `model_warmup.py` loads `facebook/dinov2-large` |
 | 4 | `trace_service.py` dùng `video.created_at` thay `recorded_at` → time sai | Fix: `base_dt = video.recorded_at or video.created_at` | `trace_service.py:187` |
@@ -841,5 +841,5 @@ TraceX-AI là hệ thống **person Re-ID + trace** cho camera surveillance vớ
 
 ---
 
-*Audit này được thực hiện dựa trên source code tại `/home/zeus/content/TraceX-AI` ngày 2026-05-11.*  
+*Audit này được thực hiện dựa trên source code tại `/home/zeus/content/TraceX-AI` ngày 2026-05-11.*
 *Để cập nhật: chạy verification commands trong Phần 14 sau mỗi deployment.*
