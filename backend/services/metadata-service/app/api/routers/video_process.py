@@ -2170,7 +2170,7 @@ def _batch_siglip_embeddings(
                     start = len(siglip_crops)
                     for idx in indices:
                         fr, bbox = obs_pairs[idx]
-                        c = _extract_crop(fr, bbox, 224)
+                        c = _extract_crop(fr, bbox, 384)
                         if c is not None:
                             siglip_crops.append(Image.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB)))
                     siglip_slices.append((start, len(siglip_crops)))
@@ -2183,7 +2183,7 @@ def _batch_siglip_embeddings(
                     indices = np.linspace(0, len(t_frames) - 1, n, dtype=int)
                     start = len(siglip_crops)
                     for idx in indices:
-                        c = _extract_crop(t_frames[idx], rep_bbox, 224)
+                        c = _extract_crop(t_frames[idx], rep_bbox, 384)
                         if c is not None:
                             siglip_crops.append(Image.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB)))
                     siglip_slices.append((start, len(siglip_crops)))
@@ -2458,8 +2458,9 @@ def _process_video_sync(
             return arr.tolist()
         return (arr / n).tolist()
 
-    # Pool the multi-frame SigLIP features (5 crops/fragment, richer signal)
-    # for the DB-stored embedding, instead of the single-crop variant.
+    # Pool the multi-frame SigLIP features (5 crops/fragment @ 384px, richer
+    # signal -- matches SigLIP-2 so400m-patch14-384 native resolution) for the
+    # DB-stored embedding, instead of the single-crop variant.
     all_siglip_embeddings = [
         _pool_avg_normalized([siglip_multi_feats[i] for i in g]) for g in _groups
     ]
