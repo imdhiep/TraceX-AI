@@ -14,7 +14,7 @@ import {
 import { GRID_BATCH_SIZE } from "@/lib/config";
 import type { VideoItem } from "@/lib/types";
 import { mapLocationIdsToCameraIds } from "@/lib/config";
-import { searchVideos, selectHistoryVideo } from "@/lib/api";
+import { resolveMediaUrl, searchVideos, selectHistoryVideo } from "@/lib/api";
 
 export type SearchImageState = {
   file: File;
@@ -57,6 +57,10 @@ type SearchContextValue = {
     candidateId: string,
     trackletId: string,
     remainingTrackletCount: number,
+    /** Backend-provided cache-busted URL for the new representative crop.
+     *  Passed through when the removed tracklet was the representative; nullish
+     *  otherwise. See _preview_url_for() in query-service candidates.py. */
+    newPreviewUrl?: string | null,
   ) => void;
 };
 
@@ -236,15 +240,24 @@ export function SearchProvider({ children }: { children: ReactNode }) {
     candidateId: string,
     trackletId: string,
     remainingTrackletCount: number,
+    newPreviewUrl?: string | null,
   ) => {
     setResults((current) =>
       current.map((item) => {
         if (item.id !== candidateId) return item;
-        return {
+        // Overwrite thumbnail when backend gave us a new representative crop —
+        // otherwise the card keeps showing the removed tracklet's image.
+        // Must go through resolveMediaUrl so the relative `/candidates/.../preview?v=...`
+        // path is rebased onto the API host instead of the frontend origin.
+        const next = {
           ...item,
           trackletCount: remainingTrackletCount,
           tracklets: item.tracklets?.filter((t) => t.trackletId !== trackletId),
         };
+        if (newPreviewUrl) {
+          (next as { thumbnailUrl?: string | null }).thumbnailUrl = resolveMediaUrl(newPreviewUrl);
+        }
+        return next;
       }),
     );
   }, []);

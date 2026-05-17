@@ -1,4 +1,5 @@
 import os
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -31,6 +32,45 @@ def _positive_env_int(name: str, default: int) -> int:
 
 
 _HISTORY_CANDIDATE_LIMIT = _positive_env_int("MAX_CANDIDATES", 50)
+
+
+def _preview_version(tracklet: Tracklet | None) -> int | None:
+    ts = getattr(tracklet, "updated_at", None) if tracklet is not None else None
+    if ts is None:
+        return None
+    try:
+        # Keep microseconds: two rapid reprocesses in the same second should
+        # still invalidate separate browser cache entries.
+        return int(ts.timestamp() * 1_000_000)
+    except Exception:
+        return None
+
+
+def _preview_url_for(tracklet: Tracklet | None) -> str:
+    tid = getattr(tracklet, "tracklet_id", "") if tracklet is not None else ""
+    if not tid:
+        return ""
+    version = _preview_version(tracklet)
+    return (
+        f"/candidates/{tid}/preview?v={version}"
+        if version is not None
+        else f"/candidates/{tid}/preview"
+    )
+
+
+def _preview_tracklet_id(preview_url: str | None) -> str | None:
+    """Extract `/candidates/{tracklet_id}/preview` when an old persisted
+    candidate preview URL still identifies a surviving representative."""
+    raw = str(preview_url or "").strip()
+    if not raw:
+        return None
+    try:
+        parts = [part for part in urlparse(raw).path.split("/") if part]
+    except Exception:
+        return None
+    if len(parts) >= 3 and parts[-3] == "candidates" and parts[-1] == "preview":
+        return parts[-2]
+    return None
 
 
 @router.get("")
@@ -118,12 +158,18 @@ def get_history_candidates(
     re-running the ranking pipeline."""
     query = _verify_query_owner(session, query_id, current_user.id)
 
+    has_current_member = (
+        select(QueryCandidateTracklet.id)
+        .where(QueryCandidateTracklet.candidate_id == QueryCandidate.candidate_id)
+        .exists()
+    )
     total_count = session.scalar(
         select(func.count())
         .select_from(QueryCandidate)
         .where(
             QueryCandidate.query_id == query_id,
             QueryCandidate.rank_position <= _HISTORY_CANDIDATE_LIMIT,
+            has_current_member,
         )
     ) or 0
 
@@ -132,6 +178,7 @@ def get_history_candidates(
         .where(
             QueryCandidate.query_id == query_id,
             QueryCandidate.rank_position <= _HISTORY_CANDIDATE_LIMIT,
+            has_current_member,
         )
         .order_by(QueryCandidate.rank_position.asc(), QueryCandidate.id.asc())
         .offset(offset)
@@ -142,37 +189,29 @@ def get_history_candidates(
         .where(
             QueryCandidate.query_id == query_id,
             QueryCandidate.is_selected == True,  # noqa: E712
+            has_current_member,
         )
         .order_by(QueryCandidate.rank_position.asc(), QueryCandidate.id.asc())
     ).all()
 
-    # Pick one representative tracklet per candidate for the thumbnail URL and
-    # collect tracklet summaries (camera + time window) so history cards match
-    # fresh search result cards.
-    rep_tracklets: dict[str, str] = {}
+    # Load current member tracklets in persisted membership order. The first
+    # member is the same fallback representative used by trace-service after a
+    # manual removal; if the old persisted preview still names a surviving
+    # member, we preserve that rep instead.
+    tracklets_by_candidate: dict[str, list[Tracklet]] = {}
     tracklet_summaries: dict[str, list[dict]] = {}
     if candidates:
         cand_ids = [c.candidate_id for c in candidates]
-        # First pick rep tracklet (min tracklet_id) per candidate for thumbnail.
-        for cand_id, tracklet_id in session.execute(
-            select(
-                QueryCandidateTracklet.candidate_id,
-                func.min(QueryCandidateTracklet.tracklet_id),
-            )
-            .where(QueryCandidateTracklet.candidate_id.in_(cand_ids))
-            .group_by(QueryCandidateTracklet.candidate_id)
-        ).all():
-            rep_tracklets[cand_id] = tracklet_id
-
-        # Then load all tracklets+video for these candidates to build summaries.
         rows = session.execute(
-            select(QueryCandidateTracklet.candidate_id, Tracklet)
+            select(QueryCandidateTracklet.candidate_id, QueryCandidateTracklet.id, Tracklet)
             .join(Tracklet, QueryCandidateTracklet.tracklet_id == Tracklet.tracklet_id)
             .join(Video, Tracklet.video_id == Video.video_id)
             .options(contains_eager(Tracklet.video))
             .where(QueryCandidateTracklet.candidate_id.in_(cand_ids))
+            .order_by(QueryCandidateTracklet.id.asc())
         ).all()
-        for cand_id, tracklet in rows:
+        for cand_id, _membership_id, tracklet in rows:
+            tracklets_by_candidate.setdefault(cand_id, []).append(tracklet)
             window = tracklet_time_window(tracklet)
             tracklet_summaries.setdefault(cand_id, []).append({
                 "tracklet_id": tracklet.tracklet_id,
@@ -187,13 +226,21 @@ def get_history_candidates(
 
     results = []
     for c in candidates:
-        thumbnail_url = c.preview_url or ""
-        if not thumbnail_url:
-            tid = rep_tracklets.get(c.candidate_id)
-            if tid:
-                thumbnail_url = f"/candidates/{tid}/preview"
+        members = tracklets_by_candidate.get(c.candidate_id, [])
         summaries = tracklet_summaries.get(c.candidate_id, [])
         tracklet_count = len(summaries)
+        # Reprocessing can legitimately delete tracklets that no longer exist
+        # in the latest pipeline result. Do not surface orphaned historical
+        # candidates that have no current member left to represent them.
+        if tracklet_count <= 0:
+            continue
+
+        persisted_rep_id = _preview_tracklet_id(c.preview_url)
+        rep = next(
+            (t for t in members if t.tracklet_id == persisted_rep_id),
+            members[0] if members else None,
+        )
+        thumbnail_url = _preview_url_for(rep)
         raw_description = c.appearance_summary or ""
         description = description_map.get(raw_description, raw_description)
         results.append({

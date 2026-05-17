@@ -11,7 +11,16 @@ type Props = {
   candidateId: string | null;
   candidateLabel?: string | null;
   onClose: () => void;
-  onTrackletRemoved?: (candidateId: string, trackletId: string, remainingTrackletCount: number) => void;
+  onTrackletRemoved?: (
+    candidateId: string,
+    trackletId: string,
+    remainingTrackletCount: number,
+    /** When the removed tracklet was the candidate's representative, the
+     *  backend picks a new one and returns this cache-busted URL. Card
+     *  thumbnails should swap to this immediately — otherwise the stale
+     *  crop of the deleted tracklet keeps showing. */
+    newPreviewUrl?: string | null,
+  ) => void;
 };
 
 export function CandidateDetailModal({
@@ -88,7 +97,12 @@ export function CandidateDetailModal({
           totalTrackletsInWindow: result.remainingTrackletCount,
         };
       });
-      onTrackletRemoved?.(candidateId, trackletId, result.remainingTrackletCount);
+      onTrackletRemoved?.(
+        candidateId,
+        trackletId,
+        result.remainingTrackletCount,
+        result.newPreviewUrl,
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Không thể loại tracklet khỏi candidate.");
     } finally {

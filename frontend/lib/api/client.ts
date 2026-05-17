@@ -731,6 +731,8 @@ export type RemoveCandidateTrackletResult = {
   candidateId: string;
   trackletId: string;
   remainingTrackletCount: number;
+  newPreviewUrl: string | null;
+  newRepresentativeTrackletId: string | null;
 };
 
 export async function removeCandidateTracklet(
@@ -742,6 +744,8 @@ export async function removeCandidateTracklet(
     candidate_id: string;
     tracklet_id: string;
     remaining_tracklet_count: number;
+    new_preview_url?: string | null;
+    new_representative_tracklet_id?: string | null;
   }>("/trace/candidate-tracklet/remove", {
     method: "POST",
     body: JSON.stringify({
@@ -754,6 +758,8 @@ export async function removeCandidateTracklet(
     candidateId: payload.candidate_id,
     trackletId: payload.tracklet_id,
     remainingTrackletCount: payload.remaining_tracklet_count,
+    newPreviewUrl: payload.new_preview_url ?? null,
+    newRepresentativeTrackletId: payload.new_representative_tracklet_id ?? null,
   };
 }
 

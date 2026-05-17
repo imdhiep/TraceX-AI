@@ -181,8 +181,14 @@ export function HomeView() {
     candidateId: string,
     trackletId: string,
     remainingTrackletCount: number,
+    newPreviewUrl?: string | null,
   ) => {
-    updateCandidateTrackletRemoval(candidateId, trackletId, remainingTrackletCount);
+    updateCandidateTrackletRemoval(
+      candidateId,
+      trackletId,
+      remainingTrackletCount,
+      newPreviewUrl,
+    );
     if (remainingTrackletCount <= 0) {
       setSelectedCandidateIds((current) => current.filter((id) => id !== candidateId));
     }

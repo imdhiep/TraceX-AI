@@ -7,7 +7,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useToast } from "@/components/ui/ToastProvider";
 import { VideoGrid } from "@/components/video/VideoGrid";
 import { CandidateDetailModal } from "@/features/candidate/CandidateDetailModal";
-import { buildTrace, getHistoryCandidates, type HistoryCandidatesResult } from "@/lib/api";
+import { buildTrace, getHistoryCandidates, resolveMediaUrl, type HistoryCandidatesResult } from "@/lib/api";
 import { GRID_BATCH_SIZE } from "@/lib/config";
 import type { VideoItem } from "@/lib/types";
 
@@ -137,6 +137,7 @@ export function HistoryCandidatesView({ queryId }: Props) {
     candidateId: string,
     trackletId: string,
     remainingTrackletCount: number,
+    newPreviewUrl?: string | null,
   ) => {
     setData((current) => {
       if (!current) return current;
@@ -144,11 +145,21 @@ export function HistoryCandidatesView({ queryId }: Props) {
         ...current,
         items: current.items.map((item) => {
           if (item.id !== candidateId) return item;
-          return {
+          // Backend may have picked a new representative tracklet and returned
+          // its cache-busted preview URL — swap the card thumbnail to that, or
+          // the deleted tracklet's stale image keeps showing.
+          // Rebase via resolveMediaUrl so the relative `/candidates/...` path
+          // resolves against the API host, not the frontend origin (which
+          // would 404 — frontend doesn't serve this route).
+          const next = {
             ...item,
             trackletCount: remainingTrackletCount,
             tracklets: item.tracklets?.filter((t) => t.trackletId !== trackletId),
           };
+          if (newPreviewUrl) {
+            (next as { thumbnailUrl?: string | null }).thumbnailUrl = resolveMediaUrl(newPreviewUrl);
+          }
+          return next;
         }),
       };
     });

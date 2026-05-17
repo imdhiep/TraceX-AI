@@ -434,6 +434,25 @@ def _local_prefilter(
     return [], {}
 
 
+def _preview_url_for(tracklet) -> str:
+    """Cache-busted preview URL for a tracklet's representative crop.
+
+    Crop filenames are deterministic (`{video_id}_{camera_id}_{t_idx}.jpg`),
+    so when a video is re-processed the file is overwritten but the URL
+    stays the same — browsers serve the stale 24h-cached thumbnail. Append
+    the tracklet's updated_at epoch so re-ingest invalidates the cache.
+    """
+    tid = getattr(tracklet, "tracklet_id", "") if tracklet is not None else ""
+    if not tid:
+        return ""
+    ts = getattr(tracklet, "updated_at", None)
+    if ts is None:
+        return f"/candidates/{tid}/preview"
+    try:
+        return f"/candidates/{tid}/preview?v={int(ts.timestamp() * 1_000_000)}"
+    except Exception:
+        return f"/candidates/{tid}/preview"
+
 
 # ── Identity merge: cosine similarity + temporal/camera guards + union-find ───
 
@@ -1379,7 +1398,7 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                 top_color=rep.upper_color or "unknown",
                 bottom_color=rep.lower_color or "unknown",
                 candidate_key=candidate_key,
-                preview_url=f"/candidates/{rep.tracklet_id}/preview",
+                preview_url=_preview_url_for(rep),
             )
             db.execute(candidate_insert.on_conflict_do_update(
                 index_elements=["candidate_id"],
@@ -1395,7 +1414,7 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                     "top_color": rep.upper_color or "unknown",
                     "bottom_color": rep.lower_color or "unknown",
                     "candidate_key": candidate_key,
-                    "preview_url": f"/candidates/{rep.tracklet_id}/preview",
+                    "preview_url": _preview_url_for(rep),
                 },
             ))
 
@@ -1502,7 +1521,7 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                 })
             results.append({
                 "id": candidate_id,
-                "thumbnail_url": f"/candidates/{rep.tracklet_id}/preview",
+                "thumbnail_url": _preview_url_for(rep),
                 "description": description,
                 "tracklet_count": tracklet_count,
                 "tracklets": tracklet_summaries,

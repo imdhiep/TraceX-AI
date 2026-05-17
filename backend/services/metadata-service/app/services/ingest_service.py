@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
@@ -317,26 +317,48 @@ def _save_tracklets_from_gpu_result(
 
     tracklets = gpu_result.get("tracklets", [])
     saved = 0
+    incoming_tracklet_ids = {
+        str(t.get("tracklet_id") or "")
+        for t in tracklets
+        if str(t.get("tracklet_id") or "")
+    }
 
-    for t in tracklets:
-        tracklet_id = str(t.get("tracklet_id") or "")
-        if not tracklet_id:
-            continue
+    # A reprocess is a replacement of this video's latest derived state, not
+    # an additive ingest. If the new run emits fewer / differently-merged
+    # tracklets than the previous run, rows absent from the fresh result must
+    # disappear too; otherwise old fragments remain queryable forever.
+    stale_tracklet_stmt = select(Tracklet.tracklet_id).where(Tracklet.video_id == video_id)
+    if incoming_tracklet_ids:
+        stale_tracklet_stmt = stale_tracklet_stmt.where(
+            Tracklet.tracklet_id.not_in(incoming_tracklet_ids)
+        )
+    stale_tracklet_ids = list(session.scalars(stale_tracklet_stmt))
+    if stale_tracklet_ids:
+        logger.info(
+            "[ingest] removing %d stale tracklets for reprocessed video %s",
+            len(stale_tracklet_ids),
+            video_id,
+        )
+        # Child rows (embeddings/actions/observations/query-candidate links)
+        # cascade from Tracklet FK constraints, so no stale identity evidence is
+        # left behind after a newer pipeline run changes the fragmentation.
+        session.execute(
+            delete(Tracklet).where(Tracklet.tracklet_id.in_(stale_tracklet_ids))
+        )
+        session.flush()
 
-        existing = session.scalar(select(Tracklet).where(Tracklet.tracklet_id == tracklet_id))
-        if existing is not None:
-            continue
+    def _opt_float(val) -> float | None:
+        return float(val) if val is not None else None
 
-        def _opt_float(val) -> float | None:
-            return float(val) if val is not None else None
+    def _s(val, max_len: int, fallback: str = "unknown") -> str:
+        """str-coerce, fallback on empty, hard-truncate to column max_len."""
+        v = str(val).strip() if val is not None else ""
+        return (v or fallback)[:max_len]
 
-        def _s(val, max_len: int, fallback: str = "unknown") -> str:
-            """str-coerce, fallback on empty, hard-truncate to column max_len."""
-            v = str(val).strip() if val is not None else ""
-            return (v or fallback)[:max_len]
-
-        tracklet = Tracklet(
-            tracklet_id=tracklet_id,
+    def _tracklet_attrs(t: dict) -> dict:
+        """Build the kwargs dict shared between INSERT and UPDATE paths so
+        the two branches can't drift apart attribute-by-attribute."""
+        return dict(
             video_id=video_id,
             camera_id=camera_id,
             track_id=str(t.get("track_id") or "0"),
@@ -404,33 +426,9 @@ def _save_tracklets_from_gpu_result(
             crop_url=str(t.get("crop_url") or ""),
             representative_bbox=t.get("representative_bbox") or [],
         )
-        session.add(tracklet)
 
-        # Embeddings:
-        #   - SigLIP2 1152-dim semantic lane (text/image retrieval)
-        #   - Re-ID lane (PersonViT-S 384-dim, MSMT17) for identity association
-        siglip_vec = t.get("siglip_embedding") or None
-        reid_vec = t.get("reid_embedding") or None
-        reid_model_version = str(t.get("reid_model_version") or "") or None
-        if siglip_vec or reid_vec:
-            session.add(TrackletEmbedding(
-                tracklet_id=tracklet_id,
-                siglip_embedding=siglip_vec,
-                reid_embedding=reid_vec,
-                reid_model_version=reid_model_version,
-            ))
-
-        # Action (VideoMAE V2)
-        action_label = str(t.get("action") or t.get("action_label") or "")
-        if action_label and action_label != "unknown":
-            session.add(TrackletAction(
-                tracklet_id=tracklet_id,
-                action_label=action_label,
-                kinetics_label=str(t.get("kinetics_label") or ""),
-                confidence=float(t.get("action_confidence") or 0.0),
-            ))
-
-        # Per-frame observations (bbox timeline) for trace-service evidence rendering
+    def _normalized_observations(t: dict, tracklet_id: str) -> list[dict]:
+        """Dedup per-frame observations, keep highest-confidence row per frame."""
         obs_list = t.get("observations") or []
         obs_by_frame: dict[int, dict] = {}
         for o in obs_list:
@@ -441,6 +439,7 @@ def _save_tracklets_from_gpu_result(
                 frame_index = int(o.get("frame_index") or 0)
                 confidence = float(o.get("confidence") or 0.0)
                 normalized = {
+                    "frame_index": frame_index,
                     "timestamp_second": float(o.get("timestamp_second") or 0.0),
                     "bbox": [int(v) for v in bbox[:4]],
                     "confidence": confidence or None,
@@ -451,17 +450,79 @@ def _save_tracklets_from_gpu_result(
                     obs_by_frame[frame_index] = normalized
             except Exception as exc:
                 logger.warning("[ingest] skip bad observation for %s: %s", tracklet_id, exc)
-
         if len(obs_by_frame) < len(obs_list):
             logger.debug(
                 "[ingest] dedup observations for %s: %d -> %d unique frames",
                 tracklet_id, len(obs_list), len(obs_by_frame),
             )
+        return [obs_by_frame[k] for k in sorted(obs_by_frame)]
 
-        for frame_index, o in sorted(obs_by_frame.items()):
+    for t in tracklets:
+        tracklet_id = str(t.get("tracklet_id") or "")
+        if not tracklet_id:
+            continue
+
+        attrs = _tracklet_attrs(t)
+        siglip_vec = t.get("siglip_embedding") or None
+        reid_vec = t.get("reid_embedding") or None
+        reid_model_version = str(t.get("reid_model_version") or "") or None
+        action_label = str(t.get("action") or t.get("action_label") or "")
+        observations = _normalized_observations(t, tracklet_id)
+
+        existing = session.scalar(select(Tracklet).where(Tracklet.tracklet_id == tracklet_id))
+        if existing is not None:
+            # Reprocess path: same tracklet_id but pipeline (model swap, threshold
+            # change, etc.) produced fresh attributes/embeddings/observations and
+            # overwrote the crop file in place. We must rewrite the row so:
+            #   • updated_at bumps → cache-busted preview URL (?v=updated_at)
+            #     invalidates the browser cached thumbnail
+            #   • attributes reflect the latest pipeline run
+            #   • embeddings reflect the current ReID/semantic model
+            #   • observations reflect the latest tracker output
+            # Older runs are intentionally discarded — keeping them mixed would
+            # poison downstream ranking and the merger.
+            for k, v in attrs.items():
+                setattr(existing, k, v)
+            # SQLAlchemy onupdate doesn't fire if no observed column changes
+            # (rare for full reprocess but possible if every value is identical).
+            # Force a touch so the preview URL always invalidates.
+            existing.updated_at = datetime.now(timezone.utc)
+
+            # Embedding / action / observation tables have FK to tracklet_id;
+            # wipe and re-insert to match the new attribute set.
+            session.execute(
+                delete(TrackletEmbedding).where(TrackletEmbedding.tracklet_id == tracklet_id)
+            )
+            session.execute(
+                delete(TrackletAction).where(TrackletAction.tracklet_id == tracklet_id)
+            )
+            session.execute(
+                delete(TrackletObservation).where(TrackletObservation.tracklet_id == tracklet_id)
+            )
+            session.flush()
+        else:
+            session.add(Tracklet(tracklet_id=tracklet_id, **attrs))
+
+        if siglip_vec or reid_vec:
+            session.add(TrackletEmbedding(
+                tracklet_id=tracklet_id,
+                siglip_embedding=siglip_vec,
+                reid_embedding=reid_vec,
+                reid_model_version=reid_model_version,
+            ))
+
+        if action_label and action_label != "unknown":
+            session.add(TrackletAction(
+                tracklet_id=tracklet_id,
+                action_label=action_label,
+                kinetics_label=str(t.get("kinetics_label") or ""),
+                confidence=float(t.get("action_confidence") or 0.0),
+            ))
+
+        for o in observations:
             session.add(TrackletObservation(
                 tracklet_id=tracklet_id,
-                frame_index=frame_index,
+                frame_index=o["frame_index"],
                 timestamp_second=o["timestamp_second"],
                 bbox=o["bbox"],
                 confidence=o["confidence"],

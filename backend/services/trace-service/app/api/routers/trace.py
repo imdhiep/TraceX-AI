@@ -498,7 +498,11 @@ def _tracklet_to_preview(t: Tracklet) -> CandidateTrackletPreview:
         start_offset_seconds=start_offset,
         end_offset_seconds=end_offset,
         duration_seconds=duration,
-        crop_url=t.crop_url or None,
+        crop_url=(
+            f"{t.crop_url}{'&' if '?' in t.crop_url else '?'}v={int(t.updated_at.timestamp() * 1_000_000)}"
+            if t.crop_url and getattr(t, "updated_at", None) is not None
+            else t.crop_url or None
+        ),
         representative_bbox=[float(v) for v in (t.representative_bbox or [])] or None,
         quality_score=float(t.quality_score) if t.quality_score is not None else None,
         confidence=float(t.quality_score) if t.quality_score is not None else None,
@@ -640,10 +644,22 @@ def remove_candidate_tracklet(
     remaining_count = len(remaining_rows)
 
     first_tracklet_id = remaining_rows[0].tracklet_id
-    candidate.preview_url = f"/candidates/{first_tracklet_id}/preview"
     first_tracklet = session.scalar(
         select(Tracklet).where(Tracklet.tracklet_id == first_tracklet_id)
     )
+    # Cache-bust preview URL with the new representative tracklet's updated_at
+    # (mirrors _preview_url_for in query-service/candidates.py — keep the URL
+    # shape in sync so frontends only need one parser).
+    if first_tracklet is not None and getattr(first_tracklet, "updated_at", None) is not None:
+        try:
+            _v = int(first_tracklet.updated_at.timestamp() * 1_000_000)
+            new_preview_url = f"/candidates/{first_tracklet_id}/preview?v={_v}"
+        except Exception:
+            new_preview_url = f"/candidates/{first_tracklet_id}/preview"
+    else:
+        new_preview_url = f"/candidates/{first_tracklet_id}/preview"
+    candidate.preview_url = new_preview_url
+
     if first_tracklet and first_tracklet.appearance_summary:
         candidate.appearance_summary = first_tracklet.appearance_summary
 
@@ -656,6 +672,11 @@ def remove_candidate_tracklet(
         "candidate_id": candidate_id,
         "tracklet_id": tracklet_id,
         "remaining_tracklet_count": remaining_count,
+        # Frontend should overwrite the card thumbnail with this — otherwise
+        # the deleted tracklet's crop keeps showing because the URL hadn't
+        # changed.
+        "new_preview_url": new_preview_url,
+        "new_representative_tracklet_id": first_tracklet_id,
         "message": "Tracklet removed from candidate",
     }
 
