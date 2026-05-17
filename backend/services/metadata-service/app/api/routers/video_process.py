@@ -108,11 +108,30 @@ VLM_BATCH_MAX_NEW_TOKENS_PER_CROP = _get_positive_env_int(
 # tăng (kỳ vọng 30-50%), nhưng độ tinh khiết group tăng đáng kể.
 # Component margin 0.03 → 0.05 → floor = 0.85 (cùng giá trị threshold cũ),
 # vẫn cho phép expand group qua các fragment trung gian.
-FRAGMENT_MERGE_SIM_THRESHOLD = _get_env_float("FRAGMENT_MERGE_SIM_THRESHOLD", 0.89)
-FRAGMENT_MERGE_MAX_GAP_SECONDS = _get_env_float("FRAGMENT_MERGE_MAX_GAP_SECONDS", 180.0)
+# 2026-05-17: tightened after audit showed hospital-uniform false-positive
+# merges (group span 500-600s on 10-min videos, 18 fragments → 1 candidate).
+#   SIM_THRESHOLD 0.89 → 0.93 : cosine 0.89-0.92 is ambiguous for uniformed
+#     subjects (e.g. nurses in similar scrubs); 0.93 excludes the ambiguous band.
+#   MAX_GAP_SECONDS 180 → 30 : long-gap appearance bridges across 2-3 minutes
+#     are almost always a different person passing through, not the same person
+#     returning. BoT-SORT already covers short-gap re-entry inside track_buffer.
+#   MAX_SPEED_PX_PER_S 800 → 300 : 800 px/s overstates hospital walking speed
+#     (~150-300 px/s) and made the spatial gate ineffective. 300 px/s rejects
+#     cross-frame appearance bridges with implausible displacement.
+FRAGMENT_MERGE_SIM_THRESHOLD = _get_env_float("FRAGMENT_MERGE_SIM_THRESHOLD", 0.93)
+FRAGMENT_MERGE_MAX_GAP_SECONDS = _get_env_float("FRAGMENT_MERGE_MAX_GAP_SECONDS", 30.0)
 FRAGMENT_MERGE_COMPONENT_MARGIN = _get_env_float("FRAGMENT_MERGE_COMPONENT_MARGIN", 0.02)
-FRAGMENT_MERGE_MAX_SPEED_PX_PER_S = _get_env_float("FRAGMENT_MERGE_MAX_SPEED_PX_PER_S", 800.0)
+FRAGMENT_MERGE_MAX_SPEED_PX_PER_S = _get_env_float("FRAGMENT_MERGE_MAX_SPEED_PX_PER_S", 300.0)
 FRAGMENT_MERGE_SPATIAL_BYPASS_MARGIN = _get_env_float("FRAGMENT_MERGE_SPATIAL_BYPASS_MARGIN", 0.05)
+# 2026-05-17: hard cap on the appearance-pass spatial budget. Without this,
+# at gap=30s with max_speed=300 the budget reaches 9000 px (wider than any
+# FOV) → spatial gate becomes a no-op. 400 px ≈ 1/5 of 1080p width, matching
+# plausible cross-frame travel for one continuous appearance. 0 disables.
+FRAGMENT_MERGE_MAX_SPATIAL_DIST_PX = _get_env_float("FRAGMENT_MERGE_MAX_SPATIAL_DIST_PX", 400.0)
+# Motion-merge appearance floor — block "two different people crossing at the
+# same point" (dist≈0px but cos far below sim_thresh). Stays below sim_thresh
+# so SigLIP-borderline same-person rescues remain possible.
+FRAGMENT_MERGE_MOTION_MIN_SIM = _get_env_float("FRAGMENT_MERGE_MOTION_MIN_SIM", 0.85)
 
 
 # ---------------------------------------------------------------------------
@@ -2054,6 +2073,81 @@ def _batch_siglip_embeddings(
         )
         return cv2.resize(pad, (size, size), interpolation=cv2.INTER_LINEAR)
 
+    def _select_siglip_observation_entries(lt, *, min_frames: int = 5, max_frames: int = 8) -> list[dict]:
+        """Pick quality-aware, temporally diverse observations for identity embedding."""
+        entries: list[dict] = []
+        for order, o in enumerate(lt.observations):
+            frame = frame_lookup.get(o.frame_index)
+            if frame is None:
+                continue
+            h, w = frame.shape[:2]
+            x1, y1, x2, y2 = (float(v) for v in o.bbox)
+            bw = max(0.0, min(float(w), x2) - max(0.0, x1))
+            bh = max(0.0, min(float(h), y2) - max(0.0, y1))
+            if bw <= 1.0 or bh <= 1.0:
+                continue
+            edge_clear = min(
+                max(0.0, x1),
+                max(0.0, y1),
+                max(0.0, float(w) - x2),
+                max(0.0, float(h) - y2),
+            )
+            edge_norm = min(1.0, edge_clear / max(1.0, 0.04 * min(h, w)))
+            edge_touch = x1 <= 1.0 or y1 <= 1.0 or x2 >= float(w - 1) or y2 >= float(h - 1)
+            entries.append({
+                "order": order,
+                "obs": o,
+                "frame": frame,
+                "bbox": [float(v) for v in o.bbox],
+                "area": bw * bh,
+                "lap": float(getattr(o, "laplacian_score", 0.0) or 0.0),
+                "conf": float(getattr(o, "confidence", 0.0) or 0.0),
+                "edge_norm": edge_norm,
+                "edge_touch": edge_touch,
+                "low_quality": bool(getattr(o, "is_low_quality_crop", False)),
+            })
+        if not entries:
+            return []
+
+        max_area = max((e["area"] for e in entries), default=1.0) or 1.0
+        max_lap = max((e["lap"] for e in entries), default=1.0) or 1.0
+        for e in entries:
+            area_norm = e["area"] / max_area
+            lap_norm = min(1.0, e["lap"] / max_lap)
+            score = (
+                0.38 * lap_norm
+                + 0.30 * area_norm
+                + 0.20 * e["conf"]
+                + 0.12 * e["edge_norm"]
+            )
+            if e["low_quality"]:
+                score -= 0.35
+            if e["edge_touch"]:
+                score -= 0.20
+            e["score"] = score
+
+        if len(entries) <= min_frames:
+            return entries
+
+        target = min(max_frames, len(entries))
+        target = max(min_frames, target)
+        chosen: set[int] = set()
+        boundaries = np.linspace(0, len(entries), target + 1, dtype=int)
+        for i in range(target):
+            start_i, end_i = int(boundaries[i]), int(boundaries[i + 1])
+            if end_i <= start_i:
+                continue
+            best_i = max(range(start_i, end_i), key=lambda idx: entries[idx]["score"])
+            chosen.add(best_i)
+
+        if len(chosen) < target:
+            for idx in sorted(range(len(entries)), key=lambda i: entries[i]["score"], reverse=True):
+                chosen.add(idx)
+                if len(chosen) >= target:
+                    break
+
+        return [entries[idx] for idx in sorted(chosen)]
+
     # ── Representative crops (384×384) from best-quality frame ───────────────
     # best_obs is determined once here; the same crop feeds both SigLIP and Qwen.
     all_rep_crops: list[Image.Image] = []
@@ -2148,30 +2242,20 @@ def _batch_siglip_embeddings(
         return torch.cat(feats_chunks, dim=0)
 
     # ── SigLIP2 multi-frame pool-avg — for fragment merge ────────────────────
-    # Use PER-OBSERVATION bbox (not the frozen rep_bbox), so each of the 5
-    # sampled crops actually contains the person. Without this, a tracklet of
-    # a moving person ends up averaging crops where 3/5 frames hit background.
-    # The frame-bbox pairs are built from lt.observations to stay aligned.
+    # Use quality-aware temporal buckets and PER-OBSERVATION bbox (not the
+    # frozen rep_bbox), so selected crops are sharp, less edge-clipped, and
+    # still spread across the tracklet.
     siglip_multi_feats = [[] for _ in t_data]
     if model_sip and proc_sip and t_data:
         try:
             siglip_crops, siglip_slices = [], []
             for lt, t_idx, rep_bbox, t_frames in t_data:
-                # Build (frame, bbox) pairs aligned by observation order.
-                obs_pairs: list[tuple[np.ndarray, list[float]]] = []
-                if frame_lookup:
-                    for o in lt.observations:
-                        fr = frame_lookup.get(o.frame_index)
-                        if fr is not None:
-                            obs_pairs.append((fr, [float(v) for v in o.bbox]))
+                selected_entries = _select_siglip_observation_entries(lt) if frame_lookup else []
 
-                if obs_pairs:
-                    n = min(5, len(obs_pairs))
-                    indices = np.linspace(0, len(obs_pairs) - 1, n, dtype=int)
+                if selected_entries:
                     start = len(siglip_crops)
-                    for idx in indices:
-                        fr, bbox = obs_pairs[idx]
-                        c = _extract_crop(fr, bbox, 384)
+                    for entry in selected_entries:
+                        c = _extract_crop(entry["frame"], entry["bbox"], 384)
                         if c is not None:
                             siglip_crops.append(Image.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB)))
                     siglip_slices.append((start, len(siglip_crops)))
@@ -2335,6 +2419,38 @@ def _process_video_sync(
 
     logger.warning("[pipeline] %s: %d detections across %d sampled frames", video_id, total_raw, len(detections_by_frame))
 
+    # ── Diagnostic: detection density + confidence distribution ──────────────
+    # Helps answer "is tracking losing the person, or is the detector?".
+    # frames_with_no_det = sampled frames where RT-DETR found nothing —
+    #   if this is high, the gap is in detection, not tracking.
+    # conf histogram shows how many dets are stuck in the low-conf band
+    #   (0.22, 0.30) which BoT-SORT cannot use to start a new track.
+    _det_diag = {
+        "frames_with_no_det": sum(1 for v in detections_by_frame.values() if not v),
+        "det_conf_lt_030": 0,
+        "det_conf_030_050": 0,
+        "det_conf_050_080": 0,
+        "det_conf_ge_080": 0,
+        "det_lap_lt_25": 0,
+    }
+    for v in detections_by_frame.values():
+        for d in v:
+            c = d.confidence
+            if c < 0.30: _det_diag["det_conf_lt_030"] += 1
+            elif c < 0.50: _det_diag["det_conf_030_050"] += 1
+            elif c < 0.80: _det_diag["det_conf_050_080"] += 1
+            else: _det_diag["det_conf_ge_080"] += 1
+            if d.laplacian_score < 25.0:
+                _det_diag["det_lap_lt_25"] += 1
+    logger.info(
+        "[diag-det] %s: empty_frames=%d/%d  conf<0.30=%d  0.30-0.50=%d  0.50-0.80=%d  >=0.80=%d  lap<25=%d",
+        video_id,
+        _det_diag["frames_with_no_det"], len(detections_by_frame),
+        _det_diag["det_conf_lt_030"], _det_diag["det_conf_030_050"],
+        _det_diag["det_conf_050_080"], _det_diag["det_conf_ge_080"],
+        _det_diag["det_lap_lt_25"],
+    )
+
     import torch as _torch
 
     if total_raw == 0:
@@ -2350,14 +2466,27 @@ def _process_video_sync(
     # TRACER_BACKEND=adaptive to fall back to the legacy BodyPartAdaptiveTracker
     # (kept in tracking_pipeline.py for camera_0002 benchmarks).
     _fps_ratio_self = sample_fps / 4.0             # 3fps→0.75, 4fps→1.0, 6fps→1.5
-    _track_buffer = max(int(round(20 * _fps_ratio_self)), 8)
+    # BoT-SORT adapter accepts track_buffer as effective sampled-frame lost
+    # buffer and converts it to BoxMOT's 30-FPS-scaled constructor argument.
+    # At the 6 FPS default this is 30 sampled frames ≈ 5 seconds.
+    _botsort_track_buffer = max(int(round(5.0 * sample_fps)), 8)
+    # Legacy adaptive tracker used 20 frames at 4 FPS, also ≈ 5 seconds.
+    _adaptive_track_buffer = max(int(round(20 * _fps_ratio_self)), 8)
     if is_botsort_backend():
         tracker = BotSortTracker(
             track_thresh=0.30,
             low_thresh=0.10,
             new_track_threshold=0.30,
-            match_thresh=0.80,                # bench-selected IoU association
-            track_buffer=_track_buffer,
+            # match_thresh in boxmot = upper bound on (1 - IoU) cost. 0.85
+            # → accept match when IoU ≥ 0.15, 0.80 → IoU ≥ 0.20 (tight).
+            # Loosened from 0.80 → 0.85 to address "track id jumps mid-FOV while
+            # person walks normally": at 6 FPS with fast walkers near the camera,
+            # adjacent-frame IoU can drop below 0.20 → match fails → BoT-SORT
+            # spawns a new id. 0.85 is a middle ground: looser than 0.80 so the
+            # tracker survives fast walkers, tighter than 0.90 so it does not
+            # accept cross-person matches when two people pass close together.
+            match_thresh=0.85,
+            track_buffer=_botsort_track_buffer,
             frame_rate=max(sample_fps, 1),
             min_track_frames=2,
             min_track_density=0.03,
@@ -2392,12 +2521,31 @@ def _process_video_sync(
             max_center_jump_ratio=2.0 * _fps_ratio_4,
             min_active_iou_short_gap=0.0,
             max_phantom_frames=1,
-            track_buffer=_track_buffer,
+            track_buffer=_adaptive_track_buffer,
             max_buffer_frames=max(int(round(300 * _fps_ratio_self)), 100),
         )
         logger.warning("[pipeline] %s: tracker backend = BodyPartAdaptiveTracker (legacy)", video_id)
     local_tracklets = tracker.track(video_id, camera_id, detections_by_frame)
     logger.warning("[pipeline] %s: %d raw tracklets from tracker", video_id, len(local_tracklets))
+
+    # ── Diagnostic: tracklet length/gap distribution from the tracker ────────
+    # If many tracklets are short (2-4 obs) the tracker is breaking IDs mid-FOV.
+    # split_ids = tracklets whose id ends with "_sN" (post-association split guard
+    # broke a BoT-SORT join). High count means the guard is firing a lot.
+    if local_tracklets:
+        _lengths = [len(t.observations) for t in local_tracklets]
+        _spans = [
+            max(t.observations[-1].frame_index - t.observations[0].frame_index + 1, 1)
+            for t in local_tracklets
+        ]
+        _split_ids = sum(1 for t in local_tracklets if "_s" in t.track_id)
+        _short = sum(1 for L in _lengths if L <= 4)
+        _med_len = sorted(_lengths)[len(_lengths) // 2]
+        _med_span_s = sorted(_spans)[len(_spans) // 2] / max(sample_fps, 1)
+        logger.info(
+            "[diag-track] %s: median_len=%d  median_span=%.1fs  short(<=4obs)=%d/%d  split_fragments=%d",
+            video_id, _med_len, _med_span_s, _short, len(local_tracklets), _split_ids,
+        )
 
     # Stage 4: Quality filter — siết để loại tracklet stub trước khi vào
     # SigLIP merge và Qwen captioning. Trước: 1893 vào → 1892 ra (filter
@@ -2412,14 +2560,32 @@ def _process_video_sync(
     )
     quality_results = {t.track_id: scorer.score(t) for t in local_tracklets}
     accepted = [t for t in local_tracklets if quality_results[t.track_id].accepted]
-    rejected_reasons = {}
+    rejected_reasons: dict = {}
+    # Per-reason length / Laplacian / duration stats so we can see whether the
+    # rejected tracklets are obviously bad (≤2 obs, lap<5) or borderline real
+    # (15 obs, lap 22) — borderline rejections suggest the gate is too tight.
+    _rej_detail: dict[str, list[tuple[int, float, float]]] = {}
     for t in local_tracklets:
         q = quality_results[t.track_id]
         if not q.accepted:
             r = q.rejection_reason or "unknown"
             rejected_reasons[r] = rejected_reasons.get(r, 0) + 1
+            _rej_detail.setdefault(r, []).append(
+                (q.frame_count, q.average_laplacian, q.duration_seconds)
+            )
     logger.warning("[pipeline] %s: %d accepted, %d rejected %s",
                    video_id, len(accepted), len(local_tracklets) - len(accepted), rejected_reasons)
+    for reason, samples in _rej_detail.items():
+        if not samples:
+            continue
+        ns = [s[0] for s in samples]; laps = [s[1] for s in samples]; durs = [s[2] for s in samples]
+        logger.info(
+            "[diag-stage4] %s: reason=%s  n=%d  median_obs=%d  median_lap=%.1f  median_dur=%.2fs",
+            video_id, reason, len(samples),
+            sorted(ns)[len(ns) // 2],
+            sorted(laps)[len(laps) // 2],
+            sorted(durs)[len(durs) // 2],
+        )
 
     # Stage 5-7: TRUE batch feature extraction — 1 GPU call per model for ALL tracklets
     frame_lookup = {sf.frame_index: sf.image for sf in sampled_frames}
@@ -2451,6 +2617,8 @@ def _process_video_sync(
         component_similarity_margin=FRAGMENT_MERGE_COMPONENT_MARGIN,
         max_speed_px_per_s=FRAGMENT_MERGE_MAX_SPEED_PX_PER_S,
         spatial_bypass_margin=FRAGMENT_MERGE_SPATIAL_BYPASS_MARGIN,
+        max_spatial_dist_px=FRAGMENT_MERGE_MAX_SPATIAL_DIST_PX,
+        motion_merge_min_appearance_sim=FRAGMENT_MERGE_MOTION_MIN_SIM,
     )
     _orig_accepted = list(accepted)
     _t_merge = time.perf_counter()
@@ -2464,8 +2632,27 @@ def _process_video_sync(
         video_id, _vlm_progress_bar(_n_raw, _n_raw), _n_raw, _n_raw,
         len(accepted), _n_merged, len(_multi_groups), _merge_elapsed,
     )
+    # Enriched per-group log: covers track_ids + total time-span. A group whose
+    # time-span is much wider than any plausible single appearance, or whose
+    # track_ids include known different people, is a likely over-merge.
+    # `_orig_accepted` holds the pre-merge tracklets aligned with _groups
+    # indices.
     for _gi, _g in enumerate(_multi_groups):
-        logger.info("[merge] %s:   group %d: %d fragments → 1", video_id, _gi + 1, len(_g))
+        members = [_orig_accepted[i] for i in _g if 0 <= i < len(_orig_accepted)]
+        if not members:
+            logger.info("[merge] %s:   group %d: %d fragments → 1 (empty)", video_id, _gi + 1, len(_g))
+            continue
+        members.sort(key=lambda t: t.observations[0].timestamp_second if t.observations else 0.0)
+        starts = [m.observations[0].timestamp_second for m in members if m.observations]
+        ends = [m.observations[-1].timestamp_second for m in members if m.observations]
+        span_s = (max(ends) - min(starts)) if starts and ends else 0.0
+        tids = ",".join(str(m.track_id) for m in members[:12])
+        if len(members) > 12:
+            tids += f"...(+{len(members) - 12})"
+        logger.info(
+            "[merge] %s:   group %d: %d fragments → 1  span=%.1fs  tids=%s",
+            video_id, _gi + 1, len(_g), span_s, tids,
+        )
 
     def _pool_avg_normalized(vecs: list) -> list:
         """Average a list of (possibly already-normalized) vectors, then L2-normalize.
@@ -2479,9 +2666,8 @@ def _process_video_sync(
             return arr.tolist()
         return (arr / n).tolist()
 
-    # Pool the multi-frame SigLIP features (5 crops/fragment @ 384px, richer
-    # signal -- matches SigLIP-2 so400m-patch14-384 native resolution) for the
-    # DB-stored embedding, instead of the single-crop variant.
+    # Pool the quality-aware multi-frame SigLIP features (5-8 crops/fragment
+    # @ 384px) for the DB-stored embedding, instead of the single-crop variant.
     all_siglip_embeddings = [
         _pool_avg_normalized([siglip_multi_feats[i] for i in g]) for g in _groups
     ]
