@@ -27,6 +27,15 @@ html.dark body {
   font-size: 13px;
   color: rgb(30 41 59);
 }
+.rdp-tracex .rdp-months {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  gap: 24px;
+}
+.rdp-tracex .rdp-month {
+  flex: 0 0 auto;
+}
 html.dark .rdp-tracex {
   --rdp-accent-background-color: rgba(59, 130, 246, 0.25);
   color: rgb(226 232 240);

@@ -282,7 +282,7 @@ export function SearchBar({ className = "" }: SearchBarProps) {
           ) : null}
         </div>
 
-        <div className="relative" ref={dateRef}>
+        <div className="relative z-40" ref={dateRef}>
           <button
             type="button"
             onClick={() => setDateOpen((prev) => !prev)}
@@ -293,7 +293,7 @@ export function SearchBar({ className = "" }: SearchBarProps) {
             {formatRangeLabel(filters.timeFrom, filters.timeTo)}
           </button>
           {dateOpen ? (
-            <div className="absolute left-0 top-[calc(100%+8px)] z-40 rounded-2xl border border-slate-200/90 bg-white/95 p-3 shadow-[0_18px_36px_rgba(15,23,42,0.16)] backdrop-blur-md dark:border-slate-700/90 dark:bg-slate-950/95 dark:shadow-[0_24px_50px_rgba(2,6,23,0.45)]">
+            <div className="absolute left-0 top-[calc(100%+8px)] z-[100] w-max max-w-[calc(100vw-2rem)] rounded-2xl border border-slate-200/90 bg-white/95 p-3 shadow-[0_18px_36px_rgba(15,23,42,0.16)] backdrop-blur-md dark:border-slate-700/90 dark:bg-slate-950/95 dark:shadow-[0_24px_50px_rgba(2,6,23,0.45)]">
               <DayPicker
                 mode="range"
                 numberOfMonths={2}
