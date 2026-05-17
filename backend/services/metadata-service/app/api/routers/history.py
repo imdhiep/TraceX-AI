@@ -59,8 +59,14 @@ def _preview_url_for(tracklet: Tracklet | None) -> str:
 
 
 def _preview_tracklet_id(preview_url: str | None) -> str | None:
-    """Extract `/candidates/{tracklet_id}/preview` when an old persisted
-    candidate preview URL still identifies a surviving representative."""
+    """Recover the representative tracklet id from persisted preview URLs.
+
+    Fresh search results now prefer `/static/crops/{tracklet_id}.jpg`, while
+    older rows and trace-service replacement previews use
+    `/candidates/{tracklet_id}/preview`. History must understand both forms so
+    it can keep showing the same representative image that search originally
+    persisted for the candidate.
+    """
     raw = str(preview_url or "").strip()
     if not raw:
         return None
@@ -70,6 +76,11 @@ def _preview_tracklet_id(preview_url: str | None) -> str | None:
         return None
     if len(parts) >= 3 and parts[-3] == "candidates" and parts[-1] == "preview":
         return parts[-2]
+    if len(parts) >= 3 and parts[-3] == "static" and parts[-2] == "crops":
+        filename = parts[-1]
+        stem, dot, ext = filename.rpartition(".")
+        if dot and stem and ext.lower() in {"jpg", "jpeg", "png", "webp", "gif"}:
+            return stem
     return None
 
 
@@ -194,10 +205,10 @@ def get_history_candidates(
         .order_by(QueryCandidate.rank_position.asc(), QueryCandidate.id.asc())
     ).all()
 
-    # Load current member tracklets in persisted membership order. The first
-    # member is the same fallback representative used by trace-service after a
-    # manual removal; if the old persisted preview still names a surviving
-    # member, we preserve that rep instead.
+    # Load current member tracklets in persisted membership order. The persisted
+    # candidate preview is the only acceptable history thumbnail: if the old
+    # representative disappeared after reprocessing/manual cleanup, return no
+    # thumbnail rather than silently substituting a different tracklet.
     tracklets_by_candidate: dict[str, list[Tracklet]] = {}
     tracklet_summaries: dict[str, list[dict]] = {}
     if candidates:
@@ -236,11 +247,16 @@ def get_history_candidates(
             continue
 
         persisted_rep_id = _preview_tracklet_id(c.preview_url)
-        rep = next(
+        persisted_rep = next(
             (t for t in members if t.tracklet_id == persisted_rep_id),
-            members[0] if members else None,
+            None,
         )
-        thumbnail_url = _preview_url_for(rep)
+        if persisted_rep is not None and c.preview_url:
+            # Preserve the exact representative thumbnail persisted by /search
+            # (or later updated by trace-service after a manual removal).
+            thumbnail_url = c.preview_url
+        else:
+            thumbnail_url = ""
         raw_description = c.appearance_summary or ""
         description = description_map.get(raw_description, raw_description)
         results.append({

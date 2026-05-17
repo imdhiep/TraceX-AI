@@ -117,14 +117,20 @@ export function VideoCard({ video, onClick, onToggleSelect, isSelected = false, 
   const body = (
     <>
       <div className="relative aspect-video w-full overflow-hidden bg-surface-muted">
-        <Image
-          src={video.thumbnailUrl}
-          alt={label || "Candidate"}
-          fill
-          unoptimized
-          className="object-cover transition duration-300 group-hover:scale-105"
-          sizes="(max-width: 768px) 50vw, 20vw"
-        />
+        {video.thumbnailUrl ? (
+          <Image
+            src={video.thumbnailUrl}
+            alt={label || "Candidate"}
+            fill
+            unoptimized
+            className="object-cover transition duration-300 group-hover:scale-105"
+            sizes="(max-width: 768px) 50vw, 20vw"
+          />
+        ) : (
+          <div className="flex h-full w-full items-center justify-center text-xs font-medium text-ink-secondary">
+            Ảnh đại diện hiện không tồn tại
+          </div>
+        )}
       </div>
       <div className="flex flex-1 flex-col gap-1 p-3">
         <p className="line-clamp-2 text-sm font-semibold text-ink">{label}</p>

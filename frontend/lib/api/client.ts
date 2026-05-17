@@ -429,7 +429,7 @@ export async function getHistoryCandidates(
     description: row.description,
     thumbnailUrl: isLikelyImageUrl(row.thumbnail_url)
       ? resolveMediaUrl(row.thumbnail_url, apiBaseUrl)
-      : placeholderThumbnail(row.id),
+      : "",
     queryId: row.query_id,
     rank: row.rank_position,
     trackletCount: row.tracklet_count,

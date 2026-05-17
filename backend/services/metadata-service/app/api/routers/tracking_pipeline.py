@@ -1248,8 +1248,8 @@ class TrackletFragmentMerger:
         # extrapolation không đáng tin, dùng tight foot-point gate thay thế.
         # R4: min_obs_each_side — cả ti và tj phải có ≥ obs này để velocity
         # reliable.
-        motion_merge_max_gap_seconds: float = 4.0,
-        motion_merge_max_extrap_ratio: float = 0.5,
+        motion_merge_max_gap_seconds: float = 10.0,
+        motion_merge_max_extrap_ratio: float = 1.0,
         motion_merge_max_velocity_angle_deg: float = 60.0,
         motion_merge_min_velocity_px_per_s: float = 20.0,
         motion_merge_min_obs_each_side: int = 3,
