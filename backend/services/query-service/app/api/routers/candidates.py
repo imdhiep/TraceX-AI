@@ -1,15 +1,17 @@
 """Candidates search router for query-service.
 
 Flow:
-1. metadata-service (/api/v1/search) forwards request here
-2. Local text pre-filter → shortlist candidates (sorted by text relevance)
-3. Union-find merge: group tracklets by cosine similarity + metadata + temporal/camera guards
-4. Save QueryCandidate + QueryCandidateTracklet rows, format and return results
+1. Direct JSON/multipart search request arrives here (metadata-service proxy remains compatible)
+2. text-only keeps the historical text/SigLIP path
+3. image-only retrieves the full gallery by PersonViT ReID similarity only
+4. image+text unions PersonViT retrieval with SigLIP/metadata recall, while image keeps rank priority
+5. Union-find merge, persist QueryCandidate rows, then format results
 """
 
 from __future__ import annotations
 
 import heapq
+import io
 import json
 import logging
 import math
@@ -23,8 +25,9 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
+from starlette.datastructures import UploadFile as StarletteUploadFile
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -38,8 +41,9 @@ class SearchRequest(BaseModel):
     time_from: str | None = None
     time_to: str | None = None
     query_image_url: str | None = None  # URL of uploaded query image (for history display)
-    query_image_path: str | None = None  # local shared-storage path for image encoding
-    user_id: int = 1  # injected by metadata-service from JWT; fallback=1 for direct calls
+    query_image_path: str | None = None  # local path for image encoding
+    persist_query: bool = False
+    user_id: int | None = None  # overwritten from JWT by the public runtime
     # When the frontend paginates (offset > 0) it can pass back the qid returned by
     # the first call so we reuse the same query_history row instead of creating a
     # new one per page. The full ranked set is persisted for history, while each
@@ -49,10 +53,11 @@ class SearchRequest(BaseModel):
 from shared.database import SessionLocal
 from shared.models import (
     QueryCandidate, QueryCandidateTracklet, QueryHistory,
-    Tracklet, TrackletAction, Video,
+    Tracklet, TrackletAction, TrackletEmbedding, Video,
 )
 from shared.tracklet_time import tracklet_time_seconds, tracklet_time_window
 from app.config import settings
+from app.services.auth_runtime import get_current_user_id
 from app.services.translation import (
     detect_vietnamese,
     translate_to_english,
@@ -437,21 +442,23 @@ def _local_prefilter(
 def _preview_url_for(tracklet) -> str:
     """Cache-busted preview URL for a tracklet's representative crop.
 
-    Crop filenames are deterministic (`{video_id}_{camera_id}_{t_idx}.jpg`),
-    so when a video is re-processed the file is overwritten but the URL
-    stays the same — browsers serve the stale 24h-cached thumbnail. Append
-    the tracklet's updated_at epoch so re-ingest invalidates the cache.
+    Prefer the direct static crop URL so direct query-service search does not
+    depend on metadata-service just to render thumbnails. Fall back to the
+    legacy preview endpoint only when the tracklet has no saved crop URL.
     """
     tid = getattr(tracklet, "tracklet_id", "") if tracklet is not None else ""
     if not tid:
         return ""
     ts = getattr(tracklet, "updated_at", None)
+    crop_url = str(getattr(tracklet, "crop_url", "") or "").strip()
+    base = crop_url or f"/candidates/{tid}/preview"
     if ts is None:
-        return f"/candidates/{tid}/preview"
+        return base
     try:
-        return f"/candidates/{tid}/preview?v={int(ts.timestamp() * 1_000_000)}"
+        sep = "&" if "?" in base else "?"
+        return f"{base}{sep}v={int(ts.timestamp() * 1_000_000)}"
     except Exception:
-        return f"/candidates/{tid}/preview"
+        return base
 
 
 # ── Identity merge: cosine similarity + temporal/camera guards + union-find ───
@@ -459,14 +466,16 @@ def _preview_url_for(tracklet) -> str:
 # 2026-05-17: default 0.9 → 0.75 after Re-ID swap DINOv2 → PersonViT-S.
 # Bench on camera_0002 (894 positive + 7710 hard-negative pairs) shows
 # PersonViT cosine distribution is much sharper than DINOv2/SigLIP:
-#   thr 0.75 → precision 92.9%, recall 75.7%   ★ ingest-side merger default
-#   thr 0.80 → precision 96.2%, recall 70.5%
+#   thr 0.75 → precision 92.9%, recall 75.7%
+#   thr 0.80 → precision 96.2%, recall 70.5%   ★ ingest-side default
 #   thr 0.90 → precision 96.8%, recall 26.5%   ← DINOv2-era default (way too strict
 #                                                 for PersonViT — under-merges hard)
-# Keep query-side default in sync with ingest-side FRAGMENT_MERGE_SIM_THRESHOLD;
-# they should agree so cross-video identity grouping isn't tighter than the
-# within-video fragment grouping.
-_MERGE_THRESHOLD = float(os.getenv("QUERY_REID_MERGE_THRESHOLD", os.getenv("QUERY_MERGE_THRESHOLD", "0.75")))
+# Query-side intentionally runs tighter than ingest now (0.82 vs 0.80): a
+# cross-video search lump that merges two visually-similar-but-different people
+# is more visible to end users than a fragment under-merge inside one video.
+# 0.82 sits between the two benchmarked points; expected ≈ 96.5%/68% based on
+# the smooth precision/recall curve — re-bench if drift is suspected.
+_MERGE_THRESHOLD = float(os.getenv("QUERY_REID_MERGE_THRESHOLD", os.getenv("QUERY_MERGE_THRESHOLD", "0.82")))
 _IDENTITY_FALLBACK_TO_SIGLIP = os.getenv("QUERY_REID_FALLBACK_TO_SIGLIP", "0").strip().lower() in {
     "1", "true", "yes", "on",
 }
@@ -632,6 +641,198 @@ def _resolve_query_image_source(image_url: str) -> str:
     return raw
 
 
+_IMAGE_EXT_BY_TYPE = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+_IMAGE_QUERY_REID_LIMIT = _get_positive_env_int("IMAGE_QUERY_REID_LIMIT", 500)
+_IMAGE_QUERY_TEXT_VECTOR_LIMIT = _get_positive_env_int("IMAGE_QUERY_TEXT_VECTOR_LIMIT", 250)
+_IMAGE_QUERY_TEXT_PREFILTER_LIMIT = _get_positive_env_int("IMAGE_QUERY_TEXT_PREFILTER_LIMIT", 200)
+_IMAGE_TEXT_REID_WEIGHT = float(os.getenv("IMAGE_TEXT_REID_WEIGHT", "0.80"))
+_IMAGE_TEXT_SIGLIP_WEIGHT = float(os.getenv("IMAGE_TEXT_SIGLIP_WEIGHT", "0.15"))
+_IMAGE_TEXT_METADATA_WEIGHT = float(os.getenv("IMAGE_TEXT_METADATA_WEIGHT", "0.05"))
+
+
+def _form_int(value: object, default: int) -> int:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _form_bool(value: object, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _query_image_extension(filename: str | None, content_type: str | None) -> str:
+    if content_type:
+        ext = _IMAGE_EXT_BY_TYPE.get(content_type.lower())
+        if ext:
+            return ext
+    suffix = Path(filename or "").suffix.lower()
+    if suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+        return ".jpg" if suffix == ".jpeg" else suffix
+    return ".jpg"
+
+
+async def _save_query_image(upload: StarletteUploadFile) -> tuple[str, str]:
+    content_type = (upload.content_type or "").lower()
+    if content_type and not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Chỉ hỗ trợ file ảnh cho query_image.")
+
+    content = await upload.read(settings.max_query_image_bytes + 1)
+    if not content:
+        raise HTTPException(status_code=400, detail="Ảnh truy vấn đang trống.")
+    if len(content) > settings.max_query_image_bytes:
+        raise HTTPException(status_code=413, detail="Ảnh truy vấn không được vượt quá 5MB.")
+
+    settings.query_image_root.mkdir(parents=True, exist_ok=True)
+    ext = _query_image_extension(upload.filename, content_type)
+    filename = f"{uuid.uuid4().hex}{ext}"
+    path = settings.query_image_root / filename
+    path.write_bytes(content)
+    return f"/static/query-images/{filename}", str(path)
+
+
+async def _parse_search_request(request: Request) -> SearchRequest:
+    content_type = request.headers.get("content-type", "").lower()
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+        camera_ids = [
+            str(value).strip()
+            for value in form.getlist("camera_ids")
+            if str(value).strip()
+        ]
+        body = SearchRequest(
+            query=str(form.get("query") or ""),
+            text=str(form.get("text") or "") or None,
+            top_k=_form_int(form.get("top_k"), 20),
+            offset=_form_int(form.get("offset"), 0),
+            camera_ids=camera_ids or None,
+            time_from=str(form.get("time_from") or "") or None,
+            time_to=str(form.get("time_to") or "") or None,
+            persist_query=_form_bool(form.get("persist_query")),
+            query_id=str(form.get("query_id") or "") or None,
+        )
+        query_image = form.get("query_image")
+        if isinstance(query_image, StarletteUploadFile) and query_image.filename:
+            image_url, image_path = await _save_query_image(query_image)
+            body.query_image_url = image_url
+            body.query_image_path = image_path
+        return body
+
+    try:
+        raw_body = await request.json()
+    except Exception:
+        raw_body = {}
+    return SearchRequest(**(raw_body or {}))
+
+
+def _load_query_image(image_url: str):
+    if not image_url:
+        return None
+    from PIL import Image
+
+    image_source = _resolve_query_image_source(image_url)
+    if image_source.startswith(("http://", "https://")):
+        import urllib.request
+        with urllib.request.urlopen(image_source, timeout=10) as resp:
+            return Image.open(io.BytesIO(resp.read())).convert("RGB")
+    return Image.open(image_source).convert("RGB")
+
+
+def _crop_query_person_image(img):
+    """Return the single-person crop expected by PersonViT.
+
+    Query uploads are currently defined as one-person images, so RT-DETR only
+    chooses the highest-confidence person bbox when it can. If the detector
+    misses a tight crop, using the full image is still the least surprising
+    fallback under that contract.
+    """
+    try:
+        from app.services.model_warmup import get_device, get_model
+        import torch as _torch
+
+        model = get_model("rtdetr")
+        processor = get_model("rtdetr_processor")
+        person_ids = get_model("rtdetr_person_ids") or {0, 1}
+        if model is None or processor is None:
+            return img
+
+        device = get_device()
+        dtype = _torch.float16 if device.type == "cuda" else _torch.float32
+        inputs = processor(images=[img], return_tensors="pt")
+        inputs = {
+            k: v.to(device=device, dtype=dtype) if v.is_floating_point() else v.to(device)
+            for k, v in inputs.items()
+        }
+        with _torch.no_grad():
+            outputs = model(**inputs)
+        target_sizes = _torch.tensor([[img.height, img.width]], device=device)
+        result = processor.post_process_object_detection(
+            outputs,
+            threshold=float(os.getenv("QUERY_IMAGE_RTDETR_THRESHOLD", "0.22")),
+            target_sizes=target_sizes,
+        )[0]
+        candidates = []
+        for score, label, box in zip(result["scores"], result["labels"], result["boxes"]):
+            if int(label.item()) not in person_ids:
+                continue
+            x1, y1, x2, y2 = [float(v) for v in box.detach().cpu().tolist()]
+            if x2 <= x1 or y2 <= y1:
+                continue
+            candidates.append((float(score.item()), (x1, y1, x2, y2)))
+        if not candidates:
+            logger.info("[personvit-image] RT-DETR found no person; using full image fallback")
+            return img
+        _, bbox = max(candidates, key=lambda item: item[0])
+        return img.crop(bbox)
+    except Exception as exc:
+        logger.warning("[personvit-image] query crop failed; using full image fallback: %s", exc)
+        return img
+
+
+def _encode_query_image_personvit(image_url: str) -> list[float]:
+    """Encode a single-person query image into the 384-dim ReID space."""
+    if not image_url:
+        return []
+    try:
+        from app.services.model_warmup import get_device, get_model
+        import numpy as _np
+        import torch as _torch
+
+        model = get_model("personvit")
+        if model is None:
+            return []
+        img = _load_query_image(image_url)
+        if img is None:
+            return []
+        crop = _crop_query_person_image(img).resize((128, 256))
+        arr = _np.asarray(crop, dtype=_np.float32)
+        device = get_device()
+        dtype = _torch.float16 if device.type == "cuda" else _torch.float32
+        tensor = _torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).contiguous().to(
+            device=device,
+            dtype=dtype,
+        ) / 255.0
+        mean = _torch.tensor([0.485, 0.456, 0.406], device=device, dtype=dtype).view(1, 3, 1, 1)
+        std = _torch.tensor([0.229, 0.224, 0.225], device=device, dtype=dtype).view(1, 3, 1, 1)
+        tensor = (tensor - mean) / std
+        with _torch.no_grad():
+            out = model(tensor)
+        feats = (out[0] if isinstance(out, tuple) else out.embeddings).float()
+        feats = feats / feats.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        return feats[0].detach().cpu().float().tolist()
+    except Exception as exc:
+        logger.warning("[personvit-image] encode failed: %s", exc)
+        return []
+
+
 def _encode_query_image_siglip(image_url: str) -> list[float]:
     """Run the SigLIP image tower on an image URL or local path. Returns
     L2-normalized list of length 1152, or [] on failure."""
@@ -686,6 +887,142 @@ def _vec_score(query_vec: list[float], tracklet_vec: list[float]) -> float:
     return max(0.0, min(1.0, (c + 1.0) / 2.0))
 
 
+def _identity_score(query_vec: list[float], tracklet_vec: list[float]) -> float:
+    """PersonViT same-person score in the native cosine regime [0, 1]."""
+    if not query_vec or not tracklet_vec:
+        return 0.0
+    return max(0.0, min(1.0, _cosine_sim(query_vec, tracklet_vec)))
+
+
+def _apply_camera_filter(statement, camera_ids: list[str] | None):
+    if camera_ids:
+        cam_lower = [c.lower().strip() for c in camera_ids if c.strip()]
+        if cam_lower:
+            statement = statement.where(func.lower(Tracklet.camera_id).in_(cam_lower))
+    return statement
+
+
+def _scan_vector_tracklets(
+    session: Session,
+    *,
+    query_vec: list[float],
+    lane: str,
+    camera_ids: list[str] | None,
+    time_from: str | None,
+    time_to: str | None,
+    limit: int,
+) -> tuple[list[Tracklet], dict[str, float]]:
+    """Exact Python fallback when DB vector operators are unavailable."""
+    tf = _parse_dt(time_from)
+    tt = _parse_dt(time_to)
+    embedding_col = (
+        TrackletEmbedding.reid_embedding
+        if lane == "reid"
+        else TrackletEmbedding.siglip_embedding
+    )
+    statement = (
+        select(Tracklet)
+        .join(Video, Tracklet.video_id == Video.video_id)
+        .join(TrackletEmbedding, Tracklet.tracklet_id == TrackletEmbedding.tracklet_id)
+        .options(
+            contains_eager(Tracklet.video),
+            contains_eager(Tracklet.embedding),
+        )
+        .where(embedding_col.is_not(None))
+    )
+    statement = _apply_camera_filter(statement, camera_ids)
+    scored: list[tuple[float, int, Tracklet]] = []
+    stream = session.execute(
+        statement.execution_options(stream_results=True, yield_per=256)
+    ).scalars()
+    for row in stream:
+        if not _tracklet_overlaps_time_range(row, tf, tt):
+            continue
+        emb = _tracklet_reid_embedding(row) if lane == "reid" else _tracklet_siglip_embedding(row)
+        score = _identity_score(query_vec, emb) if lane == "reid" else _vec_score(query_vec, emb)
+        scored.append((score, row.id, row))
+    scored.sort(key=lambda item: (-item[0], -item[1]))
+    top = scored[:limit]
+    return [row for _, _, row in top], {row.tracklet_id: score for score, _, row in top}
+
+
+def _vector_retrieve_tracklets(
+    session: Session,
+    *,
+    query_vec: list[float],
+    lane: str,
+    camera_ids: list[str] | None,
+    time_from: str | None,
+    time_to: str | None,
+    limit: int,
+) -> tuple[list[Tracklet], dict[str, float]]:
+    """Retrieve the best gallery rows for a vector query over the full gallery."""
+    if not query_vec:
+        return [], {}
+    tf = _parse_dt(time_from)
+    tt = _parse_dt(time_to)
+    embedding_col = (
+        TrackletEmbedding.reid_embedding
+        if lane == "reid"
+        else TrackletEmbedding.siglip_embedding
+    )
+    try:
+        distance = embedding_col.cosine_distance(query_vec)
+        statement = (
+            select(Tracklet, distance.label("distance"))
+            .join(Video, Tracklet.video_id == Video.video_id)
+            .join(TrackletEmbedding, Tracklet.tracklet_id == TrackletEmbedding.tracklet_id)
+            .options(
+                contains_eager(Tracklet.video),
+                contains_eager(Tracklet.embedding),
+            )
+            .where(embedding_col.is_not(None))
+            .order_by(distance.asc(), Tracklet.id.desc())
+        )
+        statement = _apply_camera_filter(statement, camera_ids)
+        rows: list[Tracklet] = []
+        score_map: dict[str, float] = {}
+        stream = session.execute(
+            statement.execution_options(stream_results=True, yield_per=256)
+        )
+        for row, distance_value in stream:
+            if not _tracklet_overlaps_time_range(row, tf, tt):
+                continue
+            emb = _tracklet_reid_embedding(row) if lane == "reid" else _tracklet_siglip_embedding(row)
+            if lane == "reid":
+                score = _identity_score(query_vec, emb)
+            else:
+                score = _vec_score(query_vec, emb)
+            rows.append(row)
+            score_map[row.tracklet_id] = score
+            if len(rows) >= limit:
+                break
+        return rows, score_map
+    except Exception as exc:
+        logger.warning("[%s-retrieval] DB vector search unavailable; exact Python scan fallback: %s", lane, exc)
+        return _scan_vector_tracklets(
+            session,
+            query_vec=query_vec,
+            lane=lane,
+            camera_ids=camera_ids,
+            time_from=time_from,
+            time_to=time_to,
+            limit=limit,
+        )
+
+
+def _merge_tracklet_pools(*pools: list[Tracklet]) -> list[Tracklet]:
+    merged: list[Tracklet] = []
+    seen: set[str] = set()
+    for pool in pools:
+        for tracklet in pool:
+            if tracklet.tracklet_id in seen:
+                continue
+            seen.add(tracklet.tracklet_id)
+            merged.append(tracklet)
+    return merged
+
+
 def _tracklet_siglip_embedding(t: Tracklet) -> list[float]:
     """Return the SigLIP semantic embedding for retrieval (1152-dim), or []."""
     if not t.embedding or t.embedding.siglip_embedding is None:
@@ -721,10 +1058,12 @@ def _tracklet_abs_window(t: Tracklet) -> tuple[float, float] | None:
     return tracklet_time_seconds(t)
 
 
-def _can_merge(t1: Tracklet, t2: Tracklet) -> bool:
+def _can_merge(t1: Tracklet, t2: Tracklet, *, use_metadata: bool = True) -> bool:
     """Return True if t1 and t2 can belong to the same person identity."""
-    # Check metadata first — cheapest way to reject obviously different people
-    if not _metadata_matches(t1, t2):
+    # Text-only search preserves the historical metadata guard. Image-led
+    # search deliberately ignores it so imperfect VLM labels cannot fracture a
+    # visually strong identity match.
+    if use_metadata and not _metadata_matches(t1, t2):
         return False
     w1 = _tracklet_abs_window(t1)
     w2 = _tracklet_abs_window(t2)
@@ -743,7 +1082,11 @@ def _can_merge(t1: Tracklet, t2: Tracklet) -> bool:
     return True
 
 
-def _merge_by_similarity(ranked_tracklets: list[Tracklet]) -> list[list[Tracklet]]:
+def _merge_by_similarity(
+    ranked_tracklets: list[Tracklet],
+    *,
+    use_metadata: bool = True,
+) -> list[list[Tracklet]]:
     """Group tracklets by embedding cosine similarity using union-find with
     a component-level guard.
 
@@ -821,7 +1164,7 @@ def _merge_by_similarity(ranked_tracklets: list[Tracklet]) -> list[list[Tracklet
         pi, pj = find(i), find(j)
         if pi == pj:
             continue
-        if not _can_merge(ranked_tracklets[i], ranked_tracklets[j]):
+        if not _can_merge(ranked_tracklets[i], ranked_tracklets[j], use_metadata=use_metadata):
             continue
         if not cross_clears_component_guard(pi, pj):
             continue
@@ -904,8 +1247,14 @@ def _split_groups_by_24h_windows(
 
 
 @router.post("")
-def search_candidates(body: SearchRequest) -> dict[str, Any]:
-    """Search candidates with GPU re-ranking. Accepts JSON body."""
+async def search_candidates(
+    request: Request,
+    current_user_id: int = Depends(get_current_user_id),
+) -> dict[str, Any]:
+    """Search candidates from JSON or multipart input with self-contained auth."""
+    body = await _parse_search_request(request)
+    body.user_id = current_user_id
+
     request_t0 = time.perf_counter()
     query = body.query or body.text or ""
     top_k = body.top_k
@@ -977,12 +1326,13 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
             db.add(qh)
             db.flush()  # FK constraint: query_candidates.query_id → query_history.query_id
 
-        # Parse query into structured constraints once (gender / colors /
-        # garments / actions). Drives both the gender hard-filter at the
-        # prefilter stage and the metadata bonus during rerank.
+        # Parse query into structured constraints once. Text-only mode keeps the
+        # historical behavior; image modes only use parsed metadata when text is
+        # actually present, never for image-only retrieval.
         parsed_query = parse_query_metadata(search_query)
         logger.info("[query:%s] parsed_metadata=%s", qid, _jdump(_parsed_query_log_dict(parsed_query)))
         image_query = bool(effective_query_image_source)
+        has_text_query = bool(search_query.strip())
         text_has_meaning = not parsed_query.is_empty()
         if not image_query and not text_has_meaning:
             qh.status = "candidates_found"
@@ -995,46 +1345,159 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
             )
             return {"results": [], "query_id": qid}
 
-        # When an image is present with generic/no structured text, treat it as
-        # image-only. If text has structured meaning, keep its metadata/actions
-        # and text-overlap signal alongside image similarity.
-        active_parsed_query = parsed_query if text_has_meaning else ParsedQueryMetadata()
+        active_parsed_query = parsed_query if (has_text_query and text_has_meaning) else ParsedQueryMetadata()
 
-        # Stage A — Text-shortlist (SQL ILIKE on materialized attributes).
-        # Recall up to 200 candidates. This is still text-based, so it can miss
-        # tracklets whose appearance_summary phrasing doesn't share tokens with
-        # the query — Stage B (SigLIP rerank below) compensates by re-scoring
-        # ALL shortlisted items in a shared text↔image embedding space.
-        prefilter_t0 = time.perf_counter()
-        prefilter_query = "" if image_query else search_query
-        shortlist, text_score_map = _local_prefilter(
-            db, prefilter_query, camera_ids, time_from, time_to, limit=200,
-            parsed=active_parsed_query,
+        # Encode independently so image+text can use both lanes at once:
+        #   - PersonViT = identity / same-person retrieval
+        #   - SigLIP text tower = semantic retrieval for textual constraints
+        personvit_query_vec: list[float] = []
+        text_query_vec: list[float] = []
+        encode_t0 = time.perf_counter()
+        if image_query:
+            personvit_query_vec = _encode_query_image_personvit(effective_query_image_source)
+            if personvit_query_vec:
+                logger.info("[search] query encoded via PersonViT image lane")
+        if has_text_query:
+            text_query_vec = _encode_query_text_siglip(search_query)
+            if text_query_vec:
+                logger.info("[search] query encoded via SigLIP text tower (len=%d)", len(search_query))
+        logger.info(
+            "[query:%s] vector_encode personvit_dim=%d siglip_text_dim=%d elapsed=%.3fs",
+            qid,
+            len(personvit_query_vec),
+            len(text_query_vec),
+            time.perf_counter() - encode_t0,
         )
-        if image_query and text_has_meaning and search_query:
+
+        if image_query and not personvit_query_vec and not has_text_query:
+            qh.status = "candidates_found"
+            qh.result_count = 0
+            db.commit()
+            logger.warning(
+                "[query:%s] image-only query could not be encoded by PersonViT; returning no candidates elapsed=%.3fs",
+                qid,
+                time.perf_counter() - request_t0,
+            )
+            return {"results": [], "query_id": qid}
+
+        # Stage A — candidate-pool construction.
+        # text-only: preserve the existing text shortlist behavior.
+        # image-only: retrieve the whole gallery by PersonViT only.
+        # image+text: union PersonViT retrieval with text metadata and SigLIP
+        #             retrieval so text can enrich recall without owning rank.
+        prefilter_t0 = time.perf_counter()
+        shortlist: list[Tracklet] = []
+        text_score_map: dict[str, float] = {}
+        per_tracklet_image_score: dict[str, float] = {}
+        per_tracklet_text_vec_score: dict[str, float] = {}
+
+        if image_query and personvit_query_vec and not has_text_query:
+            search_mode = "image_only"
+            shortlist, per_tracklet_image_score = _vector_retrieve_tracklets(
+                db,
+                query_vec=personvit_query_vec,
+                lane="reid",
+                camera_ids=camera_ids,
+                time_from=time_from,
+                time_to=time_to,
+                limit=_IMAGE_QUERY_REID_LIMIT,
+            )
+            text_score_map = {row.tracklet_id: 0.0 for row in shortlist}
+        elif image_query and personvit_query_vec:
+            search_mode = "image_text"
+            image_rows, image_scores = _vector_retrieve_tracklets(
+                db,
+                query_vec=personvit_query_vec,
+                lane="reid",
+                camera_ids=camera_ids,
+                time_from=time_from,
+                time_to=time_to,
+                limit=_IMAGE_QUERY_REID_LIMIT,
+            )
+            text_rows, _ = _local_prefilter(
+                db,
+                search_query,
+                camera_ids,
+                time_from,
+                time_to,
+                limit=_IMAGE_QUERY_TEXT_PREFILTER_LIMIT,
+                parsed=active_parsed_query,
+            )
+            text_vec_rows, _ = _vector_retrieve_tracklets(
+                db,
+                query_vec=text_query_vec,
+                lane="siglip",
+                camera_ids=camera_ids,
+                time_from=time_from,
+                time_to=time_to,
+                limit=_IMAGE_QUERY_TEXT_VECTOR_LIMIT,
+            ) if text_query_vec else ([], {})
+            shortlist = _merge_tracklet_pools(image_rows, text_vec_rows, text_rows)
             cleaned_search_query = search_query.strip().lower()
             query_tokens = {token for token in cleaned_search_query.split() if token}
-            text_score_map = {
-                row.tracklet_id: _score_search_text(
+            for row in shortlist:
+                per_tracklet_image_score[row.tracklet_id] = image_scores.get(
+                    row.tracklet_id,
+                    _identity_score(personvit_query_vec, _tracklet_reid_embedding(row)),
+                )
+                per_tracklet_text_vec_score[row.tracklet_id] = _vec_score(
+                    text_query_vec,
+                    _tracklet_siglip_embedding(row),
+                ) if text_query_vec else 0.0
+                text_score_map[row.tracklet_id] = _score_search_text(
                     _build_search_text(row),
                     cleaned_search_query,
                     query_tokens,
+                ) if cleaned_search_query else 0.0
+            shortlist.sort(
+                key=lambda row: (
+                    -per_tracklet_image_score.get(row.tracklet_id, 0.0),
+                    -per_tracklet_text_vec_score.get(row.tracklet_id, 0.0),
+                    -row.id,
                 )
-                for row in shortlist
-            }
+            )
+        else:
+            search_mode = "text_only"
+            shortlist, text_score_map = _local_prefilter(
+                db,
+                search_query,
+                camera_ids,
+                time_from,
+                time_to,
+                limit=200,
+                parsed=active_parsed_query,
+            )
+            if text_query_vec:
+                for row in shortlist:
+                    per_tracklet_text_vec_score[row.tracklet_id] = _vec_score(
+                        text_query_vec,
+                        _tracklet_siglip_embedding(row),
+                    )
+
         logger.info(
-            "[query:%s] prefilter rows=%d elapsed=%.3fs text_score_stats=%s",
+            "[query:%s] pool mode=%s rows=%d elapsed=%.3fs text_score_stats=%s image_score_stats=%s text_vec_stats=%s",
             qid,
+            search_mode,
             len(shortlist),
             time.perf_counter() - prefilter_t0,
             _score_stats([float(v) for v in text_score_map.values()]),
+            _score_stats([float(v) for v in per_tracklet_image_score.values()]),
+            _score_stats([float(v) for v in per_tracklet_text_vec_score.values()]),
         )
         if shortlist and logger.isEnabledFor(logging.DEBUG):
             preview = [
-                _tracklet_log_item(t, text_score=text_score_map.get(t.tracklet_id, 0.0))
+                _tracklet_log_item(
+                    t,
+                    text_score=text_score_map.get(t.tracklet_id, 0.0),
+                    vector_score=(
+                        per_tracklet_image_score.get(t.tracklet_id, 0.0)
+                        if search_mode.startswith("image")
+                        else per_tracklet_text_vec_score.get(t.tracklet_id, 0.0)
+                    ),
+                )
                 for t in shortlist[:_QUERY_LOG_TOP_N]
             ]
-            logger.debug("[query:%s] prefilter_top_%d=%s", qid, len(preview), _jdump(preview))
+            logger.debug("[query:%s] pool_top_%d=%s", qid, len(preview), _jdump(preview))
 
         if not shortlist:
             qh.status = "candidates_found"
@@ -1047,85 +1510,19 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
             )
             return {"results": [], "query_id": qid}
 
-        # Stage B — Encode the query once with SigLIP. Image takes priority
-        # over text when both are supplied; text is the fallback.
-        query_vec: list[float] = []
-        query_vec_source: str | None = None
-        encode_t0 = time.perf_counter()
-        if effective_query_image_source:
-            query_vec = _encode_query_image_siglip(effective_query_image_source)
-            if query_vec:
-                query_vec_source = "image"
-                logger.info("[search] query encoded via SigLIP image tower")
-        if not query_vec and search_query and (not image_query or text_has_meaning):
-            query_vec = _encode_query_text_siglip(search_query)
-            if query_vec:
-                query_vec_source = "text"
-                logger.info("[search] query encoded via SigLIP text tower (len=%d)", len(search_query))
-        if query_vec:
-            logger.info(
-                "[query:%s] vector_encode source=%s dim=%d elapsed=%.3fs",
-                qid,
-                query_vec_source,
-                len(query_vec),
-                time.perf_counter() - encode_t0,
-            )
-        else:
-            logger.warning(
-                "[query:%s] vector_encode unavailable; fallback=text_quality elapsed=%.3fs",
-                qid,
-                time.perf_counter() - encode_t0,
-            )
-        if image_query and not query_vec and not text_has_meaning:
-            qh.status = "candidates_found"
-            qh.result_count = 0
-            db.commit()
-            logger.warning(
-                "[query:%s] image query could not be encoded; returning no candidates elapsed=%.3fs",
-                qid,
-                time.perf_counter() - request_t0,
-            )
-            return {"results": [], "query_id": qid}
-
-        # Pre-compute vec-score per tracklet for the whole shortlist.
-        # If the SigLIP encoder is unavailable or query is empty, all scores
-        # default to 0 and ranking falls back to text + quality.
-        per_tracklet_vec_score: dict[str, float] = {}
-        if query_vec:
-            vec_t0 = time.perf_counter()
-            for t in shortlist:
-                emb = _tracklet_siglip_embedding(t)
-                per_tracklet_vec_score[t.tracklet_id] = _vec_score(query_vec, emb)
-            vec_scores = list(per_tracklet_vec_score.values())
-            logger.info(
-                "[query:%s] vector_scores stats=%s elapsed=%.3fs",
-                qid,
-                _score_stats(vec_scores),
-                time.perf_counter() - vec_t0,
-            )
-            if logger.isEnabledFor(logging.DEBUG):
-                top_vec_tracklets = sorted(
-                    shortlist,
-                    key=lambda t: per_tracklet_vec_score.get(t.tracklet_id, 0.0),
-                    reverse=True,
-                )[:_QUERY_LOG_TOP_N]
-                logger.debug(
-                    "[query:%s] vector_top_%d=%s",
-                    qid,
-                    len(top_vec_tracklets),
-                    _jdump([
-                        _tracklet_log_item(
-                            t,
-                            text_score=text_score_map.get(t.tracklet_id, 0.0),
-                            vector_score=per_tracklet_vec_score.get(t.tracklet_id, 0.0),
-                        )
-                        for t in top_vec_tracklets
-                    ]),
-                )
-
+        # Keep one "primary vector" map for diagnostics/member links while the
+        # scoring stage below still has access to the separate image/text maps.
+        per_tracklet_vec_score = (
+            per_tracklet_image_score
+            if search_mode.startswith("image")
+            else per_tracklet_text_vec_score
+        )
         # Stage C — Identity merge (union-find on dedicated Re-ID vectors).
         merge_t0 = time.perf_counter()
-        identity_groups = _merge_by_similarity(shortlist)
+        identity_groups = _merge_by_similarity(
+            shortlist,
+            use_metadata=(search_mode == "text_only"),
+        )
         groups = _split_groups_by_24h_windows(identity_groups, shortlist)
         merged_groups = [g for g in groups if len(g) > 1]
         logger.info(
@@ -1151,8 +1548,10 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                     member_item = _tracklet_log_item(
                         member,
                         text_score=text_score_map.get(member.tracklet_id, 0.0),
-                        vector_score=per_tracklet_vec_score.get(member.tracklet_id, 0.0)
-                        if query_vec else None,
+                        vector_score=(
+                            per_tracklet_vec_score.get(member.tracklet_id, 0.0)
+                            if per_tracklet_vec_score else None
+                        ),
                     )
                     member_emb = _tracklet_identity_embedding(member)
                     member_item["merge_sim_to_rep"] = (
@@ -1191,78 +1590,50 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
         )
 
         # Stage D — Score each candidate.
-        # New fusion (when query_vec available):
-        #   fusion = 0.65 * vec_q          ← cosine(query, group representative-vec)
-        #          + 0.20 * text_overlap   ← legacy SQL token overlap
-        #          + 0.15 * quality
-        # Fallback (no query_vec): 0.7 * text_overlap + 0.3 * quality (old behaviour).
+        # text_only keeps the historical fusion. Image modes are deliberately
+        # separate:
+        #   image_only -> PersonViT similarity only
+        #   image_text -> 0.80 PersonViT + 0.15 SigLIP(text) + 0.05 metadata
+        # This makes image identity the gravitational center whenever an image
+        # is supplied, while still letting text break near-ties usefully.
         score_t0 = time.perf_counter()
-        min_query_vector_score = _QUERY_IMAGE_MIN_VECTOR_SCORE if query_vec_source == "image" else 0.0
         merged: list[dict] = []
         filtered_by_query_vector = 0
         filtered_by_fusion_score = 0
         for group in groups:
             rep = group[0]
-            # Candidate IDs are query-scoped and stable across pagination calls.
-            # History persists the full ranked set on the first page, so page 2
-            # must return the same IDs instead of minting fresh UUIDs.
             candidate_id = _candidate_id_for_group(qid, group)
             text_score = float(text_score_map.get(rep.tracklet_id, 0.0))
             quality_score = float(rep.quality_score or 0.0)
 
-            # vec_score = average of the top-3 member vec-scores w.r.t. query.
-            # Identity covered by multiple high-scoring tracklets gets boosted;
-            # a singleton with one weak hit gets dragged down.
-            member_vec_scores = [
-                per_tracklet_vec_score.get(m.tracklet_id, 0.0) for m in group
+            member_image_scores = [
+                per_tracklet_image_score.get(m.tracklet_id, 0.0) for m in group
             ]
-            top_n = sorted(member_vec_scores, reverse=True)[:3]
-            vec_score = sum(top_n) / len(top_n) if top_n else 0.0
+            image_top_n = sorted(member_image_scores, reverse=True)[:3]
+            image_score = sum(image_top_n) / len(image_top_n) if image_top_n else 0.0
 
-            if query_vec and min_query_vector_score > 0.0 and vec_score < min_query_vector_score:
-                filtered_by_query_vector += 1
-                continue
-
-            if query_vec_source == "image" and not text_has_meaning:
-                fusion_score = vec_score
-            elif query_vec:
-                fusion_score = (
-                    0.65 * vec_score + 0.20 * text_score + 0.15 * quality_score
-                )
-            else:
-                fusion_score = 0.7 * text_score + 0.3 * quality_score
+            member_text_vec_scores = [
+                per_tracklet_text_vec_score.get(m.tracklet_id, 0.0) for m in group
+            ]
+            text_vec_top_n = sorted(member_text_vec_scores, reverse=True)[:3]
+            text_vec_score = (
+                sum(text_vec_top_n) / len(text_vec_top_n) if text_vec_top_n else 0.0
+            )
 
             # Candidate actions = union over member tracklets, deduped.
-            # Skipping members below ACTION_CONFIDENCE_FLOOR (handled in the
-            # SQL load above) keeps low-confidence VideoMAE labels from
-            # polluting the set.
             candidate_actions: set[str] = set()
             for member in group:
                 label = action_by_tracklet.get(member.tracklet_id)
                 if label:
                     candidate_actions.add(label)
-
-            # Tier A bonus: at least one matching action → small score nudge,
-            # never a hard filter. Helps surface candidates whose action
-            # matches even when appearance similarity is borderline.
             matched_actions = candidate_actions & query_actions if query_actions else set()
             action_bonus = ACTION_BONUS_SCORE if matched_actions else 0.0
-            if matched_actions:
-                fusion_score += action_bonus
 
-            # Per-field metadata bonus: each parsed (field, value) that matches
-            # at least one member tracklet of this candidate adds
-            # METADATA_BONUS_PER_MATCH. This is what disambiguates "red shirt"
-            # from "red shoes" — only the candidate whose upper_color == "red"
-            # gets the upper_color bonus, regardless of token overlap or vector
-            # noise. Capped at METADATA_MAX_BONUS so a heavily-tagged query
-            # can't dominate vec_score.
+            # Metadata signal aggregated across the entire candidate identity.
             matched_metadata: dict[str, list[str]] = {}
             metadata_bonus = 0.0
 
             def _candidate_field_values(field_name: str) -> set[str]:
-                """Distinct non-empty lowercased values of a Tracklet column
-                across all members of this candidate group."""
                 vals: set[str] = set()
                 for m in group:
                     v = getattr(m, field_name, None)
@@ -1288,8 +1659,6 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                     matched_metadata[col_name] = hits
                     metadata_bonus += METADATA_BONUS_PER_MATCH * len(hits)
 
-            # Unbound colors ("red dress" with dress ambiguous, or a bare
-            # color word) match if they appear in upper OR lower of any member.
             if active_parsed_query.unbound_colors:
                 upper_vals = _candidate_field_values("upper_color")
                 lower_vals = _candidate_field_values("lower_color")
@@ -1301,40 +1670,63 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                     matched_metadata["unbound_color"] = unbound_hits
                     metadata_bonus += METADATA_BONUS_PER_MATCH * len(unbound_hits)
 
-            # Gender is already a hard filter at the prefilter stage, but
-            # surviving tracklets with matching gender deserve a small bonus
-            # to nudge them above unknown-gender tracklets that slipped past
-            # the filter.
             if active_parsed_query.gender:
                 cand_genders = _candidate_field_values("gender")
                 if any(g in cand_genders for g in active_parsed_query.gender):
                     matched_metadata["gender"] = list(active_parsed_query.gender)
                     metadata_bonus += METADATA_BONUS_PER_MATCH
 
-            metadata_bonus_applied = 0.0
-            if metadata_bonus > 0.0:
-                metadata_bonus_applied = min(metadata_bonus, METADATA_MAX_BONUS)
-                fusion_score += metadata_bonus_applied
+            metadata_bonus_applied = min(metadata_bonus, METADATA_MAX_BONUS) if metadata_bonus > 0.0 else 0.0
+
+            if search_mode == "image_only":
+                fusion_score = image_score
+                score_mode = "personvit_image"
+                vector_score = image_score
+            elif search_mode == "image_text":
+                metadata_den = max(1e-9, METADATA_MAX_BONUS + ACTION_BONUS_SCORE)
+                metadata_signal = min(
+                    1.0,
+                    (metadata_bonus_applied + action_bonus) / metadata_den,
+                )
+                fusion_score = (
+                    _IMAGE_TEXT_REID_WEIGHT * image_score
+                    + _IMAGE_TEXT_SIGLIP_WEIGHT * text_vec_score
+                    + _IMAGE_TEXT_METADATA_WEIGHT * metadata_signal
+                )
+                score_mode = "personvit_image_siglip_metadata"
+                vector_score = image_score
+            elif text_query_vec:
+                fusion_score = (
+                    0.65 * text_vec_score + 0.20 * text_score + 0.15 * quality_score
+                )
+                fusion_score += action_bonus + metadata_bonus_applied
+                score_mode = "vector_text_quality"
+                vector_score = text_vec_score
+            else:
+                fusion_score = 0.7 * text_score + 0.3 * quality_score
+                fusion_score += action_bonus + metadata_bonus_applied
+                score_mode = "text_quality"
+                vector_score = None
 
             fusion_score = round(fusion_score, 4)
 
-            if settings.min_fusion_score > 0.0 and fusion_score < settings.min_fusion_score:
+            # Image retrieval is a ranked search problem, not a binary accept/
+            # reject problem; always return the best available candidates. The
+            # legacy min_fusion gate remains only for text-only search.
+            if (
+                search_mode == "text_only"
+                and settings.min_fusion_score > 0.0
+                and fusion_score < settings.min_fusion_score
+            ):
                 filtered_by_fusion_score += 1
                 continue
 
-            # member_links: per-tracklet score within the candidate (for evidence UI).
-            # Now reflects the member's own vec-similarity to the query when available,
-            # not the artificial rep↔member cosine.
             member_links = []
-            score_mode = (
-                "image_vector" if query_vec_source == "image" and not text_has_meaning
-                else "image_text_quality" if query_vec_source == "image"
-                else "vector_text_quality" if query_vec
-                else "text_quality"
-            )
             for member in group:
-                if query_vec:
-                    match_score = per_tracklet_vec_score.get(member.tracklet_id, 0.0)
+                if search_mode.startswith("image"):
+                    match_score = per_tracklet_image_score.get(member.tracklet_id, 0.0)
+                elif text_query_vec:
+                    match_score = per_tracklet_text_vec_score.get(member.tracklet_id, 0.0)
                 else:
                     match_score = float(text_score_map.get(member.tracklet_id, 0.0))
                 member_links.append({
@@ -1348,7 +1740,9 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                 "rep": rep,
                 "fusion_score": fusion_score,
                 "text_score": text_score,
-                "vector_score": round(vec_score, 4) if query_vec else None,
+                "vector_score": round(vector_score, 4) if vector_score is not None else None,
+                "image_score": round(image_score, 4) if search_mode.startswith("image") else None,
+                "text_vector_score": round(text_vec_score, 4) if text_query_vec else None,
                 "quality_score": round(quality_score, 4),
                 "score_mode": score_mode,
                 "action_bonus": round(action_bonus, 4),
@@ -1359,20 +1753,22 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                 "matched_metadata": matched_metadata,
             })
 
-        merged.sort(key=lambda item: (-item["fusion_score"], -item["rep"].id))
+        merged.sort(
+            key=lambda item: (
+                -item["fusion_score"],
+                -(item.get("image_score") or 0.0),
+                -item["rep"].id,
+            )
+        )
         logger.info(
-            "[query:%s] score candidates=%d filtered_vector=%d filtered_fusion=%d min_vector=%.3f min_fusion=%.3f elapsed=%.3fs mode=%s",
+            "[query:%s] score candidates=%d filtered_vector=%d filtered_fusion=%d min_fusion=%.3f elapsed=%.3fs mode=%s",
             qid,
             len(merged),
             filtered_by_query_vector,
             filtered_by_fusion_score,
-            min_query_vector_score,
             settings.min_fusion_score,
             time.perf_counter() - score_t0,
-            "image_vector" if query_vec_source == "image" and not text_has_meaning
-            else "image_text_quality" if query_vec_source == "image"
-            else "vector_text_quality" if query_vec
-            else "text_quality",
+            search_mode,
         )
 
         # Persist the top MAX_CANDIDATES ranked set for history, but return only
@@ -1476,8 +1872,10 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                     member_item = _tracklet_log_item(
                         member,
                         text_score=text_score_map.get(member.tracklet_id, 0.0),
-                        vector_score=per_tracklet_vec_score.get(member.tracklet_id, 0.0)
-                        if query_vec else None,
+                        vector_score=(
+                            per_tracklet_vec_score.get(member.tracklet_id, 0.0)
+                            if per_tracklet_vec_score else None
+                        ),
                     )
                     member_item["match_score"] = link["match_score"]
                     top_members.append(member_item)
@@ -1495,8 +1893,10 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                     "rep": _tracklet_log_item(
                         rep,
                         text_score=text_score_map.get(rep.tracklet_id, 0.0),
-                        vector_score=per_tracklet_vec_score.get(rep.tracklet_id, 0.0)
-                        if query_vec else None,
+                        vector_score=(
+                            per_tracklet_vec_score.get(rep.tracklet_id, 0.0)
+                            if per_tracklet_vec_score else None
+                        ),
                     ),
                     "matched_actions": mc["matched_actions"],
                     "matched_metadata": mc["matched_metadata"],

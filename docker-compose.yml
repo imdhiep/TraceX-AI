@@ -19,6 +19,7 @@ services:
       dockerfile: ./frontend/Dockerfile
       args:
         - NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL:-https://8000-placeholder.cloudspaces.litng.ai/api/v1}
+        - NEXT_PUBLIC_SEARCH_API_BASE_URL=${NEXT_PUBLIC_SEARCH_API_BASE_URL:-https://8003-placeholder.cloudspaces.litng.ai/api/v1}
     container_name: mcpt-frontend
     expose:
       - "3000"
@@ -26,6 +27,7 @@ services:
     environment:
       - NODE_ENV=production
       - NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL:-https://8000-placeholder.cloudspaces.litng.ai/api/v1}
+      - NEXT_PUBLIC_SEARCH_API_BASE_URL=${NEXT_PUBLIC_SEARCH_API_BASE_URL:-https://8003-placeholder.cloudspaces.litng.ai/api/v1}
       - COOLIFY_DEPLOYMENT=true
     healthcheck:
       test: ["CMD", "curl", "-s", "http://localhost:3000"]

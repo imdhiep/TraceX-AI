@@ -6,8 +6,9 @@
 #
 # Traffic flow after deployment:
 #   Browser → Coolify VPS (frontend, port 443)
-#            → LightningAI (metadata-service :8002, query-service :8003, trace-service :8004)
-#              via NEXT_PUBLIC_API_BASE_URL pointing to LightningAI public URL
+#            → LightningAI metadata-service :8002 via NEXT_PUBLIC_API_BASE_URL
+#            → LightningAI query-service :8003 via NEXT_PUBLIC_SEARCH_API_BASE_URL
+#              (trace-service :8004 remains internal)
 #
 # IMPORTANT: Set COOLIFY_PUBLIC_URL to your LightningAI public URL:
 #   e.g. https://8000-xxxx.cloudspaces.litng.ai
@@ -137,8 +138,8 @@ services:
         condition: service_healthy
 
   # ────────────────────────────────────────────────────────────────────
-  # query-service — Search & Translation (~15GB VRAM)
-  # SeamlessM4T v2-large + SigLIP 2 text tower
+  # query-service — Search & Translation
+  # SeamlessM4T + RT-DETR + PersonViT + SigLIP
   # ────────────────────────────────────────────────────────────────────
   query-service:
     build:
@@ -156,6 +157,8 @@ services:
       - POSTGRES_USER=${POSTGRES_USER:-mcpt_user}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-mcpt_user}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-video_tracking}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - JWT_ALGORITHM=${JWT_ALGORITHM:-HS256}
       - METADATA_SERVICE_URL=http://metadata-service:8002
       - TRACE_SERVICE_URL=http://trace-service:8004
       - TRACKING_SERVICE_URL=http://trace-service:8004

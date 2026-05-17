@@ -151,6 +151,18 @@ export function getApiBaseUrl(): string {
   return "http://metadata-service:8000";
 }
 
+/** Search can run directly against query-service while the rest of the app stays on metadata-service. */
+export function getSearchApiBaseUrl(): string {
+  const envBase = (process.env.NEXT_PUBLIC_SEARCH_API_BASE_URL ?? "").trim();
+  if (envBase.startsWith("/")) {
+    return envBase.replace(/\/$/, "");
+  }
+  if (envBase.startsWith("http://") || envBase.startsWith("https://")) {
+    return envBase.replace(/\/$/, "");
+  }
+  return getApiBaseUrl();
+}
+
 export function resolveMediaUrl(url: string, apiBaseUrl: string = getApiBaseUrl()): string {
   const raw = (url ?? "").trim();
   if (!raw) {
@@ -172,8 +184,7 @@ export function resolveMediaUrl(url: string, apiBaseUrl: string = getApiBaseUrl(
   return `${apiBaseUrl}/${raw}`;
 }
 
-async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const apiBaseUrl = getApiBaseUrl();
+async function apiFetchFromBase<T>(apiBaseUrl: string, path: string, init?: RequestInit): Promise<T> {
   const authHeaders: Record<string, string> = {};
   if (typeof window !== "undefined") {
     const token = loadAccessToken();
@@ -204,6 +215,10 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   return parseJsonOrThrow<T>(response);
 }
 
+async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  return apiFetchFromBase<T>(getApiBaseUrl(), path, init);
+}
+
 export type SearchPage = {
   queryId: string | null;
   items: VideoItem[];
@@ -217,7 +232,7 @@ export async function searchVideos(
   optionsOrPersistQuery: SearchVideosOptions | boolean = false,
   reuseQueryId?: string | null,
 ): Promise<SearchPage> {
-  const apiBaseUrl = getApiBaseUrl();
+  const apiBaseUrl = getSearchApiBaseUrl();
   const options: SearchVideosOptions =
     typeof optionsOrPersistQuery === "boolean"
       ? { persistQuery: optionsOrPersistQuery, reuseQueryId }
@@ -273,7 +288,7 @@ export async function searchVideos(
   } else {
     requestInit.body = JSON.stringify(payloadBody);
   }
-  const payload = await apiFetch<SearchApiResponse>("/search", {
+  const payload = await apiFetchFromBase<SearchApiResponse>(apiBaseUrl, "/search", {
     ...requestInit,
   });
 

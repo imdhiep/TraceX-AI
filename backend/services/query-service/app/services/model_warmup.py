@@ -1,7 +1,12 @@
 """GPU model warmup for query-service.
 
-Loads SigLIP 2-So400m (text + image towers) on startup. Models stay resident
-in VRAM so text/image queries can be encoded online during search requests.
+Loads the models needed for a fully independent search runtime:
+- PersonViT-S MSMT17 for same-person image retrieval
+- RT-DETR R50 for query-image person cropping
+- SigLIP So400m text/image towers for semantic retrieval
+
+Models stay resident in VRAM so search requests do not depend on
+metadata-service at inference time.
 """
 
 from __future__ import annotations
@@ -16,7 +21,7 @@ logger = logging.getLogger(__name__)
 _warmup_done = False
 _warmup_error: Optional[str] = None
 
-# Model registry — populated by _warmup_siglip2.
+# Model registry — populated by the warmup helpers below.
 _MODELS: dict[str, Any] = {}
 
 
@@ -47,13 +52,24 @@ async def warmup_models():
     device = get_device()
 
     try:
+        _warmup_rtdetr(device)
+    except Exception as exc:
+        logger.warning("RT-DETR warmup skipped; full-image query fallback will be used: %s", exc)
+
+    try:
+        _warmup_personvit(device)
+    except Exception as exc:
+        logger.warning("PersonViT warmup skipped; image search will be unavailable: %s", exc)
+
+    try:
         _warmup_siglip2(device)
-        _warmup_done = True
-        logger.info("=== Model warmup COMPLETE ===")
     except Exception as e:
         _warmup_error = str(e)
-        logger.exception("Model warmup failed: %s", e)
+        logger.exception("SigLIP warmup failed: %s", e)
         raise
+
+    _warmup_done = True
+    logger.info("=== Model warmup COMPLETE ===")
 
 
 def _warmup_siglip2(device: torch.device) -> None:
@@ -88,6 +104,64 @@ def _warmup_siglip2(device: torch.device) -> None:
         _MODELS["siglip2_model_id"] = model_id
     except Exception as e:
         logger.exception("SigLIP warmup failed: %s", e)
+        raise
+
+
+def _warmup_personvit(device: torch.device) -> None:
+    """Load the same PersonViT checkpoint used by metadata-service ingest."""
+    logger.info("Loading PersonViT-S MSMT17...")
+    try:
+        from transformers import AutoModel
+
+        torch_dtype = torch.float16 if device.type == "cuda" else torch.float32
+        model_id = "maennyn/personvit-reid-msmt17-vit-s"
+        model = AutoModel.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            torch_dtype=torch_dtype,
+        ).to(device).eval()
+
+        dummy = torch.zeros(1, 3, 256, 128, device=device, dtype=torch_dtype)
+        with torch.no_grad():
+            out = model(dummy)
+        feat = out[0] if isinstance(out, tuple) else out.embeddings
+        assert feat.shape[-1] == 384, f"Expected 384-dim, got {feat.shape[-1]}"
+
+        _MODELS["personvit"] = model
+        _MODELS["personvit_model_id"] = model_id
+        logger.info("  PersonViT-S MSMT17 loaded OK")
+    except Exception as exc:
+        logger.exception("PersonViT warmup failed: %s", exc)
+        raise
+
+
+def _warmup_rtdetr(device: torch.device) -> None:
+    """Load RT-DETR for single-person query-image cropping."""
+    logger.info("Loading RT-DETR R50 (query-image person detector)...")
+    try:
+        from pathlib import Path
+        from transformers import RTDetrForObjectDetection, RTDetrImageProcessor
+
+        torch_dtype = torch.float16 if device.type == "cuda" else torch.float32
+        finetuned = Path("/workspace/models/weights/rtdetr_person")
+        model_id = str(finetuned) if finetuned.exists() else "PekingU/rtdetr_r50vd"
+        source = "fine-tuned" if finetuned.exists() else "base"
+
+        processor = RTDetrImageProcessor.from_pretrained(model_id)
+        model = RTDetrForObjectDetection.from_pretrained(
+            model_id,
+            torch_dtype=torch_dtype,
+        ).to(device).eval()
+
+        id2label = model.config.id2label
+        person_ids = {k for k, v in id2label.items() if "person" in str(v).lower()}
+        _MODELS["rtdetr"] = model
+        _MODELS["rtdetr_processor"] = processor
+        _MODELS["rtdetr_person_ids"] = person_ids or {0, 1}
+        _MODELS["rtdetr_model_id"] = model_id
+        logger.info("  RT-DETR R50 loaded OK (%s, model: %s)", source, model_id)
+    except Exception as exc:
+        logger.exception("RT-DETR warmup failed: %s", exc)
         raise
 
 

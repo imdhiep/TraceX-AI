@@ -31,8 +31,11 @@ if _root_level_name not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
 logging.root.setLevel(getattr(logging, _root_level_name))
 # ──────────────────────────────────────────────────────────────────────────────
 
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import func, text
 
@@ -59,15 +62,16 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("SeamlessM4T warmup skipped (non-fatal): %s", exc)
 
-    # SigLIP2 text + image towers — required for vector re-ranking in candidates.search.
-    # Without this, _encode_query_text_siglip() returns [] and fusion silently
-    # falls back to text+quality only (0.7/0.3), ignoring siglip_embedding in DB.
+    # Independent search runtime:
+    # - RT-DETR crops uploaded person images
+    # - PersonViT handles same-person image retrieval
+    # - SigLIP handles text/image semantic retrieval
     try:
         from .services.model_warmup import warmup_models
         await warmup_models()
-        logger.info("SigLIP2 ready")
+        logger.info("RT-DETR + PersonViT + SigLIP ready")
     except Exception as exc:
-        logger.warning("SigLIP2 warmup skipped (non-fatal): %s", exc)
+        logger.warning("Query model warmup skipped (non-fatal): %s", exc)
 
     logger.info("Query service warmup complete")
     yield
@@ -81,15 +85,30 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Browsers reject `Access-Control-Allow-Origin: *` together with
+# `Allow-Credentials: true`. Frontend sends auth as a Bearer header, not a
+# cookie, so credentials are not required — keep the wildcard origin and turn
+# credentials off so direct browser → query-service search works from any
+# Coolify/VPS hostname without re-listing origins on every move.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 app.include_router(candidates.router, prefix="/api/v1", tags=["candidates"])
+
+# Query-service can serve search independently of metadata-service, so expose
+# the shared static assets referenced by candidate payloads too.
+_CROPS_DIR = Path("/workspace/storage/crops")
+_CROPS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/static/crops", StaticFiles(directory=str(_CROPS_DIR)), name="crops")
+
+_QUERY_IMAGES_DIR = Path("/workspace/storage/query-images")
+_QUERY_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/static/query-images", StaticFiles(directory=str(_QUERY_IMAGES_DIR)), name="query-images")
 
 
 @app.get("/health")

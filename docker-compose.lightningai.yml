@@ -7,7 +7,8 @@
 # ─── Traffic flow ────────────────────────────────────────────────────────────
 #   Browser
 #     → VPS: tracex-ai.smartnovi.tech        (frontend, port 443 HTTPS)
-#     → LightningAI: 8002-XXXX.cloudspaces.litng.ai/api/v1  (metadata-service)
+#     → LightningAI: 8002-XXXX.cloudspaces.litng.ai/api/v1  (metadata-service / non-search APIs)
+#     → LightningAI: 8003-XXXX.cloudspaces.litng.ai/api/v1  (query-service / direct search runtime)
 #
 # ─── Internal service communication ──────────────────────────────────────────
 #   metadata-service  →  query-service (http://query-service:8003)
@@ -17,7 +18,7 @@
 #
 # ─── Ports exposed trên LightningAI ──────────────────────────────────────────
 #   8002  →  metadata-service  (NEXT_PUBLIC_API_BASE_URL trỏ đến port này)
-#   8003  →  query-service     (internal, metadata-service gọi nội bộ)
+#   8003  →  query-service     (NEXT_PUBLIC_SEARCH_API_BASE_URL trỏ đến port này)
 #   8004  →  trace-service     (internal, metadata/query-service gọi nội bộ)
 #   5432  →  postgres          (KHÔNG expose — chỉ dùng nội bộ Docker network)
 #
@@ -197,7 +198,7 @@ services:
 
   # ──────────────────────────────────────────────────────────────────────────
   # query-service — port 8003
-  # GPU models: SeamlessM4T v2-large (translation) + SigLIP 2 text tower
+  # GPU models: SeamlessM4T + RT-DETR + PersonViT + SigLIP
   # ──────────────────────────────────────────────────────────────────────────
   query-service:
     build:
@@ -214,6 +215,8 @@ services:
       - POSTGRES_USER=${POSTGRES_USER:-mcpt_user}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - DATABASE_URL=${DATABASE_URL}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - JWT_ALGORITHM=${JWT_ALGORITHM:-HS256}
       # Internal service URLs
       - TRACE_SERVICE_URL=http://trace-service:8004
       - METADATA_SERVICE_URL=http://metadata-service:8002
@@ -228,7 +231,7 @@ services:
       - MAX_CANDIDATES=${MAX_CANDIDATES:-50}
       # 2026-05-17: ReID lane uses PersonViT-S MSMT17 (384-dim). Ingest-side
       # FRAGMENT_MERGE_SIM_THRESHOLD is 0.80 (loose-gate sweet spot from
-      # camera_0002 bench). Query-side is slightly stricter (0.85) because
+      # camera_0002 bench). Query-side is slightly stricter (0.82) because
       # cross-video grouping spans larger temporal/spatial windows than within-
       # video fragment merge — appearance evidence must be stronger to commit.
       # QUERY_REID_MERGE_THRESHOLD overrides this if set.

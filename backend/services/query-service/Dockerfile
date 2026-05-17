@@ -1,5 +1,5 @@
-# Query Service Dockerfile — GPU (LightningAI A100 80GB, ~15GB VRAM)
-# SeamlessM4T v2-large translation (~5GB fp16) + SigLIP 2 text tower
+# Query Service Dockerfile — GPU (LightningAI A100 80GB)
+# SeamlessM4T + RT-DETR + PersonViT + SigLIP for independent search runtime
 
 FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
 

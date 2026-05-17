@@ -108,7 +108,7 @@ Public frontend calls should point to:
 https://8002-<LIGHTNINGAI-WORKSPACE>.cloudspaces.litng.ai/api/v1
 ```
 
-Frontend `next.config.js` rewrites browser calls through `/api-gw` when `NEXT_PUBLIC_API_BASE_URL` is an external LightningAI URL.
+Frontend `next.config.js` rewrites non-search browser calls through `/api-gw` and search calls through `/search-gw` when `NEXT_PUBLIC_API_BASE_URL` / `NEXT_PUBLIC_SEARCH_API_BASE_URL` point to external LightningAI URLs.
 
 ---
 
@@ -354,6 +354,8 @@ cd frontend
 cp .env.example .env.local
 # sửa NEXT_PUBLIC_API_BASE_URL trỏ tới metadata-service:
 # NEXT_PUBLIC_API_BASE_URL=http://localhost:8002/api/v1
+# và search runtime trỏ thẳng tới query-service:
+# NEXT_PUBLIC_SEARCH_API_BASE_URL=http://localhost:8003/api/v1
 # hoặc https://8002-<workspace>.cloudspaces.litng.ai/api/v1
 npm install
 npm run dev
@@ -416,6 +418,7 @@ Tạo `.env` trên VPS:
 
 ```env
 NEXT_PUBLIC_API_BASE_URL=https://8002-<WORKSPACE-ID>.cloudspaces.litng.ai/api/v1
+NEXT_PUBLIC_SEARCH_API_BASE_URL=https://8003-<WORKSPACE-ID>.cloudspaces.litng.ai/api/v1
 ```
 
 Build và chạy:
@@ -425,7 +428,7 @@ docker compose --env-file .env build frontend
 docker compose --env-file .env up -d frontend
 ```
 
-Khi LightningAI URL đổi, phải cập nhật `NEXT_PUBLIC_API_BASE_URL` và rebuild frontend vì URL được dùng lúc build.
+Khi LightningAI URL đổi, phải cập nhật `NEXT_PUBLIC_API_BASE_URL` và `NEXT_PUBLIC_SEARCH_API_BASE_URL`, rồi rebuild frontend vì các URL được dùng lúc build.
 
 ---
 
@@ -454,6 +457,7 @@ Khi LightningAI URL đổi, phải cập nhật `NEXT_PUBLIC_API_BASE_URL` và r
 | Biến | Mô tả |
 | ---- | ---- |
 | `NEXT_PUBLIC_API_BASE_URL` | URL metadata-service kèm `/api/v1`; frontend rewrites qua `/api-gw` |
+| `NEXT_PUBLIC_SEARCH_API_BASE_URL` | URL query-service kèm `/api/v1`; frontend rewrites search qua `/search-gw` |
 
 ---
 

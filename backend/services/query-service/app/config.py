@@ -34,9 +34,17 @@ class Settings:
     preview_root: Path = Path(
         os.getenv("PREVIEW_ROOT", "/workspace/storage/candidate-previews")
     )
+    query_image_root: Path = Path(
+        os.getenv("QUERY_IMAGE_ROOT", "/workspace/storage/query-images")
+    )
+    max_query_image_bytes: int = int(
+        os.getenv("MAX_QUERY_IMAGE_BYTES", str(5 * 1024 * 1024))
+    )
 
-    # Public API
+    # Public API / auth
     public_api_base_url: str = os.getenv("PUBLIC_API_BASE_URL", "")
+    jwt_secret_key: str = os.getenv("JWT_SECRET_KEY", "")
+    jwt_algorithm: str = os.getenv("JWT_ALGORITHM", "HS256")
 
     # Hybrid search: min score threshold for returning results
     min_fusion_score: float = float(os.getenv("MIN_FUSION_SCORE", "0.5"))

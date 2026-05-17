@@ -59,15 +59,21 @@ def _get_query_service_url() -> str:
     return _QUERY_SERVICE_URL
 
 
-def _post_to_query_service(path: str, payload: dict[str, Any], timeout: float = 120.0) -> dict[str, Any]:
+def _post_to_query_service(
+    path: str,
+    payload: dict[str, Any],
+    timeout: float = 120.0,
+    authorization: str | None = None,
+) -> dict[str, Any]:
     url = f"{_get_query_service_url().rstrip('/')}/api/v1{path}"
     max_attempts = 3
     last_exc: Exception | None = None
 
     for attempt in range(1, max_attempts + 1):
         try:
+            headers = {"Authorization": authorization} if authorization else None
             with httpx.Client(timeout=timeout) as client:
-                response = client.post(url, json=payload)
+                response = client.post(url, json=payload, headers=headers)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPError as exc:
@@ -188,7 +194,11 @@ async def search_candidates(
         payload["query_id"] = body.query_id
 
     try:
-        result = _post_to_query_service("/search", payload)
+        result = _post_to_query_service(
+            "/search",
+            payload,
+            authorization=request.headers.get("authorization"),
+        )
         return result
     except HTTPException:
         raise
