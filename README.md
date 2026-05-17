@@ -1,777 +1,545 @@
-# MCPT — Multi-Camera Person Tracking & Re-Identification
+# TraceX-AI
 
-> Hệ thống tìm kiếm và truy vết người trong mạng lưới camera giám sát, sử dụng ngôn ngữ tự nhiên, AI embedding, và xác nhận của người vận hành.
+> Hệ thống tìm kiếm và truy vết người trong mạng lưới camera bằng mô tả tự nhiên, dữ liệu tracklet, AI embedding và luồng xác nhận của người vận hành.
 
----
+TraceX-AI hiện được tổ chức theo hướng **frontend tách riêng khỏi backend GPU**:
 
-## Giới thiệu
+- **VPS/Coolify** chạy frontend Next.js.
+- **LightningAI** chạy toàn bộ backend: PostgreSQL, metadata-service, query-service và trace-service.
+- Video và artefact xử lý được lưu trong `/workspace/storage` hoặc Google Drive, còn database chỉ lưu metadata, tracklet, embedding, lịch sử query, candidate và evidence.
 
-Hệ thống vận hành hàng chục camera giám sát liên tục. Khi cần tìm một người cụ thể, người vận hành thường phải scrub thủ công qua nhiều luồng video — rất tốn thời gian và dễ bỏ sót.
+## Liên kết nhanh
 
-**MCPT** giải quyết bài toán này theo hướng AI-first:
-
-1. Video từ 50 camera được xử lý offline: phát hiện người, tracking thành tracklet, trích xuất embedding ngoại hình và hành động.
-2. Khi cần tìm kiếm, người vận hành nhập mô tả tự nhiên. Hệ thống trả về danh sách ứng viên có embedding phù hợp nhất.
-3. Người vận hành chọn đúng candidate → hệ thống **Trace** tự động dựng lại hành trình liên camera trong ±12h.
-4. Người vận hành xác nhận/từ chối từng đoạn → hệ thống học thêm và re-trace.
-
-**Người dùng cuối:** Nhân viên an ninh, bảo vệ, hoặc bất kỳ người vận hành nào cần tìm người trong hệ thống camera.
+| Tài liệu | Mục đích |
+| -------- | -------- |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Kiến trúc hệ thống, luồng dữ liệu, service responsibilities |
+| [DEPLOY.md](DEPLOY.md) | Hướng dẫn deploy frontend trên VPS và backend trên LightningAI |
+| [EVALUATION_EVIDENCE.md](EVALUATION_EVIDENCE.md) | Minh chứng đánh giá, benchmark nội bộ, test evidence |
+| [WORKLOG.md](WORKLOG.md) | Phân công sprint, task và quyết định kỹ thuật |
+| [JOURNAL.md](JOURNAL.md) | Nhật ký phát triển theo tuần |
+| [docs/RULES_USER_ACCOUNT.md](docs/RULES_USER_ACCOUNT.md) | Quy tắc tài khoản và phân quyền người dùng |
 
 ---
 
 ## Mục lục
 
-1. [Key Features](#1-key-features)
-2. [Kiến trúc hệ thống](#2-kiến-trúc-hệ-thống)
-0. [**Secret Management — Đọc trước khi làm gì khác**](#0-secret-management--đọc-trước-khi-làm-gì-khác)
-3. [Tech Stack](#3-tech-stack)
-4. [AI Models](#4-ai-models)
-5. [Pipeline Offline Indexing](#5-pipeline-offline-indexing)
-6. [Pipeline Online Search](#6-pipeline-online-search)
-7. [Pipeline Trace](#7-pipeline-trace)
-8. [Luồng lưu trữ](#8-luồng-lưu-trữ)
-9. [Cấu trúc thư mục](#9-cấu-trúc-thư-mục)
-10. [Cài đặt và chạy từ đầu](#10-cài-đặt-và-chạy-từ-đầu)
-11. [Biến môi trường](#11-biến-môi-trường)
-12. [Database Schema](#12-database-schema)
-13. [API Documentation](#13-api-documentation)
-14. [Camera Topology](#14-camera-topology)
-15. [Troubleshooting](#15-troubleshooting)
-16. [Security Notes](#16-security-notes)
-17. [Performance Notes](#17-performance-notes)
-18. [Limitations & Future Work](#18-limitations--future-work)
-19. [Thành viên nhóm](#19-thành-viên-nhóm)
+1. [Tính năng chính](#tính-năng-chính)
+2. [Kiến trúc đang chạy](#kiến-trúc-đang-chạy)
+3. [Luồng sản phẩm](#luồng-sản-phẩm)
+4. [Cấu trúc thư mục](#cấu-trúc-thư-mục)
+5. [Tech stack](#tech-stack)
+6. [AI pipeline](#ai-pipeline)
+7. [Database](#database)
+8. [API chính](#api-chính)
+9. [Hướng dẫn sử dụng sản phẩm](#hướng-dẫn-sử-dụng-sản-phẩm)
+10. [Cài đặt và chạy](#cài-đặt-và-chạy)
+11. [Deploy](#deploy)
+12. [Biến môi trường quan trọng](#biến-môi-trường-quan-trọng)
+13. [Troubleshooting](#troubleshooting)
+14. [Ghi chú bảo mật](#ghi-chú-bảo-mật)
+15. [Thành viên](#thành-viên)
 
 ---
 
-## 0. Secret Management — Đọc trước khi làm gì khác
+## Tính năng chính
 
-### Cấu trúc mới — Single Source of Truth
-
-```
-secrets/                          ← GITIGNORED toàn bộ (trừ .example)
-├── master.env                    ← ĐÂY LÀ FILE DUY NHẤT CẦN CHỈNH
-├── master.env.example            ← Template (committed, không có real value)
-├── oauth/
-│   ├── oauth2_credentials.json  ← Google OAuth client credentials
-│   └── oauth2_token.pickle      ← Google OAuth refresh token (generated)
-└── shared.env                   ← Auto-generated bởi sync_secrets.sh, không edit
-```
-
-Tất cả file khác (`infra/env/backend.env`, `infra/env/ai.env`, `secrets/shared.env`) được **tự động generate** từ `secrets/master.env` bởi `scripts/sync_secrets.sh`.
-
-### Khi chuyển sang máy mới
-
-```bash
-# Máy CŨ — export secrets thành 1 file
-bash scripts/export_secrets.sh
-# → mcpt_secrets_20260430.tar.gz
-
-# Máy MỚI — import + generate env files
-git clone <REPO_URL> && cd A20-App-119
-bash scripts/import_secrets.sh /path/to/mcpt_secrets_20260430.tar.gz
-bash scripts/sync_secrets.sh --vps
-```
-
-### Cập nhật một secret
-
-```bash
-nano secrets/master.env
-# Sửa dòng cần thay đổi (ví dụ: LIGHTNING_API_BASE_URL)
-bash scripts/sync_secrets.sh --vps
-```
-
-### Danh sách secrets cần điền
-
-| Biến | Lấy ở đâu | Thay đổi khi nào |
-|------|-----------|-----------------|
-| `VPS_HOST` | IP VPS | Khi đổi VPS |
-| `VPS_PASSWORD` | Provider VPS | Khi đổi mật khẩu |
-| `POSTGRES_PASSWORD` | Tự đặt | Setup lần đầu |
-| `JWT_SECRET_KEY` | Tự generate random | Setup lần đầu |
-| `LIGHTNING_API_BASE_URL` | LightningAI UI → API Builder → Settings → URL | **Mỗi khi restart A100** |
-| `LIGHTNING_API_TOKEN` | Tự đặt | Khi muốn đổi |
-| `TRACE_SERVICE_URL` | Giống `LIGHTNING_API_BASE_URL` | **Mỗi khi restart A100** |
-| `GOOGLE_DRIVE_ROOT_FOLDER_ID` | Google Drive URL của folder root | Setup lần đầu |
-| `GOOGLE_DRIVE_SOURCE_STORAGE_FOLDER_ID` | Google Drive URL của folder `Storage/` | Setup lần đầu |
-| `NEXT_PUBLIC_API_GATEWAY_URL` | IP VPS | Khi đổi VPS |
-
-> **Quan trọng:** Sau mỗi lần restart LightningAI API Builder, `LIGHTNING_API_BASE_URL` và `TRACE_SERVICE_URL` **bắt buộc phải cập nhật**.
+| Nhóm | Mô tả |
+| ---- | ---- |
+| Đăng nhập và quản trị | JWT auth, bootstrap admin, quản lý user và lịch sử query |
+| Video ingestion | Nhận video local/Drive, xử lý offline thành tracklet và metadata |
+| AI video processing | Detect người, tracking, merge tracklet, trích xuất thuộc tính, embedding và action |
+| Search | Tìm người bằng text/image query, lọc camera/thời gian, trả về candidate đã rank |
+| Candidate review | Xem candidate, preview, mô tả, toàn bộ tracklet, chọn nhiều candidate |
+| Trace | Chọn candidate để dựng evidence video/timeline theo cửa sổ thời gian |
+| Human-in-the-loop | Người dùng xác nhận, loại tracklet khỏi candidate, xem lại history |
+| Tiếng Việt hóa UI | Nhãn, lỗi và thông tin hiển thị được dịch/sửa để phù hợp người vận hành |
 
 ---
 
-## 1. Key Features
+## Kiến trúc đang chạy
 
-| Tính năng | Mô tả |
-|-----------|-------|
-| **Natural language search** | Tìm người bằng mô tả văn bản tự do, không cần ảnh mẫu |
-| **Offline video indexing** | Xử lý video theo lô từ Google Drive, lưu embedding vào PostgreSQL |
-| **Multi-model AI pipeline** | RF-DETR detection → HeadBoxTracker → DINOv2 embedding → VideoMAE action |
-| **Within-camera fragment merge** | DINOv2 cosine similarity tự động gom các tracklet của cùng 1 người trong 1 camera |
-| **Hybrid scoring search** | Kết hợp vector similarity, attribute matching, và semantic overlap |
-| **Cross-camera deduplication** | Tự động gom nhóm cùng người xuất hiện ở nhiều camera |
-| **Trace journey** | Truy vết hành trình liên camera trong ±12h từ một seed candidate |
-| **Camera topology pruning** | BFS trên đồ thị camera để loại 90% camera không liên quan |
-| **Human-in-the-loop** | Người vận hành xác nhận → gallery update → re-trace tự động |
-| **Google Drive ingestion** | Video lưu trên Drive, queue worker tự động polling và gửi lên GPU |
-| **LightningAI GPU inference** | Toàn bộ model inference chạy trên A100 GPU cloud |
-| **Dockerized VPS deployment** | Stack đầy đủ chạy trên VPS qua Docker Compose |
-| **PostgreSQL metadata storage** | Tracklet, embedding, timeline, attribute metadata lưu có cấu trúc |
-
----
-
-## 2. Kiến trúc hệ thống
-
-### Sơ đồ tổng thể
-
-```
+```text
 ┌──────────────────────────────────────────────────────────────────┐
-│  VPS — Docker Compose                                            │
+│  VPS / Coolify — Docker Compose                                  │
 │                                                                  │
-│  ┌─────────────┐   ┌──────────────────┐   ┌──────────────────┐│
-│  │metadata-svc │   │  query-service   │   │  trace-service   ││
-│  │ FastAPI     │   │   FastAPI        │   │   FastAPI        ││
-│  │ port 8001   │   │   port 8002      │   │   port 8003      ││
-│  └──────┬──────┘   └────────┬─────────┘   └────────┬─────────┘│
-│         └───────────────────┬┴──────────────────────┘          │
-│                    ┌────────┴───────────────────────┐            │
-│                    │  PostgreSQL :5432              │            │
-│                    └────────────────────────────────┘          │
-│  ┌──────────────────────────────────────────────────────────┐ │
-│  │  Frontend (Next.js) port 3000                           │ │
-│  └──────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-                       │ HTTP POST (Bearer token)
-                       ▼
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │ Frontend (Next.js)                                        │  │
+│  │ container: mcpt-frontend                                  │  │
+│  │ port 3000 → Traefik / HTTPS                               │  │
+│  │ API rewrite: /api-gw → LightningAI metadata-service       │  │
+│  └──────────────────────────────┬─────────────────────────────┘  │
+└─────────────────────────────────┼────────────────────────────────┘
+                                  │ HTTPS /api/v1
+                                  │ NEXT_PUBLIC_API_BASE_URL
+                                  ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│  LIGHTNINGAI — API Builder (NVIDIA A100, 80GB VRAM)               │
+│  LIGHTNINGAI — Backend + Database (GPU)                          │
 │                                                                  │
-│  Trace Service (FastAPI port 8000)                               │
-│  ├── RF-DETR 2XLarge        ← person detection                  │
-│  ├── HeadBoxTracker          ← per-video tracking + fragment merge│
-│  ├── DINOv2 ViT-L/14        ← view-invariant Re-ID (1024-dim)   │
-│  ├── SigLIP2 ViT-L-16-512  ← text/image encoding + attributes   │
-│  └── VideoMAE Large         ← video action recognition          │
+│  ┌──────────────────┐   ┌──────────────────┐   ┌──────────────┐ │
+│  │ metadata-service │   │  query-service   │   │ trace-service│ │
+│  │ FastAPI          │   │  FastAPI         │   │ FastAPI      │ │
+│  │ public :8002     │   │  internal :8003  │   │ internal:8004│ │
+│  │ auth/videos      │   │  search/ranking  │   │ trace/build  │ │
+│  │ ingest/history   │   │  translation     │   │ evidence     │ │
+│  └────────┬─────────┘   └────────┬─────────┘   └──────┬───────┘ │
+│           │                      │                    │         │
+│           └──────────────────────┴────────────────────┘         │
+│                                  │                              │
+│                     ┌────────────▼────────────┐                 │
+│                     │ PostgreSQL + pgvector   │                 │
+│                     │ internal :5432          │                 │
+│                     │ users / videos /        │                 │
+│                     │ tracklets / queries /   │                 │
+│                     │ candidates / evidence   │                 │
+│                     └─────────────────────────┘                 │
+│                                                                  │
+│  metadata-service GPU models:                                    │
+│  ├── RT-DETR R50           ← person detection                    │
+│  ├── DINOv2 ViT-L/14       ← appearance / ReID features          │
+│  ├── SigLIP / SigLIP2      ← image-text embedding                │
+│  ├── VideoMAE V2           ← action recognition                  │
+│  └── Qwen2-VL-7B           ← open-vocabulary metadata            │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### Luồng dữ liệu tổng quan
+Public frontend calls should point to:
 
+```text
+https://8002-<LIGHTNINGAI-WORKSPACE>.cloudspaces.litng.ai/api/v1
 ```
-Upload video vào Drive Temp/
-  → move.py tổ chức vào Drive Storage/
-    → Queue worker (VPS) phát hiện video mới
-      → Gửi POST request tới LightningAI Trace Service
-        → Download video từ Drive, chạy AI pipeline
-          → Trả JSON (tracklets, embedding, metadata)
-            → VPS lưu vào PostgreSQL
-              → Frontend hiển thị trong queue
-                → Người dùng search (query-service) → trace (trace-service) → xác nhận
+
+Frontend `next.config.js` rewrites browser calls through `/api-gw` when `NEXT_PUBLIC_API_BASE_URL` is an external LightningAI URL.
+
+---
+
+## Luồng sản phẩm
+
+### 1. Ingest / xử lý video
+
+```text
+Video source (local hoặc Google Drive)
+  -> metadata-service /api/v1/video/process hoặc /api/v1/ingest/*
+  -> detect người bằng RT-DETR
+  -> tracking + merge tracklet
+  -> trích xuất crop, thuộc tính, embedding, action
+  -> lưu videos, tracklets, embeddings, actions, observations vào PostgreSQL
+```
+
+### 2. Search
+
+```text
+Người dùng nhập mô tả / ảnh / bộ lọc camera-thời gian
+  -> frontend
+  -> metadata-service /api/v1/search
+  -> query-service /api/v1/candidates/search
+  -> tính fusion score từ text, vector, metadata, quality/time
+  -> lưu query_history, query_candidates, query_candidate_tracklets
+  -> frontend hiển thị candidate
+```
+
+### 3. Trace
+
+```text
+Người dùng chọn candidate
+  -> /api/v1/trace/candidate-detail
+  -> /api/v1/trace/select
+  -> /api/v1/trace/build
+  -> trace-service dựng evidence segments và video/timeline
+  -> frontend xem trace, history, candidate tracklets
+  -> người dùng có thể xóa tracklet sai hoặc trace tiếp
 ```
 
 ---
 
-## 3. Tech Stack
+## Cấu trúc thư mục
+
+```text
+TraceX-AI/
+├── frontend/                         # Next.js 14 app
+│   ├── app/                           # App Router pages: login, home, history, trace, admin
+│   ├── components/                    # Layout, search, video, UI components
+│   ├── features/                      # Feature views: auth, home, search, history, trace
+│   ├── lib/                           # API client, auth session, config, types
+│   ├── next.config.js                 # /api-gw and /static rewrites to LightningAI
+│   └── Dockerfile
+│
+├── backend/
+│   ├── config/                        # Camera topology, calibration, query vocab
+│   └── services/
+│       ├── shared/                    # SQLAlchemy models, DB/session config, time helpers
+│       ├── metadata-service/          # Public API: auth, users, videos, ingest, search/trace proxy
+│       ├── query-service/             # Search ranking, translation, SigLIP online query encoding
+│       ├── trace-service/             # Trace build/status/timeline/evidence clips
+│       ├── entrypoint.sh
+│       └── lightningai-compose.yml    # Legacy/alternate LightningAI compose
+│
+├── infra/
+│   └── postgres/
+│       ├── init/                      # DB init scripts
+│       └── migrations/                # Schema migration SQL files
+│
+├── scripts/                           # Deploy, model download, RT-DETR finetune, AI logging hooks
+├── secrets/                           # Local secret templates; real values are gitignored
+├── docs/                              # Extra rules/docs
+├── camera_0002/                       # Benchmark/debug scripts for detector/tracker tuning
+├── docker-compose.yml                 # VPS/Coolify frontend-only deployment
+├── docker-compose.lightningai.yml     # Backend + DB deployment on LightningAI
+├── docker-compose.backend-included.yml# Older all-in-one VPS stack, not the main deploy path
+├── DEPLOY.md                          # Detailed deployment guide
+├── JOURNAL.md                         # Weekly progress journal
+├── WORKLOG.md                         # Sprint/worklog decisions and tasks
+├── move.py                            # Google Drive/local file organization helper
+└── ingest_local.py                    # Local ingestion/debug helper
+```
+
+---
+
+## Tech stack
+
+| Layer | Công nghệ |
+| ----- | --------- |
+| Frontend | Next.js 14, React 18, TypeScript, Tailwind CSS |
+| Public API | FastAPI metadata-service |
+| Search | FastAPI query-service, SigLIP, SeamlessM4T |
+| Trace | FastAPI trace-service, ffmpeg/evidence rendering |
+| AI video processing | PyTorch, Transformers, RT-DETR, DINOv2, SigLIP, VideoMAE, Qwen2-VL |
+| Database | PostgreSQL 16, SQLAlchemy 2, pgvector |
+| Deploy | Docker Compose, Coolify VPS, LightningAI |
+| Storage | `/workspace/storage`, optional Google Drive OAuth |
+
+---
+
+## AI pipeline
+
+### Metadata/video processing
+
+`metadata-service` warmup các model chính khi startup:
+
+| Model | Vai trò |
+| ----- | ------- |
+| RT-DETR R50 | Person detection |
+| DINOv2 ViT-L/14 | Appearance embedding / ReID features |
+| SigLIP / SigLIP2 fallback | Image/text embedding cho search |
+| VideoMAE V2 | Action recognition theo tracklet |
+| Qwen2-VL-7B-Instruct | Open-vocabulary appearance metadata/caption |
+
+Output được lưu thành:
+
+- `videos`: metadata video, camera, thời điểm ghi hình, đường dẫn storage.
+- `tracklets`: người được detect/tracking trong video.
+- `tracklets_embeddings`: SigLIP embedding 1152-dim, dùng cho text/image search.
+- `tracklets_actions`: action classification.
+- `tracklet_observations`: bbox theo frame/timestamp để xem chi tiết tracklet.
+
+### Search/ranking
+
+`query-service` nhận shortlist từ DB và tính điểm bằng nhiều tín hiệu:
+
+- SigLIP text/image similarity.
+- Metadata/attribute match từ Qwen.
+- Chất lượng tracklet/crop.
+- Camera/time filters.
+- Merge threshold để gom tracklet/candidate cùng người.
+
+Các tham số đang được tune qua env:
+
+- `MIN_FUSION_SCORE`
+- `MAX_CANDIDATES`
+- `QUERY_MERGE_THRESHOLD`
+
+### Trace/evidence
+
+`trace-service` xử lý:
+
+- `select`: chọn candidate cho query.
+- `candidate-detail`: lấy toàn bộ tracklet của candidate.
+- `build`: dựng evidence video/timeline.
+- `candidate-tracklet/remove`: loại tracklet sai khỏi candidate.
+- `continue`: trace tiếp với window mới.
+- `feedback`: ghi nhận xác nhận của người dùng.
+
+---
+
+## Database
+
+Schema chính nằm trong [backend/services/shared/models.py](backend/services/shared/models.py). Nhóm bảng hiện tại:
+
+| Nhóm | Bảng |
+| ---- | --- |
+| User/auth | `users` |
+| Camera/topology | `cameras`, `camera_zones`, `camera_edges`, `camera_settings` |
+| Video/tracklet | `videos`, `tracklets`, `tracklets_embeddings`, `tracklets_actions`, `tracklet_observations` |
+| Query/candidate | `query_history`, `query_candidates`, `query_candidate_tracklets`, `query_jobs`, `spatiotemporal_groups` |
+| Evidence/feedback | `evidence_videos`, `evidence_tracklets`, `verified_objects`, `verified_objects_tracklets` |
+| Internal queue | `queue_video_assets` |
+
+Migrations hiện có:
+
+```text
+infra/postgres/migrations/
+├── 2026-05-12-add-tracklet-observations.sql
+├── 2026-05-12-refactor-tracklets-schema.sql
+└── 2026-05-13-add-video-drive-file-id.sql
+```
+
+---
+
+## API chính
+
+Frontend gọi qua metadata-service public prefix `/api/v1`.
+
+| API | Mục đích |
+| --- | ------- |
+| `POST /api/v1/auth/login` | Đăng nhập |
+| `GET /api/v1/auth/me` | Lấy user hiện tại |
+| `GET /api/v1/users` | Quản lý user |
+| `GET /api/v1/videos` | Danh sách video |
+| `POST /api/v1/video/process` | Xử lý một video |
+| `POST /api/v1/video/process/stream` | Xử lý video dạng stream |
+| `POST /api/v1/video/batch/process` | Xử lý batch video |
+| `POST /api/v1/ingest/move-and-process` | Move/ingest rồi process |
+| `POST /api/v1/ingest/full-pipeline` | Chạy full ingest pipeline |
+| `POST /api/v1/search` | Tìm candidate |
+| `GET /api/v1/search/overview` | Overview metrics |
+| `GET /api/v1/candidates/{candidate_id}/preview` | Preview image candidate |
+| `GET /api/v1/history` | Lịch sử query |
+| `GET /api/v1/history/{query_id}/candidates` | Candidate trong một query lịch sử |
+| `GET /api/v1/history/{query_id}/evidence` | Evidence video trong history |
+| `POST /api/v1/trace/candidate-detail` | Chi tiết candidate và tracklets |
+| `POST /api/v1/trace/select` | Chọn candidate |
+| `POST /api/v1/trace/build` | Build trace evidence |
+| `GET /api/v1/trace/status/{evidence_id}` | Trạng thái evidence |
+| `GET /api/v1/trace/timeline/{evidence_id}` | Timeline evidence |
+| `POST /api/v1/trace/candidate-tracklet/remove` | Xóa tracklet khỏi candidate |
+
+Health checks:
+
+```bash
+curl http://localhost:8002/health
+curl http://localhost:8003/health
+curl http://localhost:8004/health
+```
+
+---
+
+## Hướng dẫn sử dụng sản phẩm
+
+Trong sản phẩm đã có video hướng dẫn tại trang **Hướng dẫn**. Sau khi đăng nhập, người dùng có thể mở mục **Hướng dẫn** trên sidebar để xem cách thao tác các luồng chính:
+
+- tìm kiếm bằng mô tả hoặc ảnh;
+- lọc theo camera và thời gian;
+- xem candidate và toàn bộ tracklet;
+- chọn candidate để trace;
+- xem evidence video/timeline;
+- xem lại lịch sử query và candidate.
+
+---
+
+## Cài đặt và chạy
+
+### Yêu cầu
+
+| Thành phần | Gợi ý |
+| ---------- | ----- |
+| Node.js | >= 18.17 |
+| Python | 3.10+ / 3.11 tùy service |
+| Docker | Docker Engine + Compose v2 |
+| GPU | A100 80GB trên LightningAI cho full pipeline |
+| Storage | `/workspace/storage`, `/workspace/models`, optional Google Drive secrets |
+
+### Cài frontend local
+
+```bash
+cd frontend
+cp .env.example .env.local
+# sửa NEXT_PUBLIC_API_BASE_URL trỏ tới metadata-service:
+# NEXT_PUBLIC_API_BASE_URL=http://localhost:8002/api/v1
+# hoặc https://8002-<workspace>.cloudspaces.litng.ai/api/v1
+npm install
+npm run dev
+```
+
+Frontend dev server chạy tại:
+
+```text
+http://localhost:4000
+```
+
+### Chạy backend bằng Docker Compose trên LightningAI
+
+```bash
+cp .env.lightningai.example .env.lightningai
+# sửa POSTGRES_PASSWORD, DATABASE_URL, JWT_SECRET_KEY, LIGHTNINGAI_PUBLIC_URL
+
+mkdir -p /workspace/storage/videos
+mkdir -p /workspace/storage/traces
+mkdir -p /workspace/storage/queue
+mkdir -p /workspace/storage/candidate-previews
+mkdir -p /workspace/storage/cache
+mkdir -p /workspace/models/huggingface
+mkdir -p /workspace/models/torch
+
+docker compose -f docker-compose.lightningai.yml --env-file .env.lightningai up -d --build
+```
+
+Xem log:
+
+```bash
+docker compose -f docker-compose.lightningai.yml --env-file .env.lightningai logs -f metadata-service
+docker compose -f docker-compose.lightningai.yml --env-file .env.lightningai logs -f query-service
+docker compose -f docker-compose.lightningai.yml --env-file .env.lightningai logs -f trace-service
+```
+
+---
+
+## Deploy
+
+Chi tiết đầy đủ nằm ở [DEPLOY.md](DEPLOY.md). Tóm tắt deploy hiện tại:
+
+### 1. LightningAI: backend + database
+
+```bash
+cp .env.lightningai.example .env.lightningai
+docker compose -f docker-compose.lightningai.yml --env-file .env.lightningai build
+docker compose -f docker-compose.lightningai.yml --env-file .env.lightningai up -d
+```
+
+Public API chính là metadata-service:
+
+```text
+https://8002-<WORKSPACE-ID>.cloudspaces.litng.ai/api/v1
+```
+
+### 2. VPS/Coolify: frontend only
+
+Tạo `.env` trên VPS:
+
+```env
+NEXT_PUBLIC_API_BASE_URL=https://8002-<WORKSPACE-ID>.cloudspaces.litng.ai/api/v1
+```
+
+Build và chạy:
+
+```bash
+docker compose --env-file .env build frontend
+docker compose --env-file .env up -d frontend
+```
+
+Khi LightningAI URL đổi, phải cập nhật `NEXT_PUBLIC_API_BASE_URL` và rebuild frontend vì URL được dùng lúc build.
+
+---
+
+## Biến môi trường quan trọng
+
+### `.env.lightningai`
+
+| Biến | Mô tả |
+| ---- | ---- |
+| `LIGHTNINGAI_PUBLIC_URL` | URL public của metadata-service port 8002 |
+| `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` | Thông tin PostgreSQL |
+| `DATABASE_URL` | SQLAlchemy URL, ví dụ `postgresql+psycopg2://...` |
+| `JWT_SECRET_KEY` | Key ký JWT, cần đủ mạnh |
+| `BOOTSTRAP_ADMIN_EMAIL/PASSWORD/FULL_NAME` | Admin tạo tự động khi startup |
+| `STORAGE_BASE_URL` | Base URL cho trace/evidence video |
+| `GOOGLE_DRIVE_ENABLED` | Bật/tắt Google Drive ingestion |
+| `STORAGE_INGEST_ENABLED` | Bật/tắt auto ingest từ storage |
+| `MIN_FUSION_SCORE` | Ngưỡng điểm search |
+| `MAX_CANDIDATES` | Số candidate tối đa |
+| `QUERY_MERGE_THRESHOLD` | Ngưỡng merge candidate/identity ở query-service |
+| `PIPELINE_SAMPLE_FPS` | FPS sampling khi xử lý video |
+| `QWEN2VL_MODEL_ID` | Override path/model Qwen2-VL |
 
 ### Frontend
 
-| Công nghệ | Vai trò |
-|-----------|---------|
-| Next.js 14+ | Framework React SSR/SSG |
-| TypeScript | Type safety |
-| Tailwind CSS | Styling utility-first |
-
-### Backend
-
-| Dịch vụ | Công nghệ | Vai trò |
-|---------|-----------|---------|
-| API Gateway | FastAPI + Uvicorn | REST public, auth JWT, proxy |
-| Metadata Service | FastAPI + SQLAlchemy 2.0 | Orchestration, queue, trace, DB |
-| AI Service | FastAPI | Search proxy, ranking, gọi tracking upstream |
-| Tracking Service | FastAPI (trên LightningAI) | Full AI inference pipeline |
-
-### AI / Computer Vision
-
-| Thư viện | Vai trò |
-|----------|---------|
-| `rfdetr` | Load RF-DETR 2XLarge, batch inference |
-| `transformers` | Load DINOv2 ViT-L/14 và VideoMAE Large |
-| `open_clip` | Load SigLIP2, text/image encode |
-| `opencv-python` | Decode video H.265, frame sampling |
-| `torch` + `torchvision` | Tensor ops, transforms |
-| `numpy` | Vector math, cosine similarity |
-
-### Database
-
-| Công nghệ | Vai trò |
-|-----------|---------|
-| PostgreSQL 16 | Primary DB — metadata, embedding, tracklet |
-| SQLAlchemy 2.0 | ORM — model mapping, query builder |
-| JSONB columns | Lưu raw_metadata phức tạp linh hoạt |
-
-### Infrastructure
-
-| Công nghệ | Vai trò |
-|-----------|---------|
-| Docker Compose | Orchestrate tất cả dịch vụ VPS |
-| LightningAI API Builder | Managed GPU service — auto-start |
-| Google Drive API v3 | Lưu trữ video gốc |
+| Biến | Mô tả |
+| ---- | ---- |
+| `NEXT_PUBLIC_API_BASE_URL` | URL metadata-service kèm `/api/v1`; frontend rewrites qua `/api-gw` |
 
 ---
 
-## 4. AI Models
+## Troubleshooting
 
-### RF-DETR 2XLarge — Person Detection
+### Frontend không gọi được API
 
-| Thuộc tính | Chi tiết |
-|------------|---------|
-| **Mục đích** | Phát hiện người trong từng frame đã sample |
-| **Input** | Batch PIL images |
-| **Output** | `xyxy` bbox, `confidence`, `class_id` (person = 1, COCO 1-indexed) |
-| **Checkpoint** | `rf-detr-xxlarge.pth` (484MB, COCO pretrained) |
-| **Confidence threshold** | 0.32 (detection), 0.40 (tracker high-conf), 0.45 (new track) |
-
-### HeadBoxTracker — Per-video Tracking
-
-| Thuộc tính | Chi tiết |
-|------------|---------|
-| **Mục đích** | Gán track ID cho từng người, duy trì identity xuyên suốt video |
-| **Cơ chế** | 3-stage cascade: high-conf → active, low-conf → active, unmatched → buffer re-entry |
-| **Matching** | Head-box IoU + center distance + capped velocity prediction |
-| **Buffer** | Track sống đến hết video (probe duration trước khi xử lý → không expire mid-video) |
-| **Key params** | `track_buffer=20` (5s), `max_buffer_frames=video_length`, `max_head_center_distance=120px` |
-| **Sample rate** | 4fps (default) — tất cả tham số calibrated cho 4fps |
-
-### DINOv2 ViT-L/14 — Appearance Re-ID Embedding
-
-| Thuộc tính | Chi tiết |
-|------------|---------|
-| **Mục đích** | Tạo vector đặc trưng ngoại hình 1024-dim để so sánh cross-camera và within-camera fragment merge |
-| **Input** | PIL crop ảnh người (bất kỳ kích thước, AutoImageProcessor resize) |
-| **Output** | `appearance_embedding_vector` — 1024-dim L2-normalized CLS token |
-| **Model** | `facebook/dinov2-large` (307M params, tự supervised trên 142M ảnh đa dạng) |
-| **Ưu điểm vs TransReID** | Generalise cho overhead/angled cameras — không bị bias view side/front của MSMT17 |
-| **Override** | `MCPT_DINOV2_MODEL_ID` env var (HF hub ID hoặc local path) |
-| **Lưu DB** | `person_candidates.raw_metadata['appearance_embedding_vector']` |
-
-### SigLIP2 ViT-L-16-512/webli — Text-Image Encoding
-
-| Thuộc tính | Chi tiết |
-|------------|---------|
-| **Mục đích** | Encode text query và image crops vào cùng embedding space 1024-dim |
-| **Output** | 1024-dim L2-normalized vector |
-| **Vai trò** | Zero-shot attribute classification (gender, age, shirt, pants, shoes, bag, hat, hair, skin) + action semantic embedding + query encoding |
-| **Lưu DB** | `raw_metadata['attribute_embedding_vector']`, `raw_metadata['action_semantic_embedding']` |
-
-### VideoMAE Large — Video Action Recognition
-
-| Thuộc tính | Chi tiết |
-|------------|---------|
-| **Mục đích** | Phân loại hành động của người trong clip 2s |
-| **Input** | 16 frames × 224×224 |
-| **Output** | CLS token 1024-dim; kết hợp với SigLIP2 text để chọn action label |
-| **Checkpoint** | `storage/model-weights/videomae-action/model.safetensors` (1.3GB, Kinetics-400) |
-| **Action vocabulary** | `standing_or_slow_motion`, `walking_motion`, `running_or_fast_motion`, `bending_or_sit_like_motion`, `fall_like_motion`, `carrying_object_like_motion` |
-
----
-
-## 5. Pipeline Offline Indexing
-
-### Stage 1 — Input Video
-
-Download video từ Google Drive URL về local filesystem LightningAI.
-
-### Stage 2 — Frame Decode + Sample 4fps
-
-OpenCV decode, lấy 1 frame mỗi 0.25s. Tính Laplacian variance để đánh giá blur.
-
-Output: `SampledFrame[]` — mỗi frame có `frame_index` (sampled index), `timestamp_second`, `image`, `laplacian_score`.
-
-### Stage 3 — Person Detection
-
-RF-DETR 2XLarge predict. Filter `class_id == 1` (person). Output `FrameDetection[]` per frame.
-
-### Stage 4 — Tracking per Video
-
-HeadBoxTracker 3-stage cascade:
-- **Stage 1:** high-conf detections → active tracks (IoU + center distance + velocity)
-- **Stage 2:** low-conf detections → unmatched active tracks
-- **Stage 3:** unmatched high-conf → buffer tracks (re-entry, capped velocity prediction)
-- Buffer không expire mid-video (max_buffer_frames = ceil(video_duration × 4fps) + 1)
-- `finalize_all()` ở cuối video finalize tất cả active + buffer tracks
-
-Output: `LocalTracklet[]` — mỗi tracklet có `track_id`, `observations[]`.
-
-### Stage 5 — Tracklet Quality Scoring
-
-Filter: `frame_count ≥ 9`, `duration ≥ 2s`, `frame_density ≥ 0.10`, `avg_laplacian ≥ 12.0`, `avg_confidence ≥ 0.30`.
-
-### Stage 6 — Best Frame Selection
-
-Rank frames theo `laplacian × 0.4 + bbox_area × 0.3 + confidence × 0.3`. Lấy top frames cho feature extraction.
-
-### Stage 7 — Attribute & Appearance Extraction
-
-**7a. Static Attribute — SigLIP2 Zero-shot**
-
-`gender` (male/female), `age_group` (child/adult/elderly). Output: `attribute_embedding_vector` (1024-dim SigLIP2 text).
-
-**7b. Appearance Attribute — SigLIP2 Zero-shot**
-
-8 fields: `head_accessory`, `hat`, `hair_color`, `skin_tone`, `shirt`, `pants`, `shoes`, `bag`.
-
-**7c. Appearance Embedding — DINOv2 ViT-L/14**
-
-DINOv2 encode full-body crop → 1024-dim CLS token. Quality-weighted pool across selected frames.
-
-Output: `appearance_embedding_vector` — 1024-dim L2-normalized.
-
-> Thay thế TransReID + KPR part fusion. DINOv2 CLS token đã capture full-body appearance mà không cần part crops.
-
-### Stage 8 — Action Recognition
-
-VideoMAE Large (sliding window 2s, stride 1.5s) + SigLIP2 text matching → `action_summary`, `action_semantic_embedding`.
-
-### Stage 9 — Within-camera Identity Resolution
-
-Sau khi tất cả tracklets đã có DINOv2 embedding, gom các fragment của cùng 1 người trong cùng camera:
-
-1. Temporal guard: 2 fragment không được overlap > 15% → nếu overlap nhiều = 2 người khác nhau
-2. Embedding similarity: cosine(appearance_embedding_A, appearance_embedding_B) ≥ 0.85
-3. Union-Find transitive closure (A≈B, B≈C → A,B,C cùng identity)
-4. Assign `human_key` chung → `_merge_people_by_identity()` merge data
-
-### Stage 10 — Feature Aggregation & Lưu DB
-
-Gom toàn bộ output thành 1 JSON per unique identity. Lưu vào `person_candidates`.
-
-**Output structure:**
-```json
-{
-  "track_id": "...",
-  "camera_id": "cam_01",
-  "human_key": "cam_01:track_id",
-  "merged_tracklet_count": 3,
-  "attribute_embedding_vector": [1024 floats],
-  "appearance_embedding_vector": [1024 floats],
-  "action_semantic_embedding": {"embedding_vector": [1024 floats], "labels": ["walking_motion"]},
-  "tracklet_quality": {"frame_count": 147, "duration_seconds": 36.75, "frame_density": 0.98},
-  "timeline": [{"start_second": 0.0, "end_second": 36.75, "action_summary": "walking_motion"}]
-}
-```
-
----
-
-## 6. Pipeline Online Search
-
-### Hybrid Scoring
-
-```
-Score = 0.42 × cosine(query_vector, appearance_embed)   ← DINOv2 / SigLIP2 1024-dim
-      + 0.20 × cosine(query_vector, action_embed)       ← SigLIP2 1024-dim
-      + 0.18 × attribute_keyword_match
-      + 0.12 × jaccard_token_overlap
-      + 0.05 × visibility_score
-      + 0.03 × world_position_bonus
-```
-
-> DINOv2 và SigLIP2 đều là 1024-dim — không còn dimension mismatch như kiến trúc cũ (TransReID 768-dim vs SigLIP2 1024-dim).
-
-### Luồng tổng quan
-
-```
-User nhập query text
-  → Phase 1: Hard filter DB theo camera_ids
-  → Phase 2: Local prefilter Jaccard shortlist
-  → Phase 3: Multi-modal query parsing (SigLIP2 encode)
-  → Phase 4: Hard filter time window
-  → Phase 5: Hybrid scoring mỗi candidate
-  → Phase 6: Sort by score
-  → Phase 7: Cross-camera deduplication (cosine ≥ 0.85)
-  ← Top-k candidates
-```
-
----
-
-## 7. Pipeline Trace
-
-### Stage 1 — Build Seed + Time Window
-
-Lấy candidate từ DB → `seed_time` = `recorded_start` + trung điểm timeline → window ±12h.
-
-### Stage 2 — Dynamic Topology Pruning
-
-BFS tối đa 3 hops từ `seed_camera` qua `camera_topology.json`. Giảm 80–90% candidate pool.
-
-### Stage 3 — Spatiotemporal Retrieval
-
-Query DB: `camera_id IN (camera_scope)` + `abs_time IN window`. Filter: `cosine(seed_appearance, candidate_appearance) ≥ 0.40`.
-
-### Stage 4 — Trajectory Path Search
-
-```
-segment_score = 0.55 × appearance_similarity  ← DINOv2 cosine
-              + 0.25 × topology_plausibility
-              + 0.20 × velocity_score
-```
-
-### Stage 5 — Re-ranking + Evidence Clips
-
-Loại bỏ temporal overlap và topology impossible (`topology_score < 0.05`).
-
-### Stage 6 — Human-in-the-loop Feedback
-
-Confirmed segments → average embedding → expand window +20% → re-trace với embedding mới.
-
----
-
-## 8. Luồng lưu trữ
-
-### Google Drive
-
-```
-VinUni/
-├── Temp/        ← Upload video mới vào đây
-└── Storage/     ← Cấu trúc chuẩn sau move.py
-    ├── cam01/
-    │   └── 2026-04-28/
-    │       └── cam01_2026-04-28_10-00.mp4
-    └── cam02/
-        └── 2026-04-28/
-```
-
-**Naming convention bắt buộc:** `cam{XX}_{YYYY-MM-DD}_{HH-mm}.mp4`
-
-### LightningAI Storage
-
-```
-storage/
-├── tracking-ingestion/
-│   ├── sources/   ← Video download từ Drive
-│   └── metadata/  ← JSON output
-└── model-weights/
-    ├── videomae-action/
-    │   ├── model.safetensors  (1.3GB)
-    │   └── config.json
-    └── rf-detr/
-        └── rf-detr-xxlarge.pth  (484MB)
-```
-
-> DINOv2 và SigLIP2 download tự động từ HuggingFace Hub lần đầu. Override bằng `MCPT_DINOV2_MODEL_ID` nếu cần dùng local cache.
-
----
-
-## 9. Cấu trúc thư mục
-
-```
-A20-App-119/
-├── backend/
-│   └── services/
-│       ├── metadata-service/
-│       │   └── app/
-│       ├── query-service/
-│       │   └── app/
-│       └── trace-service/          ← Chạy trên LightningAI A100
-│           └── app/
-│               ├── main.py
-│               ├── local_ingestion_pipeline.py  ← RF-DETR + HeadBoxTracker + merge
-│               ├── model_adapters.py            ← DINOv2ReIDHub, VideoMAEHub, SigLIP2ModelHub
-│               ├── tracklet_feature_pipeline.py
-│               ├── tracklet_memory_bank.py      ← Cross-camera Re-ID
-│               ├── service.py
-│               └── config.py
-│   └── config/
-│       ├── camera_topology.json
-│       └── camera_calibration.json
-├── frontend/
-├── infra/
-│   ├── docker-compose.yml
-│   ├── env/
-│   └── docker/
-├── scripts/
-├── secrets/                           ← GITIGNORED
-├── move.py
-└── ingest_local.py                    ← CLI để chạy ingestion local/debug
-```
-
----
-
-## 10. Cài đặt và chạy từ đầu
-
-### Prerequisites
-
-| Thành phần | Yêu cầu |
-|------------|---------|
-| Máy cá nhân | Python 3.11+, git |
-| VPS | Ubuntu 22.04+, Docker 24+, Docker Compose v2, RAM ≥ 12GB |
-| LightningAI | Account, API Builder enabled, GPU A100 |
-| Google Drive | Google Cloud project với Drive API enabled, OAuth2 credentials |
-
-### Bước 1 — Clone repo
+Kiểm tra:
 
 ```bash
-git clone <REPO_URL> && cd A20-App-119
+cat .env
+docker compose logs -f frontend
+curl https://8002-<WORKSPACE-ID>.cloudspaces.litng.ai/health
 ```
 
-### Bước 2 — Cấu hình môi trường
+Nếu URL LightningAI mới, cập nhật `.env` rồi rebuild frontend.
+
+### Backend startup lâu
+
+`metadata-service` và `query-service` warmup model GPU khi khởi động. Lần đầu có thể mất vài phút, đặc biệt nếu model cache chưa có.
 
 ```bash
-cp secrets/master.env.example secrets/master.env
-nano secrets/master.env
-# Điền: LIGHTNING_API_BASE_URL, TRACE_SERVICE_URL, DB credentials
+docker compose -f docker-compose.lightningai.yml --env-file .env.lightningai logs -f metadata-service
+nvidia-smi
 ```
 
-### Bước 3 — Start LightningAI API Builder
+### Search không ra candidate
 
-1. Vào LightningAI Studio → API Builder → `trace-service`
-2. Machine: **1 × A100**
-3. On start command: `bash A20-App-119/scripts/start_trace_service_api_builder.sh`
-4. Click **Start** | Bật **Auto start**
+Kiểm tra DB đã có tracklet chưa:
 
-Verify:
+```sql
+SELECT COUNT(*) FROM videos;
+SELECT COUNT(*) FROM tracklets;
+SELECT COUNT(*) FROM tracklets_embeddings;
+```
+
+Sau đó kiểm tra `MIN_FUSION_SCORE`, `QUERY_MERGE_THRESHOLD`, camera filter và time filter.
+
+### Trace không dựng được video
+
+Kiểm tra:
+
+- `trace-service` health.
+- File video gốc còn tồn tại trong storage/Drive.
+- `time_window_start/time_window_end` và timezone.
+- Logs của `trace-service` và static path `/static/traces`.
+
+### PostgreSQL lỗi sau restart LightningAI
+
+Repo có helper:
+
 ```bash
-curl -H "Authorization: Bearer <LIGHTNING_API_TOKEN>" \
-  https://8000-<HASH>.cloudspaces.litng.ai/health
-# Expected: {"status":"ok","service":"trace-service"}
+bash scripts/fix-pgdata.sh
+docker compose -f docker-compose.lightningai.yml --env-file .env.lightningai up -d
 ```
 
-### Bước 4 — Deploy VPS Stack
+---
+
+## Ghi chú bảo mật
+
+- Không commit `.env`, `.env.lightningai`, token OAuth, HF token hoặc file thật trong `secrets/`.
+- `.ai-log/*.jsonl` được gitignore; prompt logging chạy tự động qua hooks.
+- Trước khi tạo PR, đảm bảo đã chạy:
 
 ```bash
-bash infra/vps/check-secrets.sh .
-bash infra/vps/deploy.sh .
-docker compose -f infra/docker-compose.yml --env-file infra/env/backend.env ps
+bash scripts/setup_hooks.sh
 ```
 
-### Bước 5 — Upload và xử lý video
-
-```bash
-# Dry run
-python3 move.py --dry-run
-
-# Move thực: Temp/ → Storage/
-python3 move.py
-```
-
-Queue worker tự phát hiện trong 30s. Hoặc trigger thủ công:
-```bash
-docker exec mcpt-backend python -m metadata_app.queue_worker --once
-```
-
-### Bước 6 — Sử dụng hệ thống
-
-Truy cập frontend: `http://<VPS_IP>:3000`
+- Không paste token thật vào issue, commit, README hoặc log public.
+- PostgreSQL chỉ nên nằm trong Docker network nội bộ, không expose public.
 
 ---
 
-## 11. Biến môi trường
+## Tài liệu liên quan
 
-### `infra/env/backend.env`
-
-| Biến | Ví dụ | Bắt buộc |
-|------|-------|----------|
-| `POSTGRES_HOST` | `postgres` | ✅ |
-| `POSTGRES_PASSWORD` | `<secret>` | ✅ |
-| `POSTGRES_DATABASE` | `video_tracking` | ✅ |
-| `JWT_SECRET_KEY` | `<random>` | ✅ |
-| `TRACE_SERVICE_URL` | `https://8000-<HASH>.cloudspaces.litng.ai` | ✅ |
-| `LIGHTNING_API_TOKEN` | `<token>` | ✅ |
-| `QUEUE_PARALLEL_JOBS` | `3` | — |
-| `STORAGE_INGEST_SAMPLE_FPS` | `4` | — |
-| `GOOGLE_DRIVE_SOURCE_STORAGE_FOLDER_ID` | `1G6L...` | ✅ |
-
-### Trace Service env vars (LightningAI)
-
-| Biến | Mặc định | Mô tả |
-|------|----------|-------|
-| `MCPT_DINOV2_MODEL_ID` | `facebook/dinov2-large` | DINOv2 model ID hoặc local path |
-| `MCPT_REID_BATCH_SIZE` | `64` | Batch size cho DINOv2 inference |
-| `MCPT_REID_PRECISION` | `fp16` | Precision cho DINOv2 |
-| `MCPT_DETECTOR_BATCH_SIZE` | `8` | Batch size cho RF-DETR |
-| `MCPT_EMBEDDING_BATCH_SIZE` | `128` | Batch size cho SigLIP2 |
+- [DEPLOY.md](DEPLOY.md): hướng dẫn deploy chi tiết.
+- [WORKLOG.md](WORKLOG.md): phân công sprint và quyết định kỹ thuật.
+- [JOURNAL.md](JOURNAL.md): nhật ký phát triển theo tuần.
+- [docs/RULES_USER_ACCOUNT.md](docs/RULES_USER_ACCOUNT.md): quy tắc tài khoản người dùng.
 
 ---
 
-## 12. Database Schema
+## Thành viên
 
-### `queue_video_assets`
-
-| Column | Type | Mô tả |
-|--------|------|-------|
-| `video_id` | VARCHAR | Tên file video — primary key |
-| `camera_id` | VARCHAR | Camera ID (e.g. `cam_01`) |
-| `raw_video_metadata` | JSONB | sample_fps, tracklet_count, sampled_frame_count |
-| `created_at` | TIMESTAMP | Thời gian insert |
-
-### `person_candidates`
-
-| Column | Type | Mô tả |
-|--------|------|-------|
-| `id` | INTEGER | Auto-increment PK |
-| `candidate_id` | VARCHAR | UUID của tracklet/merged identity |
-| `camera_id` | VARCHAR | Camera ID |
-| `track_id` | VARCHAR | Local track ID (per video) |
-| `human_key` | VARCHAR | Resolved identity key (sau within-camera merge) |
-| `raw_metadata` | JSONB | Toàn bộ payload: `appearance_embedding_vector` (1024-dim DINOv2), `attribute_embedding_vector` (1024-dim SigLIP2), `action_semantic_embedding`, `timeline`, `tracklet_quality`, `merged_tracklet_count` |
-
----
-
-## 13. API Documentation
-
-### POST `/api/v1/auth/login`
-```json
-// Request
-{"username": "admin", "password": "<PASSWORD>"}
-// Response
-{"access_token": "eyJ...", "token_type": "bearer"}
-```
-
-### POST `/search`
-```json
-// Request
-{
-  "query": "người đàn ông áo xanh đeo balo",
-  "top_k": 10,
-  "camera_ids": ["cam07", "cam08"],
-  "time_from": "2026-04-28T08:00:00",
-  "time_to": "2026-04-28T12:00:00"
-}
-```
-
-### POST `/api/v1/trace/run`
-```json
-// Request
-{"candidate_id": "uuid", "window_hours": 12.0}
-```
-
-### POST `/api/v1/trace/feedback`
-```json
-{
-  "candidate_id": "uuid-seed",
-  "confirmed_segment_ids": ["uuid-1", "uuid-2"],
-  "rejected_segment_ids": ["uuid-3"]
-}
-```
-
-### GET `/health` *(LightningAI)*
-```json
-{"status": "ok", "service": "trace-service"}
-```
-
----
-
-## 14. Camera Topology
-
-File: `backend/config/camera_topology.json` — **50 cameras**, **56 edges**.
-
-| Khu vực | Cameras |
-|---------|---------|
-| Cổng chính, Drop-off, Bãi xe | cam01–cam06 |
-| Sảnh chính, Lễ tân | cam07–cam12 |
-| Hành lang tầng 1, Khám bệnh | cam13–cam22 |
-| Xét nghiệm, Chẩn đoán | cam23–cam30 |
-| Thang máy / Thang bộ | cam31–cam32 |
-| Tầng 2–5 | cam33–cam48 |
-| Mái, Rooftop | cam49–cam50 |
-
-Mỗi edge có `min_seconds`, `max_seconds`, `typical_seconds`, `confidence`. Bidirectional.
-
----
-
-## 15. Troubleshooting
-
-### LightningAI URL thay đổi sau restart
-```bash
-nano secrets/master.env
-# Cập nhật LIGHTNING_API_BASE_URL và TRACKING_SERVICE_URL
-bash scripts/sync_secrets.sh --vps
-```
-
-### DINOv2 download chậm lần đầu
-
-DINOv2 ViT-L (~1.2GB) download từ HuggingFace Hub lần đầu. Để dùng local cache:
-```bash
-# Trong LightningAI DevBox
-huggingface-cli download facebook/dinov2-large --local-dir /teamspace/studios/storage/model-weights/dinov2-large/
-# Sau đó set env var
-export MCPT_DINOV2_MODEL_ID=/teamspace/studios/storage/model-weights/dinov2-large/
-```
-
-### Search trả kết quả rỗng
-
-1. Có data trong DB? `SELECT COUNT(*) FROM person_candidates;`
-2. LightningAI còn chạy? `curl .../health`
-3. Thử bỏ `camera_ids` và `time_from`/`time_to`
-
-### Trace không tìm được hành trình
-
-1. Chưa đủ video trong time window
-2. Seed tracklet chất lượng thấp (blur, crop nhỏ)
-3. Threshold quá cao — thử giảm `min_similarity=0.35`
-
-### PostgreSQL connection failed
-```bash
-docker exec mcpt-postgres pg_isready -U mcpt_user -d video_tracking
-docker restart mcpt-postgres
-```
-
-### Within-camera merge quá aggressive (ít người quá)
-
-Tăng `reid_threshold` trong `_resolve_within_camera_identities` ([local_ingestion_pipeline.py](backend/services/trace-service/app/local_ingestion_pipeline.py)):
-```python
-reid_threshold: float = 0.85  # tăng lên 0.90–0.95 nếu cần
-```
-
----
-
-## 16. Security Notes
-
-- **Không commit** `secret/`, `secrets/` lên Git.
-- **OAuth token** (`oauth2_token.pickle`) có quyền đọc/ghi toàn bộ Drive — bảo vệ như password.
-- **LightningAI Bearer token** xác thực mọi request tới GPU service. Rotate định kỳ.
-- **PostgreSQL** không expose ra ngoài Docker network.
-- Khi debug với `curl`, dùng placeholder như `<JWT_TOKEN>`, không paste token thật vào log/chat.
-
----
-
-## 17. Performance Notes
-
-| Chỉ số | Giá trị |
-|--------|---------|
-| Throughput tracking | ~3–5 phút / video 10 phút trên A100 (DINOv2 lớn hơn TransReID) |
-| Parallel jobs | 3 video song song (`QUEUE_PARALLEL_JOBS=3`) |
-| Detector batch | 8–40 frames/pass tùy GPU |
-| 50 cameras × 10min | ~5–7 giờ xử lý (1 A100) |
-| Search latency | 5–30s (cold start ~60–120s) |
-| DINOv2 batch | 64 crops/pass @ fp16 |
-| Expected tracklets/camera (GT=25) | ~25–50 sau fragment merge |
-
-**Bottleneck:**
-- **DINOv2 inference:** Lớn hơn TransReID (~307M vs 86M params). Tăng `MCPT_REID_BATCH_SIZE` trên A100/H100.
-- **Fragment merge:** O(n²) per camera — với n=500 tracklets/camera không đáng kể (<1s).
-- **Cold start A100:** Auto start mất 60–120s sau idle — bật Auto start để minimize.
-
----
-
-## 18. Limitations & Future Work
-
-| Giới hạn | Mô tả |
-|----------|-------|
-| **Fragment merge threshold cần calibration** | `reid_threshold=0.85` là initial value — cần validate trên từng camera layout |
-| **Trace dựa trên heuristic** | Greedy path search không đảm bảo optimal trajectory |
-| **Topology tĩnh** | `camera_topology.json` cần update thủ công nếu layout thay đổi |
-| **Video ingestion theo lô** | Không hỗ trợ real-time streaming |
-| **Chưa có CI/CD** | Deploy thủ công qua SSH |
-| **Privacy** | Chưa có anonymization (blur face) cho video export |
-| **Single A100 GPU** | Scale horizontal chưa hỗ trợ |
-| **Không có automated tests** | `TODO: thêm pytest cho pipeline` |
-
----
-
-## 19. Thành viên nhóm
-
-| Tên | Vai trò |
-|-----|---------|
-| Cao Diệu Ly | Leader, PM, AI Research |
-| Dương Văn Hiệp | AI Engineer, Backend, Data Pipeline |
-| Bùi Văn Đạt | Backend, Frontend |
+| Tên | MSSV | Vai trò |
+| --- | --- | --- |
+| Dương Văn Hiệp | 2A202600052 | AI Engineer, Backend, Data Pipeline |
+| Bùi Văn Đạt | 2A202600355 | Backend, Frontend |
+| Cao Diệu Ly | 2A202600356 | Leader, PM, AI Research |

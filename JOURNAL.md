@@ -157,3 +157,188 @@ Ghi lại hành trình xây dựng sản phẩm mỗi tuần — những gì đ�
 - Hoàn thiện pipeline chạy được ổn định hơn từ data / DB đến model, backend và frontend.
 - Tiếp tục so sánh model detection, embedding và tracking theo metric đã chọn.
 - Chuẩn hoá dataset, metadata và API contract để phục vụ demo end-to-end.
+
+---
+
+## Tuần 04 - 26/04/2026
+
+**Thành viên:** Dương Văn Hiệp, Cao Diệu Ly, Bùi Văn Đạt
+
+### Đã làm
+- **Dương Văn Hiệp:** refactor runtime configuration và deployment workflow; tiếp tục làm gọn cấu trúc code; bổ sung metadata JSON cho camera 16–31; triển khai storage ingestion và video moving để chuẩn bị pipeline xử lý video theo lô.
+- **Bùi Văn Đạt:** thêm Tailwind CSS / PostCSS setup; cập nhật cấu trúc frontend; sửa ranked limit; cập nhật README và nội dung home guide để giao diện bám sát sản phẩm hơn.
+- **Cao Diệu Ly:** viết engineering code report cho kiến trúc Multi-Camera Person Tracking; cập nhật tài liệu AI architecture, core profiles, ingestion flow; cập nhật Google Drive folder IDs / names trong metadata-service và tracking-service.
+- Nhóm bắt đầu chuyển rõ từ “demo tìm kiếm video” sang hệ thống **Multi-Camera Person Tracking & Re-Identification** có ingest, lưu metadata, tracking và search.
+- Dọn các thư mục infra / secrets bị trùng để giảm nhầm lẫn khi cấu hình môi trường.
+
+### Chi tiết daily standup
+- **21/04/2026:** Hiệp refactor runtime configuration và deployment workflow; Đạt rà lại cấu trúc frontend; Ly kiểm tra lại kiến trúc tổng thể sau tuần đổi scope.
+- **22/04/2026:** Hiệp tiếp tục refactor code; Đạt thêm Tailwind CSS và PostCSS; Ly bổ sung engineering code report và tài liệu AI architecture.
+- **23/04/2026:** Ly cập nhật Google Drive folder IDs / names cho metadata-service và tracking-service; cả nhóm đồng bộ lại naming giữa Drive, DB và service.
+- **25/04/2026:** Đạt sửa ranked limit, cập nhật cấu trúc dự án, dọn phần `/model` cũ và cập nhật README / home guide.
+- **26/04/2026:** Hiệp thêm metadata JSON cho camera 16–31 và triển khai storage ingestion / video moving; nhóm dọn duplicated infra và secret directories.
+
+### Khó nhất tuần này
+- Naming giữa camera, Google Drive, metadata và backend service dễ lệch nhau, nếu không thống nhất sớm sẽ gây lỗi dây chuyền.
+- Việc tách repo thành nhiều service làm hệ thống đúng hướng hơn nhưng khiến cấu hình môi trường và secrets phức tạp hơn.
+- Cần cân bằng giữa viết tài liệu kiến trúc và tiếp tục code để pipeline chạy được.
+
+### AI tool đã dùng
+| Tool | Dùng để làm gì | Kết quả |
+|---|---|---|
+| ChatGPT | Hỗ trợ rà soát kiến trúc, viết lại tài liệu và mô tả luồng ingestion | Tài liệu rõ hơn, dễ giải thích pipeline hơn |
+| Codex | Hỗ trợ refactor code, đọc repo và cập nhật tài liệu theo cấu trúc mới | Giảm thời gian dọn code / docs lặp lại |
+
+### Học được
+- Với hệ thống nhiều camera, naming convention và metadata contract quan trọng không kém model.
+- Tài liệu kiến trúc cần bám sát code thật, nếu không sẽ nhanh chóng lệch khỏi sản phẩm.
+- Nên chuẩn hóa luồng storage / ingestion trước khi tối ưu model sâu hơn.
+
+### Nếu làm lại, sẽ làm khác
+- Khóa sớm format camera ID, folder Drive và metadata schema để tránh phải sửa nhiều nơi.
+- Tách rõ tài liệu “ý tưởng kiến trúc” và tài liệu “cách chạy production” ngay từ đầu.
+
+### Kế hoạch tuần tới
+- Hoàn thiện Google Drive ingestion và queue xử lý video.
+- Xây candidate search request và trace pipeline rõ hơn.
+- Chuẩn hóa secret management và luồng deploy lên VPS / GPU cloud.
+
+---
+
+## Tuần 05 - 03/05/2026
+
+**Thành viên:** Dương Văn Hiệp, Cao Diệu Ly, Bùi Văn Đạt
+
+### Đã làm
+- **Dương Văn Hiệp:** tối ưu queue runtime, remote endpoint, local ingestion batch processing và action clip builder; triển khai candidate search request; xây trace pipeline 6 stage; refactor tracker từ BoT-SORT / TransReID sang HeadBoxTracker, DINOv2 và within-camera identity resolution.
+- **Bùi Văn Đạt:** triển khai user permissions, giao diện login, dashboard guide; cập nhật sidebar, TopK select, note time/location; sửa preview auth forwarding và ổn định hiển thị candidate image.
+- **Cao Diệu Ly:** refactor secret export/import, sync secrets, HTTP client management và weight path resolution; rà soát deployment / environment setup; hỗ trợ cập nhật cấu hình VPS và Google Drive ingestion.
+- Nhóm thêm async video ingestion job queue, status polling, dedup source key, progress logging và endpoint `/api/v1/ingestion/jobs`.
+- Pipeline bắt đầu có luồng gần production hơn: Drive storage → queue → GPU processing → DB → search/candidate → trace.
+
+### Chi tiết daily standup
+- **27/04/2026:** Đạt thêm user permissions và cập nhật giao diện login / dashboard guide; nhóm kiểm tra lại quyền người dùng trong MVP.
+- **28/04/2026:** Ly và Hiệp làm Google Drive file management, public download URL, queue sync, logging và error handling cho ingestion.
+- **29/04/2026:** Hiệp nâng cấp queue runtime, batch processing, candidate search request và triển khai trace pipeline 6 stage.
+- **30/04/2026:** Ly refactor secret management; Hiệp cập nhật model adapters, weight path và logging; Đạt cập nhật sidebar, TopK select và note time/location.
+- **01/05/2026:** Nhóm sửa preview auth forwarding, permissions, sampling, async ingestion job queue, polling, dedup và nhiều lỗi runtime khi submit/poll video.
+- **02/05/2026:** Hiệp tối ưu embedding similarity, sample FPS, VideoMAE batch processing, chunked feature extraction và tracker.
+- **03/05/2026:** Hiệp cải thiện HeadBoxTracker, DINOv2 Re-ID, confidence thresholds và candidate search với tham số Drive URL.
+
+### Khó nhất tuần này
+- Ingestion qua Google Drive có nhiều edge case: URL lỗi, 503, 404 sau restart, file đã xử lý rồi nhưng queue vẫn chạy lại.
+- Tracker ban đầu còn dễ vụn tracklet hoặc merge chưa ổn, phải thử nhiều hướng như BoT-SORT, TransReID, HeadBoxTracker và DINOv2.
+- Quyền người dùng và preview image cần đi qua nhiều lớp auth/proxy nên dễ lỗi khi deploy.
+
+### AI tool đã dùng
+| Tool | Dùng để làm gì | Kết quả |
+|---|---|---|
+| ChatGPT | Gợi ý xử lý edge case cho queue, ingestion và tracking | Có thêm hướng retry, polling và phân rã lỗi |
+| Codex | Hỗ trợ refactor nhiều file, đọc commit/logic cũ và sửa lỗi runtime | Tăng tốc việc nối pipeline và dọn service |
+
+### Học được
+- Với video ingestion, “đã submit được” chưa đủ; cần trạng thái job, retry, fatal error và skip duplicate rõ ràng.
+- Tracking chất lượng phụ thuộc rất lớn vào threshold, sample FPS, feature extraction và logic merge tracklet.
+- UI candidate phải ổn định ảnh/thumbnail trước khi đánh giá được chất lượng search.
+
+### Nếu làm lại, sẽ làm khác
+- Thiết kế ingestion job state machine sớm hơn thay vì bổ sung dần theo lỗi.
+- Log chuẩn các bước queue / GPU / DB ngay từ đầu để debug nhanh hơn.
+
+### Kế hoạch tuần tới
+- Đưa hệ thống lên hạ tầng deploy ổn định hơn.
+- Sửa các lỗi Docker, API routing, DB schema và auth.
+- Hoàn thiện candidate preview, user/search UI và video processing schema.
+
+---
+
+## Tuần 06 - 10/05/2026
+
+**Thành viên:** Dương Văn Hiệp, Cao Diệu Ly, Bùi Văn Đạt
+
+### Đã làm
+- **Dương Văn Hiệp:** thêm proxy candidate preview qua LightningAI; nâng cấp video processing / tracking capabilities; triển khai RT-DETR person detection, candidates router và các thuộc tính người như age range, hat color, bag type, mask wearing, hair style, hair color.
+- **Bùi Văn Đạt:** thêm API list videos; sửa frontend API base URL, route path, SearchBar, Sidebar, MainShell, user management và search UI; cải thiện dark mode nhưng cũng revert các thay đổi UI chưa ổn để giữ sản phẩm ổn định.
+- **Cao Diệu Ly:** restructure services architecture, tài liệu Quickstart/README cho A100 GPU; sửa Docker/Coolify deploy, build context, Traefik, health check, DATABASE_URL, bcrypt/passlib, CORS, `/auth/me` và loại hardcoded HF token.
+- Nhóm deploy được phiên bản đầu tiên trên hạ tầng hiện tại vào **05/05/2026**.
+- Nhóm sửa nhiều lỗi production: DB table bootstrap, admin user, FastAPI router imports, session leaks, JSON/JSONB mismatch, API prefix `/v1`, Next.js rewrites và frontend standalone build.
+
+### Chi tiết daily standup
+- **04/05/2026:** Hiệp thêm proxy candidate preview và tracking service URL; nhóm chuẩn bị các nhánh deploy.
+- **05/05/2026:** Ly tập trung sửa Docker/Coolify, Traefik, DB URL, bcrypt, frontend build; nhóm đạt mốc deploy được.
+- **06/05/2026:** Đạt tích hợp video moving script với metadata service và thêm API list videos.
+- **07/05/2026:** Ly và Hiệp sửa bootstrap DB, admin user, router imports, session, route prefix, debug endpoints, Next.js standalone và rewrites.
+- **08/05/2026:** Ly hoàn thiện routing/config, bỏ hardcoded HF token, sửa `/auth/me` và double-prefix.
+- **09/05/2026:** Hiệp thêm RT-DETR / candidates router; Đạt cải thiện candidate preview, user management, layout và search UI; nhóm revert phần UI không ổn.
+- **10/05/2026:** Hiệp bổ sung schema thuộc tính người và refactor video processing models.
+
+### Khó nhất tuần này
+- Deploy thực tế phát sinh lỗi khác hoàn toàn local: build image, env build-time/runtime, Traefik host, API prefix và DB driver.
+- FastAPI router/session/DB schema có nhiều lỗi dây chuyền khi đổi kiến trúc service.
+- Frontend cần vừa đẹp hơn vừa không phá luồng search/candidate đang dùng để demo.
+
+### AI tool đã dùng
+| Tool | Dùng để làm gì | Kết quả |
+|---|---|---|
+| ChatGPT | Hỗ trợ phân tích lỗi deploy, Docker, CORS, routing và DB | Có checklist debug theo từng lớp hạ tầng |
+| Codex | Sửa nhiều lỗi code/config lặp lại, rà route/API prefix và cập nhật docs | Đẩy nhanh quá trình ổn định production |
+
+### Học được
+- Deploy là một phần của sản phẩm, không phải bước cuối “cho có”.
+- API prefix và env build-time của frontend phải được thống nhất cực kỳ chặt.
+- Khi UI thay đổi nhiều nhưng chưa chắc chắn, revert có chọn lọc giúp giữ demo ổn định.
+
+### Nếu làm lại, sẽ làm khác
+- Dựng staging deploy sớm hơn để phát hiện lỗi Docker/API trước khi pipeline đã quá lớn.
+- Viết checklist health check cho từng service: frontend, metadata, query, trace, postgres.
+
+### Kế hoạch tuần tới
+- Tăng chất lượng search/candidate ranking.
+- Hoàn thiện trace evidence, history và human-in-the-loop.
+- Tuning Qwen/SigLIP/tracker để giảm tracklet vụn và merge nhầm.
+
+---
+
+## Tuần 07 - 16/05/2026
+
+**Thành viên:** Dương Văn Hiệp, Cao Diệu Ly, Bùi Văn Đạt
+
+### Đã làm
+- **Dương Văn Hiệp - 2A202600052:** hoàn thiện DB và query; hoàn thiện DB schema để build; chạy và tiếp tục hoàn thiện luồng trace; hoàn chỉnh luồng để submit; chốt DB cuối cho bản nộp.
+- **Bùi Văn Đạt - 2A202600355:** update thêm data cho DB query; thêm và tối ưu trang hiển thị toàn bộ tracklet của candidate; hoàn thiện các chức năng cơ bản; sửa luồng lịch sử không lưu nhiều video; test hoàn chỉnh các luồng; fix time UTC ở bộ lọc thời gian.
+- **Cao Diệu Ly - 2A202600356:** kiểm tra DB mới và test trace; tiếp tục xây DB và sửa trace; tối ưu pipeline/query; thêm trang description; chạy full luồng trace; sửa merge tracklet bị ghép nhầm; sinh lại DB; thêm trace nhiều candidate, xóa tracklet khỏi candidate và dịch tiếng Việt; sửa full luồng detect, track, merge tracklet, similarity; fix trọng số tìm kiếm.
+- Nhóm tập trung tuần này vào việc đưa search → candidate → trace → history về trạng thái đủ ổn định để submit, ưu tiên DB đúng schema, trace chạy được, candidate hiển thị rõ và query/search có trọng số hợp lý hơn.
+- Nguồn tổng hợp chính: daily submissions trong tuần 11/05 → 16/05/2026, đối chiếu thêm với commit về DB/query, trace, history, timezone, merge tracklet và search threshold.
+
+### Chi tiết daily standup
+- **11/05/2026:** Hiệp hoàn thiện DB và query; Đạt update thêm data cho DB query; Ly kiểm tra DB mới và test luồng trace.
+- **12/05/2026:** Hiệp hoàn thiện DB schema để build; Đạt thêm trang hiển thị toàn bộ tracklet của candidate; Ly tiếp tục xây DB và sửa lại trace.
+- **13/05/2026:** Ly tiếp tục tối ưu pipeline, sửa logic query cho chính xác hơn, thêm trang description và chạy full luồng trace; Hiệp chạy luồng trace; Đạt tối ưu hiển thị toàn bộ tracklet.
+- **14/05/2026:** Hiệp tiếp tục hoàn thiện trace; Đạt hoàn thiện các chức năng cơ bản và sửa luồng lịch sử không lưu nhiều video; Ly sửa logic merge tracklet do bị ghép nhầm quá nhiều, sinh lại DB để test hiệu quả, thêm lựa chọn trace nhiều candidate, thêm lựa chọn xóa tracklet khỏi candidate và dịch tiếng Việt cho hiển thị.
+- **15/05/2026:** Ly sửa lại toàn bộ full luồng logic detect, track, merge tracklet và tính similarity, sau đó sinh lại DB; Hiệp hoàn chỉnh luồng để submit; Đạt test hoàn chỉnh các luồng.
+- **16/05/2026:** Hiệp hoàn thiện DB cuối; Ly sửa logic query và fix trọng số tìm kiếm; Đạt fix time UTC ở bộ lọc time.
+
+### Khó nhất tuần này
+- Search và trace phụ thuộc nhiều lớp: ranking, threshold, timezone, candidate merge, evidence render và history; sửa một lớp có thể làm lệch lớp khác.
+- Tracklet vụn và merge nhầm là hai lỗi đối nghịch: giảm vụn quá mạnh có thể merge nhầm, siết quá mạnh lại mất hành trình.
+- UX history/candidate cần đủ thông tin cho người vận hành nhưng không làm màn hình quá rối.
+
+### AI tool đã dùng
+| Tool | Dùng để làm gì | Kết quả |
+|---|---|---|
+| ChatGPT | Brainstorm logic search/trace, diễn giải lỗi timezone và cách trình bày UX | Có thêm hướng kiểm tra edge case và viết nhãn tiếng Việt rõ hơn |
+| Codex | Hỗ trợ sửa logic, refactor query/tracker/frontend và cập nhật tài liệu | Tăng tốc vòng lặp debug trong tuần nước rút |
+
+### Học được
+- Human-in-the-loop không chỉ là tính năng phụ; nó là cách giảm rủi ro khi ReID/search chưa thể hoàn hảo.
+- Threshold phải được tune theo dữ liệu thật và theo mục tiêu demo: ưu tiên không merge nhầm hay ưu tiên không bỏ sót.
+- Timezone, timestamp và hiển thị thời gian là phần nhỏ nhưng ảnh hưởng trực tiếp tới niềm tin của người dùng.
+
+### Nếu làm lại, sẽ làm khác
+- Tạo bộ test nhỏ cho timezone, ranking và trace window để không phải kiểm tra thủ công quá nhiều.
+- Lưu lại bảng tuning threshold theo ngày để biết thay đổi nào làm search tốt hơn hoặc tệ hơn.
+
+### Kế hoạch tiếp theo
+- Chuẩn bị demo cuối: chọn video/camera/query ổn định, kiểm tra search → candidate → trace → history.
+- Bổ sung test tối thiểu cho query ranking, trace time window và ingestion job state.
+- Viết ngắn gọn phần giới hạn hiện tại: single A100, batch ingestion, threshold cần calibration và chưa có realtime streaming.

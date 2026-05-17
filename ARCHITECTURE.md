@@ -1,423 +1,602 @@
-﻿# Architecture
+# TraceX-AI Architecture
 
-Tài liệu này mô tả pipeline đầy đủ dự tính của hệ thống `CCTV Person Search Engine` trong bối cảnh bệnh viện có khoảng `50 camera`.
+Tài liệu này mô tả kiến trúc hiện tại của TraceX-AI: hệ thống tìm kiếm và truy vết người trong nhiều camera bằng mô tả tự nhiên, dữ liệu tracklet, embedding và luồng xác nhận của người vận hành.
 
-Mục tiêu của kiến trúc là hỗ trợ người vận hành tìm một người trong nhiều camera bằng mô tả tự nhiên, xác nhận candidate đúng, sau đó truy hồi các lần xuất hiện liên quan và dựng lại hành trình.
+Khác với bản thiết kế ban đầu, kiến trúc hiện tại đã tách rõ:
 
----
-
-## 1. Bối cảnh hệ thống
-
-Bệnh viện là môi trường có mật độ người cao, nhiều khu vực liên thông và nhiều camera hoạt động song song:
-
-- khoảng `50 camera`
-- nhiều khu vực: sảnh chính, hành lang, thang máy, khu khám bệnh, cấp cứu, bãi xe, cổng ra vào
-- video có thể đến từ NVR export, local storage hoặc hệ thống lưu trữ nội bộ
-- người vận hành cần tìm người nhanh trong nhiều camera thay vì xem lại từng video thủ công
-
-Với bối cảnh này, hệ thống cần được thiết kế theo hướng:
-
-- xử lý nặng ở bước offline indexing
-- search theo tracklet thay vì raw frame
-- hỗ trợ multi-camera retrieval
-- có bước xác nhận của người dùng trước khi truy hồi sâu
-- lưu metadata có cấu trúc để filter theo camera, thời gian và khu vực
-- ưu tiên triển khai trong mạng nội bộ bệnh viện để bảo vệ dữ liệu nhạy cảm
+- **Frontend** chạy trên VPS/Coolify.
+- **Backend + database + GPU services** chạy trên LightningAI.
+- **PostgreSQL + pgvector** là kho dữ liệu chính cho video, tracklet, embedding, query, candidate và evidence.
+- Search/trace đều đi qua `metadata-service` để frontend chỉ cần một API base URL.
 
 ---
 
-## 2. Pipeline đầy đủ dự tính
+## 1. Bối cảnh và mục tiêu
 
-```mermaid
-flowchart TB
-    subgraph Offline_Pipeline[Offline indexing pipeline]
-        Video[Video]
-        DetectionTracking[Detection + Tracking]
-        Tracklets[Tracklets]
-        EmbeddingMetadata[Embedding + Metadata]
-        TrackletIndex[Tracklet Index]
+TraceX-AI phục vụ bài toán vận hành camera giám sát: người dùng cần tìm một người cụ thể trong nhiều video/camera mà không phải xem thủ công từng đoạn.
 
-        Video --> DetectionTracking --> Tracklets --> EmbeddingMetadata --> TrackletIndex
-    end
+Mục tiêu hiện tại:
 
-    subgraph Online_Search[Online search and investigation]
-        UserQuery[User Query]
-        TextEmbedding[Text Embedding]
-        SearchIndex[Search Tracklet Index]
-        TopK[Top-k Candidates]
-        UserSelect[User Selects Candidate]
-        CrossCamera[Cross-camera Retrieval]
-        Stitching[Trajectory Stitching]
-        FinalVideo[Final Video]
+- xử lý video offline thành tracklet có metadata và embedding;
+- cho phép tìm kiếm bằng text hoặc ảnh, kèm bộ lọc camera/thời gian;
+- trả về candidate có preview, description và toàn bộ tracklet liên quan;
+- cho phép người dùng chọn candidate để dựng trace/evidence;
+- lưu lại lịch sử query, candidate và evidence video;
+- cho phép human-in-the-loop: xóa tracklet sai khỏi candidate, trace nhiều candidate, xem lại history.
 
-        UserQuery --> TextEmbedding --> SearchIndex --> TopK --> UserSelect --> CrossCamera --> Stitching --> FinalVideo
-    end
+Không phải trọng tâm hiện tại:
 
-    TrackletIndex --> SearchIndex
+- realtime streaming;
+- nhận dạng danh tính tuyệt đối;
+- scale đa GPU tự động;
+- training model lớn từ đầu trong app chính.
+
+---
+
+## 2. Kiến trúc triển khai
+
+```text
+┌──────────────────────────────────────────────────────────────────┐
+│  VPS / Coolify                                                   │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │ Frontend (Next.js)                                        │  │
+│  │ container: mcpt-frontend                                  │  │
+│  │ port 3000 -> Traefik / HTTPS                              │  │
+│  │ API rewrite: /api-gw -> LightningAI metadata-service      │  │
+│  └──────────────────────────────┬─────────────────────────────┘  │
+└─────────────────────────────────┼────────────────────────────────┘
+                                  │ HTTPS /api/v1
+                                  │ NEXT_PUBLIC_API_BASE_URL
+                                  ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  LightningAI                                                     │
+│                                                                  │
+│  ┌──────────────────┐   ┌──────────────────┐   ┌──────────────┐ │
+│  │ metadata-service │   │  query-service   │   │ trace-service│ │
+│  │ FastAPI          │   │  FastAPI         │   │ FastAPI      │ │
+│  │ public :8002     │   │  internal :8003  │   │ internal:8004│ │
+│  │ auth/videos      │   │  search/ranking  │   │ trace/build  │ │
+│  │ ingest/history   │   │  translation     │   │ evidence     │ │
+│  └────────┬─────────┘   └────────┬─────────┘   └──────┬───────┘ │
+│           │                      │                    │         │
+│           └──────────────────────┴────────────────────┘         │
+│                                  │                              │
+│                     ┌────────────▼────────────┐                 │
+│                     │ PostgreSQL + pgvector   │                 │
+│                     │ internal :5432          │                 │
+│                     └─────────────────────────┘                 │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
+### Runtime rule
+
+- Browser không gọi trực tiếp `query-service` hoặc `trace-service`.
+- Frontend gọi `metadata-service` qua `/api-gw` hoặc `NEXT_PUBLIC_API_BASE_URL`.
+- `metadata-service` gọi nội bộ:
+  - `query-service` qua `http://query-service:8003`;
+  - `trace-service` qua `http://trace-service:8004`.
+- PostgreSQL chỉ nằm trong Docker network của LightningAI, không expose public.
+
 ---
 
-## 3. Offline Indexing Pipeline
+## 3. Service responsibilities
 
-### 3.1 Video
+### 3.1 Frontend
 
-Video đầu vào đến từ hệ thống camera bệnh viện. Mỗi video cần có metadata tối thiểu:
+Vị trí: `frontend/`
 
-- `video_id`
-- `camera_id`
-- `camera_location`
-- `start_time`
-- `end_time`
-- `fps`
-- `source_path`
+Công nghệ:
 
-Ở quy mô khoảng `50 camera`, dữ liệu nên được xử lý theo batch hoặc job queue để tránh phải infer đồng thời toàn bộ camera.
+- Next.js 14;
+- React 18;
+- TypeScript;
+- Tailwind CSS.
 
-### 3.2 Detection + Tracking
+Trách nhiệm:
 
-Mục tiêu của bước này là phát hiện người và nối các detection theo thời gian để tạo track.
+- đăng nhập và giữ session;
+- home/search UI;
+- candidate result panel;
+- candidate detail modal;
+- history pages;
+- trace page;
+- admin/users/settings pages;
+- proxy API qua `/api-gw`;
+- proxy static files qua `/static`.
 
-Detection:
+Các feature chính:
 
-- phát hiện class `person`
-- lọc theo confidence threshold
-- lọc bbox quá nhỏ hoặc nhiễu
+- `features/home/HomeView.tsx`
+- `features/search/SearchResultsPanel.tsx`
+- `features/history/HistoryView.tsx`
+- `features/history/HistoryCandidatesView.tsx`
+- `features/trace/TraceView.tsx`
+- `features/candidate/CandidateDetailModal.tsx`
 
-Tracking:
+### 3.2 metadata-service
 
-- nối detection qua nhiều frame
-- giảm ID switch trong khu vực đông người
-- loại bỏ track quá ngắn
-- giữ bbox theo từng frame để phục vụ crop và clip preview
+Vị trí: `backend/services/metadata-service/`
 
-### 3.3 Tracklets
+Public API chính, port `8002`.
 
-Tracklet là đơn vị trung tâm của hệ thống. Một tracklet đại diện cho một người được theo dõi liên tục trong một đoạn video từ một camera.
+Trách nhiệm:
 
-Một tracklet nên gồm:
+- auth/JWT và bootstrap admin;
+- user management;
+- video metadata;
+- ingest endpoints;
+- video processing endpoints;
+- static crop/query-image/trace serving;
+- search proxy sang `query-service`;
+- trace proxy sang `trace-service`;
+- history storage/retrieval.
+
+Routers chính:
+
+- `/api/v1/auth`
+- `/api/v1/users`
+- `/api/v1/videos`
+- `/api/v1/video`
+- `/api/v1/ingest`
+- `/api/v1/search`
+- `/api/v1/candidates`
+- `/api/v1/history`
+- `/api/v1/trace`
+
+GPU model warmup hiện nằm ở `metadata-service`:
+
+- RT-DETR R50: person detection;
+- DINOv2 ViT-L/14: appearance/ReID features;
+- SigLIP/SigLIP2 fallback: image-text embedding;
+- VideoMAE V2: action recognition;
+- Qwen2-VL-7B-Instruct: open-vocabulary person metadata.
+
+### 3.3 query-service
+
+Vị trí: `backend/services/query-service/`
+
+Internal API, port `8003`.
+
+Trách nhiệm:
+
+- nhận query/search request từ `metadata-service`;
+- encode text/image query;
+- parse metadata từ query;
+- tính ranking/fusion score;
+- merge candidate theo threshold;
+- lưu `query_history`, `query_candidates`, `query_candidate_tracklets`;
+- dịch text hiển thị sang tiếng Việt khi cần;
+- cung cấp overview metrics.
+
+Model chính:
+
+- SigLIP So400m text/image tower;
+- SeamlessM4T v2-large cho translation.
+
+Tham số quan trọng:
+
+- `MIN_FUSION_SCORE`
+- `MAX_CANDIDATES`
+- `QUERY_MERGE_THRESHOLD`
+- `QUERY_SERVICE_LOG_LEVEL`
+
+### 3.4 trace-service
+
+Vị trí: `backend/services/trace-service/`
+
+Internal API, port `8004`.
+
+Trách nhiệm:
+
+- chọn candidate cho trace;
+- trả candidate detail gồm toàn bộ tracklet;
+- xóa tracklet khỏi candidate;
+- build evidence video/timeline;
+- trả trace status/timeline;
+- nhận feedback;
+- continue trace;
+- render/cache trace clips;
+- đọc video từ local storage hoặc Drive cache khi cần.
+
+Routers chính:
+
+- `/api/v1/trace/select`
+- `/api/v1/trace/build`
+- `/api/v1/trace/status/{evidence_id}`
+- `/api/v1/trace/timeline/{evidence_id}`
+- `/api/v1/trace/feedback`
+- `/api/v1/trace/candidate-detail`
+- `/api/v1/trace/candidate-tracklet/remove`
+- `/api/v1/trace/continue`
+
+### 3.5 shared module
+
+Vị trí: `backend/services/shared/`
+
+Trách nhiệm:
+
+- SQLAlchemy models;
+- shared database/session config;
+- time helpers;
+- common schema compatibility.
+
+File quan trọng:
+
+- `shared/models.py`
+- `shared/database.py`
+- `shared/tracklet_time.py`
+
+---
+
+## 4. Data flow
+
+### 4.1 Ingest / video processing
+
+```text
+Video source
+  -> metadata-service /api/v1/video/process hoặc /api/v1/ingest/*
+  -> decode/sample frames
+  -> RT-DETR person detection
+  -> tracking + tracklet observations
+  -> Qwen/SigLIP/DINOv2/VideoMAE feature extraction
+  -> merge/filter tracklets
+  -> write DB:
+       videos
+       tracklets
+       tracklets_embeddings
+       tracklets_actions
+       tracklet_observations
+  -> write files:
+       crops
+       previews
+       local cached source/evidence assets
+```
+
+Storage entrypoints:
+
+- Local files in `/workspace/storage`;
+- optional Google Drive via OAuth secrets;
+- helper scripts `move.py` and `ingest_local.py` for local/debug workflows.
+
+### 4.2 Search
+
+```text
+User query + optional image + filters
+  -> frontend SearchBar
+  -> metadata-service POST /api/v1/search
+  -> query-service POST /api/v1/search
+  -> encode query text/image
+  -> DB shortlist from tracklets/embeddings
+  -> fusion scoring
+  -> candidate merge/grouping
+  -> write:
+       query_history
+       query_candidates
+       query_candidate_tracklets
+  -> metadata-service returns candidates to frontend
+```
+
+Search inputs:
+
+- `query` or `text`;
+- `top_k`;
+- `offset`;
+- `camera_ids`;
+- `time_from`;
+- `time_to`;
+- optional `query_image`.
+
+Search outputs:
+
+- `query_id`;
+- ranked candidates;
+- candidate preview URL;
+- score fields;
+- camera/time metadata;
+- appearance summary;
+- tracklet linkage for later trace/detail.
+
+### 4.3 Candidate review
+
+```text
+Candidate selected in frontend
+  -> metadata-service POST /api/v1/trace/candidate-detail
+  -> trace-service POST /api/v1/trace/candidate-detail
+  -> load query_candidate_tracklets + tracklets + observations/actions
+  -> localize display fields
+  -> frontend displays all tracklets and description
+```
+
+The user can:
+
+- inspect all tracklets of a candidate;
+- select one or multiple candidates for trace;
+- remove wrong tracklets from a candidate;
+- go back to history and inspect previous query/candidate state.
+
+### 4.4 Trace / evidence
+
+```text
+User selects candidate
+  -> POST /api/v1/trace/select
+  -> POST /api/v1/trace/build
+  -> trace-service builds evidence segments
+  -> render/cache clips in /workspace/storage/traces
+  -> write:
+       evidence_videos
+       evidence_tracklets
+  -> frontend polls status/timeline
+  -> user gives feedback or continues trace
+```
+
+Trace output:
+
+- evidence video URL;
+- ordered timeline;
+- segment count;
+- time window;
+- confidence;
+- linked tracklets.
+
+---
+
+## 5. Database model
+
+Schema chính nằm ở `backend/services/shared/models.py`.
+
+### User/auth
+
+- `users`
+
+### Camera/topology
+
+- `cameras`
+- `camera_zones`
+- `camera_edges`
+- `camera_settings`
+
+Camera config files:
+
+- `backend/config/camera_topology.json`
+- `backend/config/camera_calibration.json`
+- `backend/config/homography_registry.json`
+- `backend/config/world_projection_calibration.json`
+
+### Video/tracklet
+
+- `videos`
+- `tracklets`
+- `tracklets_embeddings`
+- `tracklets_actions`
+- `tracklet_observations`
+
+Important tracklet fields:
 
 - `tracklet_id`
 - `video_id`
 - `camera_id`
-- `local_track_id`
-- `start_frame`
-- `end_frame`
-- `start_second`
-- `end_second`
-- danh sách bbox theo thời gian
-- các frame/crop đại diện
-
-### 3.4 Embedding + Metadata
-
-Với mỗi tracklet, hệ thống sinh embedding và metadata để phục vụ search.
+- `start_time`, `end_time`
+- appearance fields: upper/lower/shoes/bag/hat/mask/hair/gender/age;
+- `appearance_summary`;
+- `crop_url`;
+- `representative_bbox`;
+- `quality_score`;
+- BEV coordinates.
 
 Embedding:
 
-- visual embedding từ crop người
-- ReID embedding để so sánh identity
-- embedding trung bình hoặc embedding đại diện theo thời gian
+- table: `tracklets_embeddings`;
+- field: `siglip_embedding`;
+- dimension: 1152 when pgvector is available.
 
-Metadata:
+### Query/candidate
 
-- camera, vị trí camera, ngày giờ
-- khoảng thời gian xuất hiện
-- bbox và frame đại diện
-- caption / appearance summary
-- đường dẫn crop, thumbnail hoặc clip preview
+- `query_history`
+- `query_candidates`
+- `query_candidate_tracklets`
+- `query_jobs`
+- `spatiotemporal_groups`
 
-VLM/captioning nên nhận **tracklet crops** thay vì video gốc. Cách này giúp mô tả tập trung vào ngoại hình người trong tracklet.
+Important candidate fields:
 
-### 3.5 Tracklet Index
+- `candidate_id`;
+- `query_id`;
+- `fusion_score`;
+- `vector_score`;
+- `text_score`;
+- `spatiotemporal_score`;
+- `rank_position`;
+- `preview_url`;
+- `appearance_summary`;
+- `primary_camera_id`.
 
-Tracklet index lưu các vector và metadata đã chuẩn hóa để phục vụ truy vấn.
+### Evidence/feedback
 
-Index nên hỗ trợ:
+- `evidence_videos`
+- `evidence_tracklets`
+- `verified_objects`
+- `verified_objects_tracklets`
 
-- vector search theo embedding
-- filter theo camera/khu vực/thời gian
-- lookup metadata theo `tracklet_id`
-- update theo batch khi có video mới
-- partition theo ngày hoặc camera để giảm phạm vi search
+### Internal staging
 
-Ở quy mô bệnh viện, metadata nên đi vào database có cấu trúc như `PostgreSQL`, còn vector có thể lưu bằng `FAISS` hoặc vector database tương đương.
+- `queue_video_assets`
 
----
-
-## 4. Online Search Pipeline
-
-### 4.1 User Query
-
-Người vận hành nhập mô tả tự nhiên, ví dụ:
-
-- `người mặc áo xanh đi qua khu cấp cứu`
-- `người đeo ba lô xuất hiện ở sảnh chính`
-- `người đội mũ đi từ thang máy sang hành lang tầng 2`
-
-Query có thể kèm filter:
-
-- thời gian
-- camera
-- khu vực
-- tầng / khoa / cổng
-
-### 4.2 Text Embedding
-
-Query được encode thành text embedding để so sánh với tracklet index.
-
-Ngoài embedding, hệ thống có thể tách các điều kiện có cấu trúc:
-
-- thời gian
-- camera/khu vực
-- thuộc tính ngoại hình đơn giản
-
-### 4.3 Search Tracklet Index
-
-Backend dùng text embedding và metadata filters để tìm tracklet phù hợp.
-
-Kết quả search là danh sách `top-k candidates`, mỗi candidate có:
-
-- crop hoặc thumbnail đại diện
-- camera/khu vực
-- thời gian xuất hiện
-- caption / appearance summary
-- similarity score
-- clip preview ngắn nếu có
-
-### 4.4 User Selects Candidate
-
-Người dùng chọn candidate đúng nhất trong `top-k`. Bước này rất quan trọng vì mô tả tự nhiên có thể mơ hồ và nhiều người trong bệnh viện có ngoại hình tương tự.
-
-Candidate được chọn trở thành anchor cho bước truy hồi sâu hơn.
-
-### 4.5 Cross-camera Retrieval
-
-Hệ thống dùng anchor candidate để tìm cùng một người trong các camera/video khác.
-
-Logic truy hồi nên kết hợp:
-
-- ReID/visual embedding similarity
-- ràng buộc thời gian
-- vị trí camera và hướng di chuyển có thể xảy ra
-- ngưỡng similarity
-- loại bỏ kết quả trùng hoặc mâu thuẫn thời gian
-
-Output của bước này là tập tracklets có khả năng thuộc cùng một người.
-
-### 4.6 Trajectory Stitching
-
-Các tracklet match được sắp xếp và nối lại thành trajectory.
-
-Trajectory nên gồm:
-
-- thứ tự xuất hiện theo thời gian
-- camera/khu vực tương ứng
-- start/end time của từng segment
-- crop/thumbnail/clip preview
-- score hoặc mức tin cậy của từng đoạn
-
-### 4.7 Final Video
-
-Final output có thể là:
-
-- timeline các lần xuất hiện
-- danh sách clip preview theo thứ tự thời gian
-- evidence video ghép từ các segment liên quan
-- metadata để người vận hành kiểm tra lại
+Used for storage/Drive ingestion staging.
 
 ---
 
-## 5. Data Model Dự Tính
+## 6. Storage architecture
 
-### Tracklet Candidate
+### Runtime storage
 
-```json
-{
-  "tracklet_id": "cam01_20260419_000001",
-  "video_id": "cam01_20260419_080000.mp4",
-  "camera_id": "cam01",
-  "camera_location": "ER corridor",
-  "local_track_id": "1",
-  "global_person_id": null,
-  "start_time": "2026-04-19T08:03:20",
-  "end_time": "2026-04-19T08:03:52",
-  "start_frame": 120,
-  "end_frame": 248,
-  "representative_bbox": [100, 80, 64, 180],
-  "content_frames": [
-    {
-      "frame_idx": 120,
-      "second": 30.0,
-      "bbox": [100, 80, 64, 180]
-    }
-  ],
-  "embedding_vector": [0.01, 0.02],
-  "person_caption": "a person wearing dark pants",
-  "appearance_summary": "a person wearing dark pants"
-}
+On LightningAI:
+
+```text
+storage/
+├── pgdata/                 # PostgreSQL bind mount
+├── videos/                 # source/local videos
+├── traces/                 # evidence clips/videos
+├── queue/                  # ingest queue cache
+├── candidate-previews/     # candidate preview assets
+├── cache/                  # trace/cache workspace
+└── model-weights/          # optional local model weights
 ```
 
-### Search Candidate
+Model cache:
 
-```json
-{
-  "tracklet_id": "cam01_20260419_000001",
-  "score": 0.78,
-  "camera_id": "cam01",
-  "camera_location": "ER corridor",
-  "start_time": "2026-04-19T08:03:20",
-  "end_time": "2026-04-19T08:03:52",
-  "thumbnail_path": "outputs/thumbs/cam01_20260419_000001.jpg",
-  "clip_path": "outputs/clips/cam01_20260419_000001.mp4",
-  "appearance_summary": "a person wearing dark pants"
-}
+```text
+/home/zeus/.cache/huggingface
+/home/zeus/.cache/torch
 ```
 
-### Global Trajectory
+Secrets:
 
-```json
-{
-  "global_person_id": "person_0001",
-  "anchor_tracklet_id": "cam01_20260419_000001",
-  "segments": [
-    {
-      "tracklet_id": "cam01_20260419_000001",
-      "camera_id": "cam01",
-      "camera_location": "ER corridor",
-      "start_time": "2026-04-19T08:03:20",
-      "end_time": "2026-04-19T08:03:52",
-      "similarity": 1.0
-    },
-    {
-      "tracklet_id": "cam07_20260419_000421",
-      "camera_id": "cam07",
-      "camera_location": "Main lobby",
-      "start_time": "2026-04-19T08:05:10",
-      "end_time": "2026-04-19T08:05:38",
-      "similarity": 0.82
-    }
-  ]
-}
+```text
+secrets/
+├── master.env.example
+├── shared.env.example
+└── oauth/                  # real OAuth files are not committed
 ```
 
----
+### Static serving
 
-## 6. Backend Services Dự Tính
+`metadata-service` mounts:
 
-### Ingestion Service
+- `/static/crops`
+- `/static/query-images`
+- `/static/traces`
 
-- nhận video mới
-- tạo job xử lý video
-- quản lý trạng thái ingest/index
-
-### Detection / Tracking Service
-
-- detect person
-- track theo từng camera/video
-- xuất tracklets
-
-### Metadata / Embedding Service
-
-- sinh visual embedding
-- sinh caption từ tracklet crop
-- chuẩn hóa metadata
-- ghi DB và vector index
-
-### Search Service
-
-- encode user query
-- áp dụng metadata filter
-- search tracklet index
-- trả `top-k candidates`
-
-### ReID / Cross-camera Service
-
-- nhận anchor candidate
-- tìm cùng người qua camera khác
-- gán global ID tạm thời hoặc lâu dài
-
-### Trajectory Service
-
-- sắp xếp tracklets theo thời gian
-- stitch thành trajectory
-- xuất final timeline hoặc final video
+Frontend proxies static assets through Next.js rewrite when needed.
 
 ---
 
-## 7. Storage Dự Tính
+## 7. API boundary
 
-### Metadata Database
+Frontend only needs one base URL:
 
-Nên dùng database có cấu trúc cho quy mô bệnh viện:
+```text
+NEXT_PUBLIC_API_BASE_URL=https://8002-<workspace>.cloudspaces.litng.ai/api/v1
+```
 
-- `PostgreSQL` cho metadata chính
-- index theo `camera_id`, `camera_location`, `start_time`, `end_time`
-- partition theo ngày hoặc camera nếu dữ liệu lớn
+`frontend/next.config.js` rewrites:
 
-### Vector Index
+- `/api-gw/:path*` -> upstream `/api/v1/:path*`;
+- `/static/:path*` -> upstream `/static/:path*`.
 
-- `FAISS` hoặc vector database tương đương
-- index visual/text-compatible embedding
-- hỗ trợ rebuild theo batch
-- có mapping từ vector row sang `tracklet_id`
+Primary public APIs:
 
-### File Storage
-
-- raw video hoặc đường dẫn tới video gốc
-- representative crops
-- thumbnails
-- short clips
-- final evidence video
-
----
-
-## 8. Scalability Considerations
-
-Với khoảng `50 camera`, hệ thống không nên xử lý tất cả camera theo thời gian thực trong MVP. Hướng phù hợp hơn là:
-
-- xử lý theo batch/offline trước
-- chia job theo video hoặc camera
-- ưu tiên camera/khoảng thời gian do người dùng chọn
-- partition metadata theo ngày/camera
-- cache thumbnail và clip preview
-- chỉ tạo final video khi người dùng xác nhận candidate
-
-Nếu cần mở rộng về sau:
-
-- thêm job queue cho ingestion
-- tách ingestion service và search service
-- dùng PostgreSQL thay SQLite
-- dùng vector database chuyên dụng nếu FAISS local không đủ
-- thêm monitoring cho thời gian xử lý từng camera
+- `POST /api/v1/auth/login`
+- `GET /api/v1/auth/me`
+- `GET /api/v1/videos`
+- `POST /api/v1/video/process`
+- `POST /api/v1/video/process/stream`
+- `POST /api/v1/video/batch/process`
+- `POST /api/v1/search`
+- `GET /api/v1/history`
+- `GET /api/v1/history/{query_id}/candidates`
+- `GET /api/v1/history/{query_id}/evidence`
+- `POST /api/v1/trace/candidate-detail`
+- `POST /api/v1/trace/select`
+- `POST /api/v1/trace/build`
+- `GET /api/v1/trace/status/{evidence_id}`
+- `GET /api/v1/trace/timeline/{evidence_id}`
+- `POST /api/v1/trace/candidate-tracklet/remove`
 
 ---
 
-## 9. Security và Privacy
+## 8. Deployment architecture
 
-Dữ liệu bệnh viện có độ nhạy cảm cao, nên kiến trúc cần coi privacy là yêu cầu chính.
+Current deployment path:
 
-- Không hardcode API key ở frontend.
-- Video và evidence nên nằm trong mạng nội bộ hoặc storage được kiểm soát.
-- Backend phải kiểm soát quyền truy cập theo user/role.
-- Logs nên tránh ghi mô tả cá nhân hoặc frame/crop không cần thiết.
-- Final evidence chỉ nên export đúng segment liên quan.
-- Cần có audit trail cho thao tác search/export nếu triển khai thực tế.
+| File | Purpose |
+| ---- | ------- |
+| `docker-compose.yml` | VPS/Coolify frontend only |
+| `docker-compose.lightningai.yml` | LightningAI backend + database |
+| `.env.vps.example` | frontend env template |
+| `.env.lightningai.example` | backend env template |
+| `DEPLOY.md` | operational deployment steps |
+
+Service ports:
+
+| Service | Port | Public |
+| ------- | ---- | ------ |
+| frontend | 3000 | via VPS Traefik HTTPS |
+| metadata-service | 8002 | yes, LightningAI public URL |
+| query-service | 8003 | internal only |
+| trace-service | 8004 | internal only |
+| PostgreSQL | 5432 | internal only |
 
 ---
 
-## 10. Phạm vi Pipeline Dự Tính
+## 9. Scalability considerations
 
-Pipeline đầy đủ dự tính bao gồm:
+Current design is batch/offline-first.
 
-- ingest video từ khoảng `50 camera`
-- detection và tracking để tạo tracklet
-- embedding và metadata cho tracklet
-- tracklet index có thể search
-- text query embedding
-- top-k candidate retrieval
-- user confirmation
-- cross-camera retrieval
-- trajectory stitching
-- final video / evidence timeline
+Reasons:
 
-Các phần realtime streaming, nhận dạng danh tính tuyệt đối và huấn luyện model lớn từ đầu không phải trọng tâm của pipeline dự tính giai đoạn này.
+- video processing is GPU-heavy;
+- Qwen/SigLIP/VideoMAE inference is expensive;
+- tracklet quality depends on batch tuning;
+- trace rendering can be CPU/IO-bound.
+
+Recommended scale path:
+
+1. Keep frontend stateless.
+2. Keep PostgreSQL as source of truth.
+3. Add explicit job queue for video processing if ingest volume increases.
+4. Partition/index DB by camera/time for large deployments.
+5. Keep trace/evidence rendering async and pollable.
+6. Split model workloads across GPUs only after job boundaries are stable.
+7. Add observability for:
+   - ingest latency;
+   - detection/tracking throughput;
+   - candidate count;
+   - search latency;
+   - trace render time;
+   - failed Drive/local video fetches.
+
+---
+
+## 10. Security and privacy
+
+Current requirements:
+
+- no secrets in frontend bundle except public API base URL;
+- no real `.env`, OAuth token, HF token, or private Drive credential committed;
+- JWT required for user-facing APIs;
+- PostgreSQL not publicly exposed;
+- logs should avoid dumping full personal descriptions, tokens, or private URLs;
+- evidence clips should be scoped to the selected query/candidate;
+- admin/user actions should remain auditable through query/history tables.
+
+Operational requirement from `AGENTS.md`:
+
+- run `bash scripts/setup_hooks.sh` before creating PRs;
+- do not commit `.ai-log/*.jsonl`.
+
+---
+
+## 11. Known limitations
+
+- No realtime camera stream processing in the current app.
+- Single LightningAI backend environment is the main deployment target.
+- Search and merge thresholds still require dataset-specific calibration.
+- Trace depends on source video availability in storage/Drive.
+- Some legacy files remain for older deployment paths, e.g. `docker-compose.backend-included.yml` and `backend/services/lightningai-compose.yml`.
+- Automated test coverage for full ingest/search/trace is still limited.
+
+---
+
+## 12. Information still needed for production hardening
+
+The repo is enough to document the current architecture. For production-grade architecture, the following inputs are still needed:
+
+- expected number of cameras active per day;
+- average video duration and file size;
+- required retention period for source videos, crops, traces and query history;
+- expected concurrent users;
+- target search latency and trace render latency;
+- whether Google Drive remains the storage backend or will be replaced by internal object storage/NVR;
+- privacy policy for evidence export and access logs;
+- backup/restore requirements for PostgreSQL and `/storage`.
