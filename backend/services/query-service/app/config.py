@@ -39,7 +39,7 @@ class Settings:
     public_api_base_url: str = os.getenv("PUBLIC_API_BASE_URL", "")
 
     # Hybrid search: min score threshold for returning results
-    min_fusion_score: float = float(os.getenv("MIN_FUSION_SCORE", "0.55"))
+    min_fusion_score: float = float(os.getenv("MIN_FUSION_SCORE", "0.5"))
 
     # Max candidates to return
     max_candidates: int = int(os.getenv("MAX_CANDIDATES", "50"))

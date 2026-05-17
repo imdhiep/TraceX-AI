@@ -97,6 +97,10 @@ services:
       - VLM_BATCH_MAX_SIZE=${VLM_BATCH_MAX_SIZE:-8}
       - VLM_BATCH_MAX_NEW_TOKENS_PER_CROP=${VLM_BATCH_MAX_NEW_TOKENS_PER_CROP:-512}
       - MAX_VIDEO_FRAMES=500
+      # Pipeline frame-sampling rate for BoT-SORT.
+      - PIPELINE_SAMPLE_FPS=${PIPELINE_SAMPLE_FPS:-6}
+      # Tracker backend: botsort (default) | adaptive (legacy BodyPartAdaptiveTracker)
+      - TRACER_BACKEND=${TRACER_BACKEND:-botsort}
       # Public base URL for metadata-service (used for generating storage URLs)
       - NEXT_PUBLIC_API_GATEWAY_URL=${COOLIFY_PUBLIC_URL:-}
     volumes:
