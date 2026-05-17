@@ -1,9 +1,49 @@
 "use client";
 
 import { type ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
+import { DayPicker, type DateRange } from "react-day-picker";
+import { vi } from "date-fns/locale";
+import { CalendarRange, ImagePlus, MapPin, X } from "lucide-react";
+import "react-day-picker/style.css";
 
 import { LOCATION_OPTIONS, summarizeSelectedLocations } from "@/lib/config";
 import { useSearch } from "@/features/search/SearchContext";
+
+function pad(n: number) {
+  return String(n).padStart(2, "0");
+}
+
+function parseDateTimeLocal(value: string): Date | undefined {
+  if (!value) return undefined;
+  const [datePart, timePart = "00:00"] = value.split("T");
+  const [y, m, d] = datePart.split("-").map(Number);
+  const [hh, mm] = timePart.split(":").map(Number);
+  if (!y || !m || !d) return undefined;
+  return new Date(y, m - 1, d, hh || 0, mm || 0);
+}
+
+function formatDateTimeLocal(date: Date | undefined, timeHHmm: string): string {
+  if (!date) return "";
+  const [hh, mm] = (timeHHmm || "00:00").split(":");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${hh}:${mm}`;
+}
+
+function extractTime(value: string): string {
+  if (!value) return "";
+  const parts = value.split("T");
+  return parts[1] ?? "";
+}
+
+function formatRangeLabel(from: string, to: string): string {
+  const f = parseDateTimeLocal(from);
+  const t = parseDateTimeLocal(to);
+  if (!f && !t) return "Thời gian";
+  const fmt = (d: Date) =>
+    `${pad(d.getDate())}/${pad(d.getMonth() + 1)} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  if (f && t) return `${fmt(f)} → ${fmt(t)}`;
+  if (f) return `Từ ${fmt(f)}`;
+  return `Đến ${fmt(t!)}`;
+}
 
 type SearchBarProps = {
   className?: string;
@@ -28,21 +68,66 @@ export function SearchBar({ className = "" }: SearchBarProps) {
   const [locationKeyword, setLocationKeyword] = useState("");
   const [imageError, setImageError] = useState<string | null>(null);
   const [imagePreviewOpen, setImagePreviewOpen] = useState(false);
+  const [dateOpen, setDateOpen] = useState(false);
   const locationRef = useRef<HTMLDivElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const imageButtonRef = useRef<HTMLButtonElement | null>(null);
   const queryInputRef = useRef<HTMLInputElement | null>(null);
+  const dateRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     function onClickOutside(event: MouseEvent) {
-      if (!locationRef.current) return;
-      if (!locationRef.current.contains(event.target as Node)) {
+      const target = event.target as Node;
+      if (locationRef.current && !locationRef.current.contains(target)) {
         setLocationOpen(false);
+      }
+      if (dateRef.current && !dateRef.current.contains(target)) {
+        setDateOpen(false);
       }
     }
     document.addEventListener("mousedown", onClickOutside);
     return () => document.removeEventListener("mousedown", onClickOutside);
   }, []);
+
+  const dateRange: DateRange | undefined = useMemo(() => {
+    const from = parseDateTimeLocal(filters.timeFrom);
+    const to = parseDateTimeLocal(filters.timeTo);
+    if (!from && !to) return undefined;
+    return { from, to };
+  }, [filters.timeFrom, filters.timeTo]);
+
+  const fromTime = extractTime(filters.timeFrom) || "00:00";
+  const toTime = extractTime(filters.timeTo) || "23:59";
+
+  function handleRangeSelect(range: DateRange | undefined) {
+    if (!range) {
+      setTimeFrom("");
+      setTimeTo("");
+      return;
+    }
+    setTimeFrom(range.from ? formatDateTimeLocal(range.from, fromTime) : "");
+    setTimeTo(range.to ? formatDateTimeLocal(range.to, toTime) : "");
+  }
+
+  function handleFromTimeChange(value: string) {
+    const current = parseDateTimeLocal(filters.timeFrom) ?? dateRange?.from;
+    if (!current) {
+      const today = new Date();
+      setTimeFrom(formatDateTimeLocal(today, value));
+      return;
+    }
+    setTimeFrom(formatDateTimeLocal(current, value));
+  }
+
+  function handleToTimeChange(value: string) {
+    const current = parseDateTimeLocal(filters.timeTo) ?? dateRange?.to;
+    if (!current) {
+      const today = new Date();
+      setTimeTo(formatDateTimeLocal(today, value));
+      return;
+    }
+    setTimeTo(formatDateTimeLocal(current, value));
+  }
 
   useEffect(() => {
     return () => {
@@ -137,11 +222,7 @@ export function SearchBar({ className = "" }: SearchBarProps) {
           title="Tải ảnh mẫu (tối đa 5MB)"
           className="min-h-[52px] shrink-0 cursor-pointer rounded-2xl border border-slate-200/90 bg-white/85 px-4 text-sm font-medium text-slate-700 shadow-[0_12px_30px_rgba(15,23,42,0.08)] transition duration-200 hover:border-sky-300 hover:text-slate-900 dark:border-slate-700/90 dark:bg-slate-900/85 dark:text-slate-200 dark:shadow-[0_16px_34px_rgba(2,6,23,0.35)] dark:hover:border-sky-500 dark:hover:text-white"
         >
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2">
-            <rect x="3" y="3" width="18" height="18" rx="2" />
-            <path d="M3 15l6-6 4 4 2-2 6 6" />
-            <circle cx="8.5" cy="8.5" r="1.5" />
-          </svg>
+          <ImagePlus className="h-5 w-5" strokeWidth={1.9} />
         </button>
         <button
           type="submit"
@@ -156,9 +237,10 @@ export function SearchBar({ className = "" }: SearchBarProps) {
         <div className="relative" ref={locationRef}>
           <button
             type="button"
-            className="min-h-[44px] cursor-pointer rounded-xl border border-slate-200/90 bg-white/85 px-4 text-sm font-medium text-slate-700 shadow-[0_8px_20px_rgba(15,23,42,0.06)] transition duration-200 hover:border-sky-300 hover:text-slate-900 dark:border-slate-700/90 dark:bg-slate-900/85 dark:text-slate-200 dark:shadow-[0_12px_26px_rgba(2,6,23,0.32)] dark:hover:border-sky-500 dark:hover:text-white"
+            className="inline-flex min-h-[44px] cursor-pointer items-center gap-2 rounded-xl border border-slate-200/90 bg-white/85 px-4 text-sm font-medium text-slate-700 shadow-[0_8px_20px_rgba(15,23,42,0.06)] transition duration-200 hover:border-sky-300 hover:text-slate-900 dark:border-slate-700/90 dark:bg-slate-900/85 dark:text-slate-200 dark:shadow-[0_12px_26px_rgba(2,6,23,0.32)] dark:hover:border-sky-500 dark:hover:text-white"
             onClick={() => setLocationOpen((prev) => !prev)}
           >
+            <MapPin className="h-4 w-4" strokeWidth={1.9} />
             {selectedCount ? `${selectedSummary} (${selectedCount})` : "Vị trí"}
           </button>
           {locationOpen ? (
@@ -200,20 +282,70 @@ export function SearchBar({ className = "" }: SearchBarProps) {
           ) : null}
         </div>
 
-        <input
-          type="datetime-local"
-          value={filters.timeFrom}
-          onChange={(event) => setTimeFrom(event.target.value)}
-          className="min-h-[44px] rounded-xl border border-slate-200/90 bg-white/85 px-3 text-sm text-slate-700 shadow-[0_8px_20px_rgba(15,23,42,0.06)] outline-none ring-sky-300/35 focus:border-sky-400 focus:ring-2 dark:border-slate-700/90 dark:bg-slate-900/85 dark:text-slate-200 dark:shadow-[0_12px_26px_rgba(2,6,23,0.32)] dark:[color-scheme:dark]"
-          aria-label="Thời gian bắt đầu"
-        />
-        <input
-          type="datetime-local"
-          value={filters.timeTo}
-          onChange={(event) => setTimeTo(event.target.value)}
-          className="min-h-[44px] rounded-xl border border-slate-200/90 bg-white/85 px-3 text-sm text-slate-700 shadow-[0_8px_20px_rgba(15,23,42,0.06)] outline-none ring-sky-300/35 focus:border-sky-400 focus:ring-2 dark:border-slate-700/90 dark:bg-slate-900/85 dark:text-slate-200 dark:shadow-[0_12px_26px_rgba(2,6,23,0.32)] dark:[color-scheme:dark]"
-          aria-label="Thời gian kết thúc"
-        />
+        <div className="relative" ref={dateRef}>
+          <button
+            type="button"
+            onClick={() => setDateOpen((prev) => !prev)}
+            className="inline-flex min-h-[44px] cursor-pointer items-center gap-2 rounded-xl border border-slate-200/90 bg-white/85 px-4 text-sm font-medium text-slate-700 shadow-[0_8px_20px_rgba(15,23,42,0.06)] transition duration-200 hover:border-sky-300 hover:text-slate-900 dark:border-slate-700/90 dark:bg-slate-900/85 dark:text-slate-200 dark:shadow-[0_12px_26px_rgba(2,6,23,0.32)] dark:hover:border-sky-500 dark:hover:text-white"
+            aria-label="Chọn khoảng thời gian"
+          >
+            <CalendarRange className="h-4 w-4" strokeWidth={1.9} />
+            {formatRangeLabel(filters.timeFrom, filters.timeTo)}
+          </button>
+          {dateOpen ? (
+            <div className="absolute left-0 top-[calc(100%+8px)] z-40 rounded-2xl border border-slate-200/90 bg-white/95 p-3 shadow-[0_18px_36px_rgba(15,23,42,0.16)] backdrop-blur-md dark:border-slate-700/90 dark:bg-slate-950/95 dark:shadow-[0_24px_50px_rgba(2,6,23,0.45)]">
+              <DayPicker
+                mode="range"
+                numberOfMonths={2}
+                locale={vi}
+                selected={dateRange}
+                onSelect={handleRangeSelect}
+                weekStartsOn={1}
+                showOutsideDays
+                className="rdp-tracex"
+              />
+              <div className="mt-2 flex flex-wrap items-center gap-3 border-t border-slate-200 pt-3 dark:border-slate-800">
+                <label className="flex items-center gap-2 text-xs font-medium text-slate-600 dark:text-slate-300">
+                  Từ
+                  <input
+                    type="time"
+                    value={fromTime}
+                    onChange={(e) => handleFromTimeChange(e.target.value)}
+                    className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm text-slate-800 outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-300/35 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:[color-scheme:dark]"
+                  />
+                </label>
+                <label className="flex items-center gap-2 text-xs font-medium text-slate-600 dark:text-slate-300">
+                  Đến
+                  <input
+                    type="time"
+                    value={toTime}
+                    onChange={(e) => handleToTimeChange(e.target.value)}
+                    className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-sm text-slate-800 outline-none focus:border-sky-400 focus:ring-2 focus:ring-sky-300/35 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:[color-scheme:dark]"
+                  />
+                </label>
+                <div className="ml-auto flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setTimeFrom("");
+                      setTimeTo("");
+                    }}
+                    className="text-xs font-medium text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200"
+                  >
+                    Xoá
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDateOpen(false)}
+                    className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-blue-500"
+                  >
+                    Xong
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
+        </div>
         <button
           type="button"
           onClick={clearFilters}
@@ -244,10 +376,7 @@ export function SearchBar({ className = "" }: SearchBarProps) {
               title="Xóa ảnh"
               className="ml-1 flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded-full border border-slate-200 bg-white text-slate-500 transition hover:border-red-300 hover:bg-red-50 hover:text-red-600 dark:border-slate-700 dark:bg-slate-950/60 dark:text-slate-400 dark:hover:border-red-500/60 dark:hover:bg-red-950/40 dark:hover:text-red-300"
             >
-              <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2.5">
-                <path d="M6 6l12 12" />
-                <path d="M18 6L6 18" />
-              </svg>
+              <X className="h-3.5 w-3.5" strokeWidth={2.5} />
             </button>
           </div>
         </div>
@@ -269,10 +398,7 @@ export function SearchBar({ className = "" }: SearchBarProps) {
               className="absolute -right-3 -top-3 flex h-9 w-9 cursor-pointer items-center justify-center rounded-full bg-white text-slate-700 shadow-lg transition hover:bg-slate-100 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
               title="Đóng"
             >
-              <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2.5">
-                <path d="M6 6l12 12" />
-                <path d="M18 6L6 18" />
-              </svg>
+              <X className="h-4 w-4" strokeWidth={2.5} />
             </button>
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img

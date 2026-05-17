@@ -3,6 +3,19 @@
 import Link from "next/link";
 import { usePathname, useSearchParams } from "next/navigation";
 import { type ReactNode, useEffect, useState } from "react";
+import {
+  BookOpen,
+  ChevronLeft,
+  ChevronRight,
+  History,
+  LayoutDashboard,
+  Moon,
+  ScanSearch,
+  Settings,
+  SquarePlus,
+  Sun,
+  Users,
+} from "lucide-react";
 
 import { loadSessionUser, type AuthUser } from "@/lib/auth";
 import { useSearch } from "@/features/search/SearchContext";
@@ -123,6 +136,8 @@ export function Sidebar() {
     setCollapsed(nextCollapsed);
   }
 
+  const iconClass = "h-[18px] w-[18px]";
+
   return (
     <>
       {/* Desktop sidebar */}
@@ -140,18 +155,13 @@ export function Sidebar() {
           aria-label={collapsed ? "Mở rộng sidebar" : "Thu gọn sidebar"}
           aria-expanded={!collapsed}
         >
-          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
-            {collapsed ? <path d="m9 18 6-6-6-6" /> : <path d="m15 18-6-6 6-6" />}
-          </svg>
+          {collapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
         </button>
 
         {/* Logo */}
         <div className={["mb-7 flex items-center gap-3", collapsed ? "justify-center px-0" : "px-1"].join(" ")}>
           <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-blue-600 text-white shadow-[0_12px_24px_rgba(37,99,235,0.28)]">
-            <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2">
-              <circle cx="11" cy="11" r="6" />
-              <path d="m16 16 4 4" />
-            </svg>
+            <ScanSearch className="h-5 w-5" strokeWidth={2.2} />
           </div>
           {!collapsed ? (
             <div className="min-w-0">
@@ -168,41 +178,24 @@ export function Sidebar() {
           {canAccessHome ? (
             <>
               <NavItem href="/home" onClick={resetSearch} label="Tạo mới" active={isNew} collapsed={collapsed}>
-                <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8">
-                  <path d="M5 12h14M12 5v14" />
-                </svg>
+                <SquarePlus className={iconClass} strokeWidth={1.9} />
               </NavItem>
               <NavItem href="/history" label="Lịch sử" active={isHistory} collapsed={collapsed}>
-                <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8">
-                  <path d="M4 12a8 8 0 1 0 2.34-5.66" />
-                  <path d="M4 4v6h6" />
-                </svg>
+                <History className={iconClass} strokeWidth={1.9} />
               </NavItem>
             </>
           ) : null}
           {canAccessUsers ? (
             <NavItem href="/admin/users" label="Người dùng" active={isUsers} collapsed={collapsed}>
-              <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8">
-                <path d="M16 19c0-2.2-1.8-4-4-4s-4 1.8-4 4" />
-                <circle cx="12" cy="9" r="3" />
-                <path d="M20 19a3 3 0 0 0-3-3M18 9a2.5 2.5 0 0 0-2.5-2.5" />
-              </svg>
+              <Users className={iconClass} strokeWidth={1.9} />
             </NavItem>
           ) : null}
           <NavItem href="/guide" label="Hướng dẫn" active={isGuide} collapsed={collapsed}>
-            <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8">
-              <path d="M5 5.5A2.5 2.5 0 0 1 7.5 3H20v16H7.5A2.5 2.5 0 0 0 5 21V5.5Z" />
-              <path d="M5 21h15" />
-            </svg>
+            <BookOpen className={iconClass} strokeWidth={1.9} />
           </NavItem>
           {canAccessDashboard ? (
             <NavItem href="/dashboard" label="Dashboard" active={isDashboard} collapsed={collapsed}>
-              <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8">
-                <rect x="3" y="3" width="8" height="8" />
-                <rect x="13" y="3" width="8" height="5" />
-                <rect x="13" y="10" width="8" height="11" />
-                <rect x="3" y="13" width="8" height="8" />
-              </svg>
+              <LayoutDashboard className={iconClass} strokeWidth={1.9} />
             </NavItem>
           ) : null}
           {isDetail && !collapsed ? (
@@ -213,26 +206,13 @@ export function Sidebar() {
         {/* Dark mode toggle */}
         <div className="mb-4 border-t border-slate-200 pt-4 dark:border-slate-800">
           <NavItem onClick={toggleTheme} label={darkMode ? "Chế độ sáng" : "Chế độ tối"} active={false} collapsed={collapsed}>
-            <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8">
-              {darkMode ? (
-                <>
-                  <circle cx="12" cy="12" r="4" />
-                  <path d="M12 2v2" /><path d="M12 20v2" />
-                  <path d="M2 12h2" /><path d="M20 12h2" />
-                </>
-              ) : (
-                <path d="M12 3a7 7 0 1 0 9 9 9 9 0 0 1-9-9Z" />
-              )}
-            </svg>
+            {darkMode ? <Sun className={iconClass} strokeWidth={1.9} /> : <Moon className={iconClass} strokeWidth={1.9} />}
           </NavItem>
         </div>
 
         {/* Settings */}
         <NavItem href="/settings" label="Cài đặt" active={isSettings} collapsed={collapsed}>
-          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8">
-            <path d="M12 8.5A3.5 3.5 0 1 0 12 15.5 3.5 3.5 0 1 0 12 8.5Z" />
-            <path d="M19.4 15a1.7 1.7 0 0 0 .33 1.87l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .97 1.7 1.7 0 0 1-1.58 1.13h-.84A1.7 1.7 0 0 1 10 20.37a1.7 1.7 0 0 0-1-.97 1.7 1.7 0 0 0-1.87.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.97-1 1.7 1.7 0 0 1-1.13-1.58v-.84A1.7 1.7 0 0 1 3.63 10a1.7 1.7 0 0 0 .97-1 1.7 1.7 0 0 0-.33-1.87l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.97A1.7 1.7 0 0 1 11.58 2.5h.84A1.7 1.7 0 0 1 14 3.63a1.7 1.7 0 0 0 1 .97 1.7 1.7 0 0 0 1.87-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9c.45.2.8.56 1 .97a1.7 1.7 0 0 1 1.13 1.58v.84A1.7 1.7 0 0 1 20.4 14c-.2.45-.56.8-.97 1Z" />
-          </svg>
+          <Settings className={iconClass} strokeWidth={1.9} />
         </NavItem>
       </aside>
 
@@ -241,51 +221,26 @@ export function Sidebar() {
         {canAccessHome ? (
           <>
             <NavItem href="/home" onClick={resetSearch} label="Tạo mới" active={isNew} collapsed>
-              <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8">
-                <path d="M5 12h14M12 5v14" />
-              </svg>
+              <SquarePlus className={iconClass} strokeWidth={1.9} />
             </NavItem>
             <NavItem href="/history" label="Lịch sử" active={isHistory} collapsed>
-              <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8">
-                <path d="M4 12a8 8 0 1 0 2.34-5.66" />
-                <path d="M4 4v6h6" />
-              </svg>
+              <History className={iconClass} strokeWidth={1.9} />
             </NavItem>
           </>
         ) : null}
         {canAccessUsers ? (
           <NavItem href="/admin/users" label="Người dùng" active={isUsers} collapsed>
-            <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8">
-              <path d="M16 19c0-2.2-1.8-4-4-4s-4 1.8-4 4" />
-              <circle cx="12" cy="9" r="3" />
-              <path d="M20 19a3 3 0 0 0-3-3M18 9a2.5 2.5 0 0 0-2.5-2.5" />
-            </svg>
+            <Users className={iconClass} strokeWidth={1.9} />
           </NavItem>
         ) : null}
         <NavItem href="/guide" label="Hướng dẫn" active={isGuide} collapsed>
-          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8">
-            <path d="M5 5.5A2.5 2.5 0 0 1 7.5 3H20v16H7.5A2.5 2.5 0 0 0 5 21V5.5Z" />
-            <path d="M5 21h15" />
-          </svg>
+          <BookOpen className={iconClass} strokeWidth={1.9} />
         </NavItem>
         <NavItem href="/settings" label="Cài đặt" active={isSettings} collapsed>
-          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8">
-            <path d="M12 8.5A3.5 3.5 0 1 0 12 15.5 3.5 3.5 0 1 0 12 8.5Z" />
-            <path d="M19.4 15a1.7 1.7 0 0 0 .33 1.87l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .97 1.7 1.7 0 0 1-1.58 1.13h-.84A1.7 1.7 0 0 1 10 20.37a1.7 1.7 0 0 0-1-.97 1.7 1.7 0 0 0-1.87.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.97-1 1.7 1.7 0 0 1-1.13-1.58v-.84A1.7 1.7 0 0 1 3.63 10a1.7 1.7 0 0 0 .97-1 1.7 1.7 0 0 0-.33-1.87l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.97A1.7 1.7 0 0 1 11.58 2.5h.84A1.7 1.7 0 0 1 14 3.63a1.7 1.7 0 0 0 1 .97 1.7 1.7 0 0 0 1.87-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9c.45.2.8.56 1 .97a1.7 1.7 0 0 1 1.13 1.58v.84A1.7 1.7 0 0 1 20.4 14c-.2.45-.56.8-.97 1Z" />
-          </svg>
+          <Settings className={iconClass} strokeWidth={1.9} />
         </NavItem>
         <NavItem label="Đổi chế độ" active={false} collapsed onClick={toggleTheme}>
-          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8">
-            {darkMode ? (
-              <>
-                <circle cx="12" cy="12" r="4" />
-                <path d="M12 2v2" /><path d="M12 20v2" />
-                <path d="M2 12h2" /><path d="M20 12h2" />
-              </>
-            ) : (
-              <path d="M12 3a7 7 0 1 0 9 9 9 9 0 0 1-9-9Z" />
-            )}
-          </svg>
+          {darkMode ? <Sun className={iconClass} strokeWidth={1.9} /> : <Moon className={iconClass} strokeWidth={1.9} />}
         </NavItem>
       </nav>
     </>

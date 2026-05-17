@@ -17,3 +17,50 @@ body {
 html.dark body {
   @apply bg-slate-950 text-slate-100;
 }
+
+/* react-day-picker theme override */
+.rdp-tracex {
+  --rdp-accent-color: #2563eb;
+  --rdp-accent-background-color: #dbeafe;
+  --rdp-day-height: 36px;
+  --rdp-day-width: 36px;
+  font-size: 13px;
+  color: rgb(30 41 59);
+}
+html.dark .rdp-tracex {
+  --rdp-accent-background-color: rgba(59, 130, 246, 0.25);
+  color: rgb(226 232 240);
+}
+.rdp-tracex .rdp-day_button {
+  border-radius: 10px;
+}
+.rdp-tracex .rdp-day_button:hover:not([disabled]) {
+  background: rgb(241 245 249);
+}
+html.dark .rdp-tracex .rdp-day_button:hover:not([disabled]) {
+  background: rgb(30 41 59);
+}
+.rdp-tracex .rdp-selected .rdp-day_button,
+.rdp-tracex .rdp-range_start .rdp-day_button,
+.rdp-tracex .rdp-range_end .rdp-day_button {
+  background: var(--rdp-accent-color);
+  color: #fff;
+  font-weight: 600;
+}
+.rdp-tracex .rdp-range_middle .rdp-day_button {
+  background: var(--rdp-accent-background-color);
+  color: rgb(30 64 175);
+  border-radius: 0;
+}
+html.dark .rdp-tracex .rdp-range_middle .rdp-day_button {
+  color: rgb(191 219 254);
+}
+.rdp-tracex .rdp-month_caption {
+  font-weight: 600;
+}
+.rdp-tracex .rdp-weekday {
+  font-weight: 600;
+  color: rgb(100 116 139);
+  text-transform: uppercase;
+  font-size: 11px;
+}
