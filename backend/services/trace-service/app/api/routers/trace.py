@@ -438,13 +438,25 @@ def submit_feedback(
 
 def _embedding_info(t: Tracklet) -> CandidateTrackletEmbeddingInfo:
     emb = t.embedding
-    if emb is None or emb.siglip_embedding is None:
+    if emb is None:
         return CandidateTrackletEmbeddingInfo(has_embedding=False)
+
     try:
-        dim = len(emb.siglip_embedding)
+        siglip_dim = len(emb.siglip_embedding) if emb.siglip_embedding is not None else None
     except TypeError:
-        dim = None
-    return CandidateTrackletEmbeddingInfo(has_embedding=True, dim=dim)
+        siglip_dim = None
+    try:
+        reid_dim = len(emb.reid_embedding) if emb.reid_embedding is not None else None
+    except TypeError:
+        reid_dim = None
+
+    return CandidateTrackletEmbeddingInfo(
+        has_embedding=siglip_dim is not None,
+        dim=siglip_dim,
+        has_reid_embedding=reid_dim is not None,
+        reid_dim=reid_dim,
+        reid_model=emb.reid_model_version,
+    )
 
 
 def _tracklet_to_preview(t: Tracklet) -> CandidateTrackletPreview:

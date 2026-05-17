@@ -370,11 +370,12 @@ class Tracklet(Base):
 
 
 class TrackletEmbedding(Base):
-    """SigLIP 2-So400m embedding per tracklet (1152-dim).
+    """Semantic + identity embeddings per tracklet.
 
-    The single embedding model in use. Same space as text queries → enables
-    text-to-image search directly via cosine similarity on `siglip_embedding`.
-    Vector is L2-normalized at write time so cosine = dot product.
+    `siglip_embedding` stays in the text↔image space used for semantic search.
+    `reid_embedding` is the appearance/identity lane used for same-person
+    association (fragment merge now; cross-camera grouping downstream).
+    Both vectors are L2-normalized at write time so cosine = dot product.
     """
     __tablename__ = "tracklets_embeddings"
     __table_args__ = (
@@ -389,6 +390,10 @@ class TrackletEmbedding(Base):
     siglip_embedding: Mapped[list | None] = mapped_column(
         PgVector(1152) if _PGVECTOR_AVAILABLE else JSON, nullable=True,
     )
+    reid_embedding: Mapped[list | None] = mapped_column(
+        PgVector(384) if _PGVECTOR_AVAILABLE else JSON, nullable=True,
+    )
+    reid_model_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False,
     )

@@ -437,20 +437,31 @@ def _local_prefilter(
 
 # ── Identity merge: cosine similarity + temporal/camera guards + union-find ───
 
-_MERGE_THRESHOLD = float(os.getenv("QUERY_MERGE_THRESHOLD", "0.9"))
-# SigLIP image embeddings of arbitrary person crops cluster very tightly
-# (cosine 0.85–1.0 across different people), so the 0.85 used at ingest's
-# fragment-merge stage (where temporal/spatial guards do the heavy lifting)
-# collapses entire query shortlists into one candidate at search time.
-# Cross-camera identity merge needs a very strict floor — 0.985 keeps the
-# same-person bridges while breaking the noisy "everyone looks like everyone"
-# edges. Tunable via QUERY_MERGE_THRESHOLD env without redeploy.
+# 2026-05-17: default 0.9 → 0.75 after Re-ID swap DINOv2 → PersonViT-S.
+# Bench on camera_0002 (894 positive + 7710 hard-negative pairs) shows
+# PersonViT cosine distribution is much sharper than DINOv2/SigLIP:
+#   thr 0.75 → precision 92.9%, recall 75.7%   ★ ingest-side merger default
+#   thr 0.80 → precision 96.2%, recall 70.5%
+#   thr 0.90 → precision 96.8%, recall 26.5%   ← DINOv2-era default (way too strict
+#                                                 for PersonViT — under-merges hard)
+# Keep query-side default in sync with ingest-side FRAGMENT_MERGE_SIM_THRESHOLD;
+# they should agree so cross-video identity grouping isn't tighter than the
+# within-video fragment grouping.
+_MERGE_THRESHOLD = float(os.getenv("QUERY_REID_MERGE_THRESHOLD", os.getenv("QUERY_MERGE_THRESHOLD", "0.75")))
+_IDENTITY_FALLBACK_TO_SIGLIP = os.getenv("QUERY_REID_FALLBACK_TO_SIGLIP", "0").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+# Identity grouping prefers the dedicated `reid_embedding` lane (PersonViT-S
+# 384-dim). The DB was reset on 2026-05-17 via scripts/reset_db_for_personvit.py,
+# so any row that still lacks reid_embedding is a fresh ingest that failed —
+# we keep it as a singleton rather than silently downgrading to SigLIP semantic
+# space (which uses very different cosine geometry and would mis-cluster).
+# Operators can set QUERY_REID_FALLBACK_TO_SIGLIP=1 only if running a transient
+# A/B where SigLIP is the primary lane — not the production path.
 
 # Component-level guard for the union-find pass. Plain pair-wise union-find is
 # transitive: A↔B 0.99, B↔C 0.99 chains C into A's group even when A↔C is
-# only 0.97. With SigLIP person crops sitting in a narrow band, that chain
-# pulls in increasingly different people one hop at a time. Before unioning
-# two components we require:
+# only 0.97. Before unioning two components we require:
 #   - mean cross-cosine ≥ _MERGE_THRESHOLD     (cluster is genuinely tight)
 #   - min cross-cosine  ≥ _MERGE_COMPONENT_FLOOR  (no weak bridge)
 # The floor is _MERGE_THRESHOLD - _MERGE_COMPONENT_MARGIN so a single
@@ -656,14 +667,34 @@ def _vec_score(query_vec: list[float], tracklet_vec: list[float]) -> float:
     return max(0.0, min(1.0, (c + 1.0) / 2.0))
 
 
-def _tracklet_embedding(t: Tracklet) -> list[float]:
-    """Return the SigLIP2 embedding for this tracklet (1152-dim), or []."""
+def _tracklet_siglip_embedding(t: Tracklet) -> list[float]:
+    """Return the SigLIP semantic embedding for retrieval (1152-dim), or []."""
     if not t.embedding or t.embedding.siglip_embedding is None:
         return []
     try:
         return list(t.embedding.siglip_embedding)
     except Exception:
         return []
+
+
+def _tracklet_reid_embedding(t: Tracklet) -> list[float]:
+    """Return the identity/Re-ID embedding for grouping, or []."""
+    if not t.embedding or t.embedding.reid_embedding is None:
+        return []
+    try:
+        return list(t.embedding.reid_embedding)
+    except Exception:
+        return []
+
+
+def _tracklet_identity_embedding(t: Tracklet) -> list[float]:
+    """Return the preferred identity vector, with optional legacy fallback."""
+    reid = _tracklet_reid_embedding(t)
+    if reid:
+        return reid
+    if _IDENTITY_FALLBACK_TO_SIGLIP:
+        return _tracklet_siglip_embedding(t)
+    return []
 
 
 def _tracklet_abs_window(t: Tracklet) -> tuple[float, float] | None:
@@ -720,7 +751,7 @@ def _merge_by_similarity(ranked_tracklets: list[Tracklet]) -> list[list[Tracklet
             i = parent[i]
         return i
 
-    embs = [_tracklet_embedding(t) for t in ranked_tracklets]
+    embs = [_tracklet_identity_embedding(t) for t in ranked_tracklets]
 
     # Build a unit-normalized matrix so cosine is a single dot product.
     # Rows for tracklets without an embedding are zero — they'll never be
@@ -1044,7 +1075,7 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
         if query_vec:
             vec_t0 = time.perf_counter()
             for t in shortlist:
-                emb = _tracklet_embedding(t)
+                emb = _tracklet_siglip_embedding(t)
                 per_tracklet_vec_score[t.tracklet_id] = _vec_score(query_vec, emb)
             vec_scores = list(per_tracklet_vec_score.values())
             logger.info(
@@ -1073,7 +1104,7 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                     ]),
                 )
 
-        # Stage C — Identity merge (union-find on tracklet-tracklet SigLIP sim).
+        # Stage C — Identity merge (union-find on dedicated Re-ID vectors).
         merge_t0 = time.perf_counter()
         identity_groups = _merge_by_similarity(shortlist)
         groups = _split_groups_by_24h_windows(identity_groups, shortlist)
@@ -1095,7 +1126,7 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
             # production health monitoring.
             group_preview = []
             for group in merged_groups[:_QUERY_LOG_GROUP_N]:
-                rep_emb = _tracklet_embedding(group[0])
+                rep_emb = _tracklet_identity_embedding(group[0])
                 member_items = []
                 for member in group[:_QUERY_LOG_MEMBER_N]:
                     member_item = _tracklet_log_item(
@@ -1104,7 +1135,7 @@ def search_candidates(body: SearchRequest) -> dict[str, Any]:
                         vector_score=per_tracklet_vec_score.get(member.tracklet_id, 0.0)
                         if query_vec else None,
                     )
-                    member_emb = _tracklet_embedding(member)
+                    member_emb = _tracklet_identity_embedding(member)
                     member_item["merge_sim_to_rep"] = (
                         round(_cosine_sim(rep_emb, member_emb), 4)
                         if rep_emb and member_emb else None

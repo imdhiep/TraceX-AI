@@ -5,17 +5,22 @@ Production single-video pipeline (`_process_video_sync`):
   2. RT-DETR R50 person detection (primary) / Grounding DINO 1.6 (fallback)
   3. BoT-SORT tracker (Kalman + IoU, ReID disabled, GMC disabled) —
      legacy BodyPartAdaptiveTracker available via TRACER_BACKEND=adaptive
-  4. TrackletQualityScorer (min_frames, density, duration, Laplacian)
-  5. SigLIP 2-So400m (1152-dim) — multi-frame pool-avg per fragment
-  6. TrackletFragmentMerger (cosine ≥ 0.85, max_gap ≤ 60 s, Union-Find)
-  7. Qwen2.5-VL-7B-Instruct open-vocabulary attribute captioning
+  4. TrackletQualityScorer (min_frames, density, duration, Laplacian) — loose
+     by design so the merger sees every mergeable fragment
+  5. PersonViT-S MSMT17 (384-dim) — multi-frame Re-ID lane per fragment
+     (swapped from DINOv2 ViT-L on 2026-05-17; +0.343 pair-distribution gap
+     on camera_0002 bench, 43% reduction in merged-tracklet count at zero
+     overmerge). See camera_0002/bench_personvit_merger_threshold.py.
+  6. TrackletFragmentMerger (PersonViT cosine ≥ 0.75 + temporal/spatial guards)
+  7. SigLIP 2-So400m (1152-dim) semantic lane + Qwen2.5-VL captioning
      (only on MERGED tracklets, batch with OOM-aware backoff)
   8. VideoMAE V2 action classification
      (per-frame bbox crops, Kinetics-400 → TraceX taxonomy)
   9. BEV projection + crop save + DB write
 
-DB embedding = L2-normalized pool-avg of multi-frame SigLIP features across
-all fragments in the merged group (DINOv2 has been removed).
+DB embeddings:
+  - `reid_embedding`: L2-normalized pooled PersonViT-S identity vector (384-dim)
+  - `siglip_embedding`: L2-normalized pooled SigLIP semantic vector (1152-dim)
 
 Cross-camera batch pipeline (`process_batch`):
   - Stage 1-3: parallel per video
@@ -88,6 +93,7 @@ def _get_env_float(name: str, default: float) -> float:
 DEFAULT_SAMPLE_INTERVAL = 15
 DEFAULT_MIN_BBOX_AREA = 400
 DEFAULT_BEV_MAX_DIST = 1.5
+REID_MODEL_VERSION = os.getenv("REID_MODEL_VERSION", "personvit_s_msmt17")
 MAX_WORKERS = int(os.getenv("BATCH_MAX_WORKERS", "8"))
 VLM_BATCH_SIZE = _get_positive_env_int("VLM_BATCH_SIZE", 4)
 VLM_BATCH_MAX_SIZE = _get_positive_env_int("VLM_BATCH_MAX_SIZE", 8)
@@ -102,36 +108,53 @@ VLM_BATCH_STABLE_STEPS = _get_positive_env_int("VLM_BATCH_STABLE_STEPS", 3)
 VLM_BATCH_MAX_NEW_TOKENS_PER_CROP = _get_positive_env_int(
     "VLM_BATCH_MAX_NEW_TOKENS_PER_CROP", 448
 )
-# Bench cam_0002 + production review: 0.85 đang merge nhầm các tracklet
-# có đồng phục giống nhau (nhân viên/hồ sơ bệnh nhân tương tự). Nâng lên 0.90
-# để chỉ merge khi appearance thực sự rất gần. Hệ quả: số merged tracklets
-# tăng (kỳ vọng 30-50%), nhưng độ tinh khiết group tăng đáng kể.
-# Component margin 0.03 → 0.05 → floor = 0.85 (cùng giá trị threshold cũ),
-# vẫn cho phép expand group qua các fragment trung gian.
-# 2026-05-17: tightened after audit showed hospital-uniform false-positive
-# merges (group span 500-600s on 10-min videos, 18 fragments → 1 candidate).
-#   SIM_THRESHOLD 0.89 → 0.93 : cosine 0.89-0.92 is ambiguous for uniformed
-#     subjects (e.g. nurses in similar scrubs); 0.93 excludes the ambiguous band.
-#   MAX_GAP_SECONDS 180 → 30 : long-gap appearance bridges across 2-3 minutes
-#     are almost always a different person passing through, not the same person
-#     returning. BoT-SORT already covers short-gap re-entry inside track_buffer.
-#   MAX_SPEED_PX_PER_S 800 → 300 : 800 px/s overstates hospital walking speed
-#     (~150-300 px/s) and made the spatial gate ineffective. 300 px/s rejects
-#     cross-frame appearance bridges with implausible displacement.
-FRAGMENT_MERGE_SIM_THRESHOLD = _get_env_float("FRAGMENT_MERGE_SIM_THRESHOLD", 0.93)
-FRAGMENT_MERGE_MAX_GAP_SECONDS = _get_env_float("FRAGMENT_MERGE_MAX_GAP_SECONDS", 30.0)
+# 2026-05-17 (PersonViT-S swap): re-tuned for the new embedding's cosine
+# distribution. Bench on camera_0002 (894 positive + 7710 hard-negative pairs)
+# shows PersonViT-S mean(pos)=0.825 / mean(neg)=0.361 — a gap of +0.464
+# vs DINOv2's +0.121. Merger sweep:
+#   thr 0.85 → 200 merged, 4 overmerge  (conservative)
+#   thr 0.80 → 163 merged, 6 overmerge  (safe)
+#   thr 0.75 → 132 merged, 7 overmerge  ★ chosen sweet spot
+#   thr 0.70 → 117 merged, 14 overmerge (aggressive)
+# 0.75 sits at the elbow of the merge-vs-overmerge curve. Sweeping further
+# down doubles overmerge for only ~10% extra merging.
+#
+# Scene/motion params re-tuned 2026-05-17 after first production run on a
+# 10-minute CCTV (cam_02) with 25 persons and heavy occlusion: PersonViT
+# gave 749 fragments → only 264 merged (expected ~100). Root cause: scene
+# gates calibrated for the older 4-minute camera_0002 bench — too tight for
+# real CCTV where the same person disappears for 30-90s (long occlusion or
+# leaves and re-enters FOV from a different edge).
+#
+#   MAX_GAP_SECONDS    30 → 120 : allow re-entry after 1-2 minutes (very
+#                                 common in long CCTV with multiple FOVs).
+#   MAX_SPEED_PX_PER_S 300 → 800: 300 px/s underestimates 1080p fast walking;
+#                                 800 matches earlier BoT-SORT scene policy.
+#   MAX_SPATIAL_DIST_PX 400 → 1500: re-entry at the opposite FOV edge is
+#                                   plausible same-person; 400 was sized for
+#                                   short-gap continuation only.
+# The appearance gate (PersonViT cosine ≥ 0.75, p25 same-person ≈ 0.78) does
+# the hard work; loosening scene gates only lets it score MORE pairs, it does
+# not weaken purity.
+FRAGMENT_MERGE_SIM_THRESHOLD = _get_env_float("FRAGMENT_MERGE_SIM_THRESHOLD", 0.75)
+FRAGMENT_MERGE_MAX_GAP_SECONDS = _get_env_float("FRAGMENT_MERGE_MAX_GAP_SECONDS", 120.0)
 FRAGMENT_MERGE_COMPONENT_MARGIN = _get_env_float("FRAGMENT_MERGE_COMPONENT_MARGIN", 0.02)
-FRAGMENT_MERGE_MAX_SPEED_PX_PER_S = _get_env_float("FRAGMENT_MERGE_MAX_SPEED_PX_PER_S", 300.0)
+FRAGMENT_MERGE_MAX_SPEED_PX_PER_S = _get_env_float("FRAGMENT_MERGE_MAX_SPEED_PX_PER_S", 800.0)
 FRAGMENT_MERGE_SPATIAL_BYPASS_MARGIN = _get_env_float("FRAGMENT_MERGE_SPATIAL_BYPASS_MARGIN", 0.05)
-# 2026-05-17: hard cap on the appearance-pass spatial budget. Without this,
-# at gap=30s with max_speed=300 the budget reaches 9000 px (wider than any
-# FOV) → spatial gate becomes a no-op. 400 px ≈ 1/5 of 1080p width, matching
-# plausible cross-frame travel for one continuous appearance. 0 disables.
-FRAGMENT_MERGE_MAX_SPATIAL_DIST_PX = _get_env_float("FRAGMENT_MERGE_MAX_SPATIAL_DIST_PX", 400.0)
-# Motion-merge appearance floor — block "two different people crossing at the
-# same point" (dist≈0px but cos far below sim_thresh). Stays below sim_thresh
-# so SigLIP-borderline same-person rescues remain possible.
-FRAGMENT_MERGE_MOTION_MIN_SIM = _get_env_float("FRAGMENT_MERGE_MOTION_MIN_SIM", 0.85)
+FRAGMENT_MERGE_MAX_SPATIAL_DIST_PX = _get_env_float("FRAGMENT_MERGE_MAX_SPATIAL_DIST_PX", 1500.0)
+# Motion-merge appearance floor — sim_thresh − 0.08 (same offset as before,
+# rescues borderline same-person fragments while blocking cross-person merges
+# at coincident spatial points).
+FRAGMENT_MERGE_MOTION_MIN_SIM = _get_env_float("FRAGMENT_MERGE_MOTION_MIN_SIM", 0.67)
+# If PersonViT is unavailable, SigLIP is only a degraded fallback lane. It lives
+# in a very different cosine regime, so it MUST keep its own conservative
+# thresholds rather than inheriting PersonViT's 0.75 / 0.67 defaults.
+FRAGMENT_MERGE_SIGLIP_FALLBACK_SIM_THRESHOLD = _get_env_float(
+    "FRAGMENT_MERGE_SIGLIP_FALLBACK_SIM_THRESHOLD", 0.96,
+)
+FRAGMENT_MERGE_SIGLIP_FALLBACK_MOTION_MIN_SIM = _get_env_float(
+    "FRAGMENT_MERGE_SIGLIP_FALLBACK_MOTION_MIN_SIM", 0.88,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -675,22 +698,29 @@ def _mcblt_associate(
 
 
 # ---------------------------------------------------------------------------
-# Stage 5: DINOv2 Appearance Embedding
+# Stage 5: PersonViT Re-ID Appearance Embedding
 # ---------------------------------------------------------------------------
 
-def _generate_dinov2_embeddings(
+def _generate_personvit_embeddings(
     frames: list[np.ndarray],
     bboxes: list[list[float]],
     tracklet_id: str,
 ) -> Optional[list[float]]:
-    """Generate DINOv2 ViT-L/14 appearance embeddings (1024-dim)."""
-    model = get_model("dinov2")
-    processor = get_model("dinov2_processor")
-    if model is None or processor is None:
+    """Generate PersonViT-S Re-ID embeddings (384-dim) for a single tracklet.
+
+    Used by the cross-camera batch pipeline path (`process_batch`); the
+    per-video path uses `_batch_personvit_embeddings` for true batched
+    inference across all fragments.
+
+    Crop convention matches `_batch_personvit_embeddings`: aspect-preserving
+    256×128 person crop, ImageNet-normalized.
+    """
+    model = get_model("personvit")
+    if model is None:
         return None
 
     device = _get_device()
-    dtype = torch.float16
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
 
     if not frames or not bboxes:
         return None
@@ -698,7 +728,7 @@ def _generate_dinov2_embeddings(
     n = min(5, len(frames))
     indices = np.linspace(0, len(frames) - 1, n, dtype=int)
 
-    pil_crops = []
+    rgb_crops: list[np.ndarray] = []
     for idx in indices:
         frame = frames[idx]
         bbox = bboxes[min(idx, len(bboxes) - 1)]
@@ -708,34 +738,26 @@ def _generate_dinov2_embeddings(
         x2, y2 = min(w, x2), min(h, y2)
         if x2 <= x1 or y2 <= y1:
             continue
-
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
             continue
+        resized = cv2.resize(crop, (128, 256), interpolation=cv2.INTER_LINEAR)
+        rgb_crops.append(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB))
 
-        crop_h, crop_w = crop.shape[:2]
-        max_dim = max(crop_h, crop_w)
-        top = (max_dim - crop_h) // 2
-        bottom = max_dim - crop_h - top
-        left = (max_dim - crop_w) // 2
-        right = max_dim - crop_w - left
-        square = cv2.copyMakeBorder(
-            crop, top, bottom, left, right,
-            cv2.BORDER_CONSTANT, value=(114, 114, 114)
-        )
-        resized = cv2.resize(square, (224, 224), interpolation=cv2.INTER_LINEAR)
-        pil_crops.append(Image.fromarray(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)))
-
-    if not pil_crops:
+    if not rgb_crops:
         return None
 
+    arr = np.stack(rgb_crops, axis=0)
+    tensor = torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous().to(
+        device=device, dtype=dtype,
+    ) / 255.0
+    _mean = torch.tensor([0.485, 0.456, 0.406], device=device, dtype=dtype).view(1, 3, 1, 1)
+    _std = torch.tensor([0.229, 0.224, 0.225], device=device, dtype=dtype).view(1, 3, 1, 1)
+    tensor = (tensor - _mean) / _std
+
     with torch.no_grad():
-        inputs = processor(images=pil_crops, return_tensors="pt")
-        inputs = {
-            k: v.to(device=device, dtype=dtype) if v.is_floating_point() else v.to(device)
-            for k, v in inputs.items()
-        }
-        feats = model(**inputs).pooler_output.float()  # [N, 1024] — stays on GPU
+        out = model(tensor)
+    feats = (out[0] if isinstance(out, tuple) else out.embeddings).float()
 
     avg = feats.mean(0)
     norm = avg.norm()
@@ -1105,6 +1127,8 @@ def _build_tracklet_result(
     bev_x: float,
     bev_y: float,
     siglip_embedding: list[float],
+    reid_embedding: list[float],
+    reid_model_version: str,
     action: str,
     action_confidence: float,
     kinetics_label: str,
@@ -1176,6 +1200,8 @@ def _build_tracklet_result(
         bev_y=float(bev_y or 0.0),
         crop_url=crop_url,
         siglip_embedding=siglip_embedding or [],
+        reid_embedding=reid_embedding or [],
+        reid_model_version=reid_model_version or "",
 
         action=action,
         action_confidence=float(action_confidence or 0.0),
@@ -1898,7 +1924,7 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
         rep_bev_x = mid_det.get("bev_x", 0.0)
         rep_bev_y = mid_det.get("bev_y", 0.0)
 
-        embedding = _generate_dinov2_embeddings(
+        embedding = _generate_personvit_embeddings(
             tracklet_frames, [rep_bbox] * len(tracklet_frames),
             f"{req.video_id}_{group_idx}"
         )
@@ -1924,6 +1950,8 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
             bev_x=rep_bev_x,
             bev_y=rep_bev_y,
             siglip_embedding=[],
+            reid_embedding=embedding or [],
+            reid_model_version=REID_MODEL_VERSION if embedding else "",
             action=action if isinstance(action, str) else str(action),
             action_confidence=0.0,
             kinetics_label="",
@@ -2039,11 +2067,11 @@ def _batch_siglip_embeddings(
     frame_lookup: dict | None = None,
 ) -> tuple[list, list, list]:
     """
-    Batch SigLIP2 embeddings only. DINOv2 removed — SigLIP2 is the sole embedding model.
+    Batch SigLIP2 semantic embeddings.
     Returns: (siglip_multi_feats, all_rep_crops, all_siglip_embeddings)
-      siglip_multi_feats: multi-frame pool-avg per fragment (for fragment merge)
+      siglip_multi_feats: multi-frame pool-avg per fragment (for semantic DB pooling)
       all_rep_crops: PIL Images 384×384 from best-quality frame (for Qwen/storage)
-      all_siglip_embeddings: single-crop embedding per fragment (for DB)
+      all_siglip_embeddings: single-crop embedding per fragment (diagnostic/fallback)
 
     frame_lookup: optional {frame_index -> image} mapping. When provided, the
     multi-frame SigLIP path crops each frame with that observation's own bbox
@@ -2073,8 +2101,28 @@ def _batch_siglip_embeddings(
         )
         return cv2.resize(pad, (size, size), interpolation=cv2.INTER_LINEAR)
 
-    def _select_siglip_observation_entries(lt, *, min_frames: int = 5, max_frames: int = 8) -> list[dict]:
-        """Pick quality-aware, temporally diverse observations for identity embedding."""
+    def _select_siglip_observation_entries(lt, *, min_frames: int = 4, max_frames: int = 12) -> list[dict]:
+        """Pick quality-aware, temporally diverse observations for identity embedding.
+
+        2026-05-17: re-tuned for ReID-friendliness (matters more now that
+        SigLIP2 will be replaced by a dedicated ReID backbone — DINOv2 →
+        TransReID — and embedding quality of SHORT tracklets becomes the
+        bottleneck for cross-fragment merging).
+
+        Changes vs prior version:
+          • max_frames 8 → 12: long tracklets get more crops, embedding mean
+            becomes more representative (matters most for camera_0002-style
+            footage where same person re-enters multiple times).
+          • min_frames 5 → 4: short tracklets (4-5 obs) no longer get a
+            random tail of low-quality entries padded in just to hit min=5.
+          • area uses ABSOLUTE bbox-vs-frame ratio (not max-area-in-tracklet
+            normalization) — fair comparison between short and long tracklets,
+            so a short tracklet with consistently small/blurry crops is not
+            artificially boosted by its own internal "best" being weak.
+          • weights re-balanced for ReID priority: sharpness > size > conf;
+            edge_norm bonus increased (full-body unoccluded is critical for
+            person ReID, marginal for semantic).
+        """
         entries: list[dict] = []
         for order, o in enumerate(lt.observations):
             frame = frame_lookup.get(o.frame_index)
@@ -2094,12 +2142,18 @@ def _batch_siglip_embeddings(
             )
             edge_norm = min(1.0, edge_clear / max(1.0, 0.04 * min(h, w)))
             edge_touch = x1 <= 1.0 or y1 <= 1.0 or x2 >= float(w - 1) or y2 >= float(h - 1)
+            # Absolute area ratio: bbox area / frame area, capped so a person
+            # filling 25% of the frame already saturates the bonus (typical
+            # CCTV person is 1-10% of frame).
+            frame_area = max(1.0, float(w) * float(h))
+            area_ratio = min(1.0, (bw * bh) / (0.25 * frame_area))
             entries.append({
                 "order": order,
                 "obs": o,
                 "frame": frame,
                 "bbox": [float(v) for v in o.bbox],
                 "area": bw * bh,
+                "area_ratio": area_ratio,
                 "lap": float(getattr(o, "laplacian_score", 0.0) or 0.0),
                 "conf": float(getattr(o, "confidence", 0.0) or 0.0),
                 "edge_norm": edge_norm,
@@ -2109,21 +2163,21 @@ def _batch_siglip_embeddings(
         if not entries:
             return []
 
-        max_area = max((e["area"] for e in entries), default=1.0) or 1.0
-        max_lap = max((e["lap"] for e in entries), default=1.0) or 1.0
+        # Sharpness saturates at lap=200 (empirically distinguishes "in focus"
+        # from "motion blurred" for typical CCTV at 1080p). Same cap for short
+        # and long tracklets → no within-tracklet relative normalization.
         for e in entries:
-            area_norm = e["area"] / max_area
-            lap_norm = min(1.0, e["lap"] / max_lap)
+            lap_norm = min(1.0, e["lap"] / 200.0)
             score = (
-                0.38 * lap_norm
-                + 0.30 * area_norm
-                + 0.20 * e["conf"]
-                + 0.12 * e["edge_norm"]
+                0.45 * lap_norm           # sharpness: primary signal for ReID
+                + 0.20 * e["area_ratio"]  # absolute size (capped)
+                + 0.15 * e["conf"]        # detector confidence
+                + 0.20 * e["edge_norm"]   # full-body unoccluded by frame edge
             )
             if e["low_quality"]:
                 score -= 0.35
             if e["edge_touch"]:
-                score -= 0.20
+                score -= 0.25
             e["score"] = score
 
         if len(entries) <= min_frames:
@@ -2302,11 +2356,228 @@ def _batch_siglip_embeddings(
     except Exception:
         all_siglip_embeddings = [[]] * len(t_data)
 
-    logger.info("[pipeline] %s: SigLIP2 done in %.1fs — %d fragments | merge_emb=%d | DB_emb=%d",
+    logger.info("[pipeline] %s: SigLIP2 done in %.1fs — %d fragments | multi_emb=%d | single_emb=%d",
                 video_id, time.perf_counter() - _t0, len(t_data),
                 sum(1 for e in siglip_multi_feats if e),
                 sum(1 for e in all_siglip_embeddings if e))
     return siglip_multi_feats, all_rep_crops, all_siglip_embeddings
+
+
+def _batch_personvit_embeddings(
+    t_data: list,
+    video_id: str,
+    frame_lookup: dict | None = None,
+) -> list[list[float]]:
+    """Return one pooled PersonViT-S Re-ID vector per raw fragment (384-dim).
+
+    Replaced DINOv2 ViT-L (2026-05-17). PersonViT is fine-tuned on MSMT17 with
+    arcface+triplet loss; bench on camera_0002 shows pair-distribution gap
+    (mean_pos − mean_neg) of 0.464 vs DINOv2 0.121, and merged tracklets at
+    zero-overmerge of 200 vs 347 (43% reduction). See bench files in
+    camera_0002/ and [[feedback-post-tracker-filter-loose]].
+
+    Crop format differs from DINOv2: 256×128 aspect-preserving resize (no
+    square pad), ImageNet-normalized float tensor — no HF processor needed
+    because the PersonViT HF wrapper expects raw tensors.
+    """
+    if frame_lookup is None:
+        frame_lookup = {}
+
+    model_pv = get_model("personvit")
+    if not model_pv or not t_data:
+        return [[] for _ in t_data]
+
+    device = _get_device()
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
+    # ImageNet normalization (same as DINOv2/SigLIP backbones)
+    _mean = torch.tensor([0.485, 0.456, 0.406], device=device, dtype=dtype).view(1, 3, 1, 1)
+    _std = torch.tensor([0.229, 0.224, 0.225], device=device, dtype=dtype).view(1, 3, 1, 1)
+
+    def _extract_crop(frame, bbox, h_out: int = 256, w_out: int = 128):
+        """Aspect-preserving 256×128 person crop (no square pad — person ReID
+        models expect elongated portrait aspect)."""
+        x1, y1, x2, y2 = map(int, bbox)
+        H, W = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(W, x2), min(H, y2)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+        return cv2.resize(crop, (w_out, h_out), interpolation=cv2.INTER_LINEAR)
+
+    def _select_entries(lt, *, min_frames: int = 4, max_frames: int = 12) -> list[dict]:
+        """PersonViT ReID embedding entry selection. Mirrors the SigLIP picker —
+        see docstring of _select_siglip_observation_entries for rationale of
+        weights and absolute-area normalization."""
+        entries: list[dict] = []
+        for order, obs in enumerate(lt.observations):
+            frame = frame_lookup.get(obs.frame_index)
+            if frame is None:
+                continue
+            h, w = frame.shape[:2]
+            x1, y1, x2, y2 = (float(v) for v in obs.bbox)
+            bw = max(0.0, min(float(w), x2) - max(0.0, x1))
+            bh = max(0.0, min(float(h), y2) - max(0.0, y1))
+            if bw <= 1.0 or bh <= 1.0:
+                continue
+            edge_clear = min(
+                max(0.0, x1),
+                max(0.0, y1),
+                max(0.0, float(w) - x2),
+                max(0.0, float(h) - y2),
+            )
+            edge_norm = min(1.0, edge_clear / max(1.0, 0.04 * min(h, w)))
+            edge_touch = x1 <= 1.0 or y1 <= 1.0 or x2 >= float(w - 1) or y2 >= float(h - 1)
+            frame_area = max(1.0, float(w) * float(h))
+            area_ratio = min(1.0, (bw * bh) / (0.25 * frame_area))
+            entries.append({
+                "order": order,
+                "obs": obs,
+                "frame": frame,
+                "bbox": [float(v) for v in obs.bbox],
+                "area": bw * bh,
+                "area_ratio": area_ratio,
+                "lap": float(getattr(obs, "laplacian_score", 0.0) or 0.0),
+                "conf": float(getattr(obs, "confidence", 0.0) or 0.0),
+                "edge_norm": edge_norm,
+                "edge_touch": edge_touch,
+                "low_quality": bool(getattr(obs, "is_low_quality_crop", False)),
+            })
+        if not entries:
+            return []
+
+        for e in entries:
+            lap_norm = min(1.0, e["lap"] / 200.0)
+            score = (
+                0.45 * lap_norm
+                + 0.20 * e["area_ratio"]
+                + 0.15 * e["conf"]
+                + 0.20 * e["edge_norm"]
+            )
+            if e["low_quality"]:
+                score -= 0.35
+            if e["edge_touch"]:
+                score -= 0.25
+            e["score"] = score
+
+        if len(entries) <= min_frames:
+            return entries
+
+        target = min(max_frames, len(entries))
+        target = max(min_frames, target)
+        chosen: set[int] = set()
+        boundaries = np.linspace(0, len(entries), target + 1, dtype=int)
+        for i in range(target):
+            start_i, end_i = int(boundaries[i]), int(boundaries[i + 1])
+            if end_i <= start_i:
+                continue
+            chosen.add(max(range(start_i, end_i), key=lambda idx: entries[idx]["score"]))
+        if len(chosen) < target:
+            for idx in sorted(range(len(entries)), key=lambda i: entries[i]["score"], reverse=True):
+                chosen.add(idx)
+                if len(chosen) >= target:
+                    break
+        return [entries[idx] for idx in sorted(chosen)]
+
+    # Collect BGR crops as numpy arrays (we'll batch them as tensors below —
+    # PersonViT's HF wrapper takes a raw [B, 3, 256, 128] tensor, not PIL).
+    crops_bgr: list[np.ndarray] = []
+    slices: list[tuple[int, int]] = []
+    for lt, _, rep_bbox, t_frames in t_data:
+        selected_entries = _select_entries(lt) if frame_lookup else []
+        start = len(crops_bgr)
+        if selected_entries:
+            for entry in selected_entries:
+                crop = _extract_crop(entry["frame"], entry["bbox"])
+                if crop is not None:
+                    crops_bgr.append(crop)
+        else:
+            n = min(5, len(t_frames))
+            indices = np.linspace(0, len(t_frames) - 1, n, dtype=int) if n else []
+            for idx in indices:
+                crop = _extract_crop(t_frames[idx], rep_bbox)
+                if crop is not None:
+                    crops_bgr.append(crop)
+        slices.append((start, len(crops_bgr)))
+
+    if not crops_bgr:
+        return [[] for _ in t_data]
+
+    # PersonViT is small (22M params) and crops are 256×128 — large batches OK
+    init_batch = _get_positive_env_int("PERSONVIT_BATCH_INIT", 64)
+    max_batch = _get_positive_env_int("PERSONVIT_BATCH_MAX", 256)
+    grow_step = _get_positive_env_int("PERSONVIT_BATCH_GROW_STEP", 16)
+    feats_chunks: list[torch.Tensor] = []
+    idx = 0
+    batch = max(1, min(init_batch, max_batch, len(crops_bgr)))
+    stable_windows = 0
+    t0 = time.perf_counter()
+
+    while idx < len(crops_bgr):
+        end = min(len(crops_bgr), idx + batch)
+        window = crops_bgr[idx:end]
+        try:
+            # BGR → RGB → [B, 3, H, W] float tensor → ImageNet normalize
+            arr = np.stack([cv2.cvtColor(c, cv2.COLOR_BGR2RGB) for c in window], axis=0)
+            tensor = torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous().to(
+                device=device, dtype=dtype,
+            ) / 255.0
+            tensor = (tensor - _mean) / _std
+            amp_ctx = torch.autocast(device_type="cuda", dtype=dtype) if device.type == "cuda" else nullcontext()
+            with torch.no_grad(), amp_ctx:
+                out = model_pv(tensor)
+            # PersonViT forward returns (embeddings, hidden_states); embeddings
+            # are already L2-normalized inside the model.
+            feats = out[0] if isinstance(out, tuple) else out.embeddings
+            feats_chunks.append(feats.detach().cpu().float())
+            idx = end
+            stable_windows += 1
+            if stable_windows >= 3 and batch < max_batch:
+                batch = min(max_batch, batch + grow_step, len(crops_bgr) - idx or batch)
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            if "out of memory" in msg and batch > 1:
+                new_batch = max(1, batch // 2)
+                logger.warning(
+                    "[pipeline] %s: PersonViT OOM at %d/%d (batch=%d) -> retry batch=%d",
+                    video_id,
+                    idx,
+                    len(crops_bgr),
+                    batch,
+                    new_batch,
+                )
+                batch = new_batch
+                stable_windows = 0
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                continue
+            raise
+        finally:
+            try:
+                del tensor
+            except Exception:
+                pass
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    pooled = [[] for _ in t_data]
+    feats_all = torch.cat(feats_chunks, dim=0) if feats_chunks else None
+    if feats_all is not None:
+        for t_i, (start, end) in enumerate(slices):
+            if end > start:
+                avg = feats_all[start:end].mean(0)
+                pooled[t_i] = (avg / avg.norm().clamp_min(1e-8)).cpu().float().tolist()
+
+    logger.info(
+        "[pipeline] %s: PersonViT Re-ID done in %.1fs — %d fragments | emb=%d",
+        video_id,
+        time.perf_counter() - t0,
+        len(t_data),
+        sum(1 for e in pooled if e),
+    )
+    return pooled
 
 
 def _process_video_sync(
@@ -2547,16 +2818,24 @@ def _process_video_sync(
             video_id, _med_len, _med_span_s, _short, len(local_tracklets), _split_ids,
         )
 
-    # Stage 4: Quality filter — siết để loại tracklet stub trước khi vào
-    # SigLIP merge và Qwen captioning. Trước: 1893 vào → 1892 ra (filter
-    # không tồn tại). Sau: kỳ vọng loại được 30-40% các tracklet 2-3 obs
-    # noise/false-positive.
+    # Stage 4: Quality filter — nới lỏng để KHÔNG reject fragment có khả năng
+    # merge được bởi ReID-stage downstream. Triết lý: chỉ chặn noise rõ ràng
+    # (1-2 detection rời rạc, crop mờ), nhường quyết định ID-level cho merger.
+    #
+    # 2026-05-17: trước khi nới, min_density=0.15 (gấp 5x BoT-SORT's 0.03)
+    # khiến các fragment short-but-valid (người che 2/3 thời gian rồi chỉ
+    # xuất hiện 1 lần ở rìa) bị rớt — mất cơ hội ghép với fragment chính
+    # của cùng người ở Stage 5. min_duration_s=0.4 cũng quá chặt: người đi
+    # nhanh qua FOV xa với 2-3 obs trong <0.4s vẫn là same-person hợp lệ.
+    # min_laplacian=25 → 15 cho phép crop hơi mờ (đi nhanh, motion blur)
+    # nhưng vẫn discriminative cho DINOv2/ReID. min_confidence 0.35 → 0.30
+    # align với detector RT-DETR threshold (track_thresh=0.30 trong BoT-SORT).
     scorer = TrackletQualityScorer(
-        min_confidence=0.35,
-        min_frames=2,           # require at least two detections before embedding
-        min_density=0.15,       # 1 obs / 6.6 frames = ~2.2s — tracklet liên tục
-        min_duration_s=0.4,     # drop very short FP detection bursts
-        min_laplacian=25.0,
+        min_confidence=0.30,
+        min_frames=2,
+        min_density=0.05,       # align với BoT-SORT min_track_density
+        min_duration_s=0.2,     # 2 obs @ 6FPS = ~0.17s là chấp nhận được
+        min_laplacian=15.0,     # vẫn loại crop trắng/đen/quá mờ, không cắt mid-blur
     )
     quality_results = {t.track_id: scorer.score(t) for t in local_tracklets}
     accepted = [t for t in local_tracklets if quality_results[t.track_id].accepted]
@@ -2597,32 +2876,50 @@ def _process_video_sync(
         t_frames = [frame_lookup[o.frame_index] for o in lt.observations if o.frame_index in frame_lookup] or [sampled_frames[0].image]
         t_data.append((lt, t_idx, rep_bbox_float, t_frames))
 
+    reid_multi_feats = _batch_personvit_embeddings(
+        t_data, video_id, frame_lookup=frame_lookup,
+    )
     siglip_multi_feats, all_rep_crops, all_siglip_embeddings = _batch_siglip_embeddings(
         t_data, video_id, frame_lookup=frame_lookup,
     )
 
-    # Stage 8: Post-hoc fragment merging via SigLIP2 cosine similarity.
+    # Stage 8: Post-hoc fragment merging via dedicated Re-ID cosine similarity.
+    # Primary: PersonViT-S (MSMT17-fine-tuned, 384-dim). Bench shows pair
+    # separability gap +0.464 vs DINOv2's +0.121 — bench files in camera_0002/.
+    # SigLIP2 is kept ONLY as last-ditch fallback when PersonViT fails to
+    # load (e.g. checkpoint missing); under normal operation the merger uses
+    # PersonViT cosine at threshold FRAGMENT_MERGE_SIM_THRESHOLD (default 0.75).
     import numpy as _np
 
     _n_raw = len(accepted)
+    _merge_embedding_source = "PersonViT-S"
+    _merge_embeddings = reid_multi_feats
+    _merge_similarity_threshold = FRAGMENT_MERGE_SIM_THRESHOLD
+    _merge_motion_min_sim = FRAGMENT_MERGE_MOTION_MIN_SIM
+    if not any(_merge_embeddings):
+        _merge_embedding_source = "SigLIP2-fallback"
+        _merge_embeddings = siglip_multi_feats
+        _merge_similarity_threshold = FRAGMENT_MERGE_SIGLIP_FALLBACK_SIM_THRESHOLD
+        _merge_motion_min_sim = FRAGMENT_MERGE_SIGLIP_FALLBACK_MOTION_MIN_SIM
     logger.info(
-        "[merge] %s: %s  0/%d — merging fragments (emb=SigLIP2, threshold=%.2f, max_gap=%.0fs)",
+        "[merge] %s: %s  0/%d — merging fragments (emb=%s, threshold=%.2f, max_gap=%.0fs)",
         video_id, _vlm_progress_bar(0, _n_raw), _n_raw,
-        FRAGMENT_MERGE_SIM_THRESHOLD, FRAGMENT_MERGE_MAX_GAP_SECONDS,
+        _merge_embedding_source,
+        _merge_similarity_threshold, FRAGMENT_MERGE_MAX_GAP_SECONDS,
     )
 
     _merger = TrackletFragmentMerger(
-        similarity_threshold=FRAGMENT_MERGE_SIM_THRESHOLD,
+        similarity_threshold=_merge_similarity_threshold,
         max_gap_seconds=FRAGMENT_MERGE_MAX_GAP_SECONDS,
         component_similarity_margin=FRAGMENT_MERGE_COMPONENT_MARGIN,
         max_speed_px_per_s=FRAGMENT_MERGE_MAX_SPEED_PX_PER_S,
         spatial_bypass_margin=FRAGMENT_MERGE_SPATIAL_BYPASS_MARGIN,
         max_spatial_dist_px=FRAGMENT_MERGE_MAX_SPATIAL_DIST_PX,
-        motion_merge_min_appearance_sim=FRAGMENT_MERGE_MOTION_MIN_SIM,
+        motion_merge_min_appearance_sim=_merge_motion_min_sim,
     )
     _orig_accepted = list(accepted)
     _t_merge = time.perf_counter()
-    accepted, _groups = _merger.merge(list(accepted), siglip_multi_feats)
+    accepted, _groups = _merger.merge(list(accepted), _merge_embeddings)
     _merge_elapsed = time.perf_counter() - _t_merge
 
     _n_merged = sum(len(g) - 1 for g in _groups if len(g) > 1)
@@ -2666,10 +2963,13 @@ def _process_video_sync(
             return arr.tolist()
         return (arr / n).tolist()
 
-    # Pool the quality-aware multi-frame SigLIP features (5-8 crops/fragment
-    # @ 384px) for the DB-stored embedding, instead of the single-crop variant.
+    # Pool both lanes across the raw fragments that now form each merged tracklet.
+    # SigLIP remains the semantic DB vector; PersonViT-S is the identity/Re-ID vector.
     all_siglip_embeddings = [
         _pool_avg_normalized([siglip_multi_feats[i] for i in g]) for g in _groups
+    ]
+    all_reid_embeddings = [
+        _pool_avg_normalized([reid_multi_feats[i] for i in g]) for g in _groups
     ]
 
     # Rebuild t_data aligned to merged tracklets — use _best_observation for rep frame
@@ -2806,6 +3106,7 @@ def _process_video_sync(
         obs = lt.observations
         attrs = all_attributes[t_idx]
         siglip_emb = all_siglip_embeddings[t_idx] if t_idx < len(all_siglip_embeddings) else []
+        reid_emb = all_reid_embeddings[t_idx] if t_idx < len(all_reid_embeddings) else []
         action_tuple = all_actions[t_idx]
         if isinstance(action_tuple, tuple) and len(action_tuple) >= 3:
             action, action_conf, kinetics_raw = str(action_tuple[0]), float(action_tuple[1]), str(action_tuple[2])
@@ -2852,6 +3153,8 @@ def _process_video_sync(
             bev_x=_bev_inputs[t_idx].get("bev_x", 0.0),
             bev_y=_bev_inputs[t_idx].get("bev_y", 0.0),
             siglip_embedding=siglip_emb,
+            reid_embedding=reid_emb,
+            reid_model_version=REID_MODEL_VERSION if reid_emb else "",
             action=action,
             action_confidence=action_conf,
             kinetics_label=kinetics_raw,
@@ -2882,7 +3185,7 @@ def process_batch(req: BatchProcessRequest) -> BatchProcessResponse:
 
     Takes up to 100 videos from different cameras (same timestamp),
     runs per-video detection + BEV in parallel, then ONE MCBLT call
-    across all cameras, then DINOv2 + Qwen2.5-VL + VideoMAE per unified tracklet.
+    across all cameras, then PersonViT-S + Qwen2.5-VL + VideoMAE per unified tracklet.
 
     Returns unified cross-camera tracklets with global IDs.
     """
@@ -2973,7 +3276,7 @@ def process_batch(req: BatchProcessRequest) -> BatchProcessResponse:
     groups = _mcblt_associate(detections_by_camera, max_dist=max_dist)
     logger.info("[%s] MCBLT formed %d cross-camera groups", batch_id, len(groups))
 
-    # ---- Stages 5-7: Per unified tracklet → DINOv2 + Qwen2.5-VL + VideoMAE ----
+    # ---- Stages 5-7: Per unified tracklet → PersonViT-S + Qwen2.5-VL + VideoMAE ----
     tracklets: list[TrackletResult] = []
     tracklet_id_prefix = f"{batch_id}_tracklet"
 
@@ -3032,6 +3335,11 @@ def process_batch(req: BatchProcessRequest) -> BatchProcessResponse:
 
         summary = _build_appearance_summary(attributes)
         global_tracklet_id = f"{tracklet_id_prefix}_{group_idx}"
+        embedding = _generate_personvit_embeddings(
+            all_track_frames,
+            all_track_bboxes,
+            global_tracklet_id,
+        )
 
         tracklets.append(_build_tracklet_result(
             tracklet_id=global_tracklet_id,
@@ -3047,6 +3355,8 @@ def process_batch(req: BatchProcessRequest) -> BatchProcessResponse:
             bev_x=rep_bev_x,
             bev_y=rep_bev_y,
             siglip_embedding=[],
+            reid_embedding=embedding or [],
+            reid_model_version=REID_MODEL_VERSION if embedding else "",
             action=action if isinstance(action, str) else str(action),
             action_confidence=0.0,
             kinetics_label="",

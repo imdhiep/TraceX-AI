@@ -153,13 +153,15 @@ services:
       - PIPELINE_SAMPLE_FPS=${PIPELINE_SAMPLE_FPS:-6}
       # Tracker backend: botsort (default) | adaptive (legacy BodyPartAdaptiveTracker)
       - TRACER_BACKEND=${TRACER_BACKEND:-botsort}
-      # FragmentMerger tuning (2026-05-17 hospital-uniform calibration):
-      #   SIM_THRESHOLD     0.93 — exclude ambiguous-uniform cosine band 0.89-0.92
-      #   MAX_GAP_SECONDS   30   — short of any plausible same-person re-entry
-      #   MAX_SPEED_PX_PER_S 300 — make spatial gate effective at hospital walking speed
-      - FRAGMENT_MERGE_SIM_THRESHOLD=${FRAGMENT_MERGE_SIM_THRESHOLD:-0.93}
-      - FRAGMENT_MERGE_MAX_GAP_SECONDS=${FRAGMENT_MERGE_MAX_GAP_SECONDS:-30}
-      - FRAGMENT_MERGE_MAX_SPEED_PX_PER_S=${FRAGMENT_MERGE_MAX_SPEED_PX_PER_S:-300}
+      # FragmentMerger tuning (2026-05-17 PersonViT-S + real-CCTV calibration):
+      #   SIM_THRESHOLD     0.75  — PersonViT-S cosine sweet spot (camera_0002 bench)
+      #   MAX_GAP_SECONDS   120   — allow re-entry after long occlusion (was 30)
+      #   MAX_SPEED_PX_PER_S 800  — fits 1080p fast-walking (was 300, too tight)
+      #   MAX_SPATIAL_DIST_PX 1500 — allow opposite-FOV-edge re-entry (was 400)
+      - FRAGMENT_MERGE_SIM_THRESHOLD=${FRAGMENT_MERGE_SIM_THRESHOLD:-0.75}
+      - FRAGMENT_MERGE_MAX_GAP_SECONDS=${FRAGMENT_MERGE_MAX_GAP_SECONDS:-120}
+      - FRAGMENT_MERGE_MAX_SPEED_PX_PER_S=${FRAGMENT_MERGE_MAX_SPEED_PX_PER_S:-800}
+      - FRAGMENT_MERGE_MAX_SPATIAL_DIST_PX=${FRAGMENT_MERGE_MAX_SPATIAL_DIST_PX:-1500}
       - QWEN25VL_MODEL_ID=${QWEN25VL_MODEL_ID:-}
       - VLM_BATCH_SIZE=${VLM_BATCH_SIZE:-4}
       - VLM_BATCH_MAX_SIZE=${VLM_BATCH_MAX_SIZE:-8}
@@ -224,10 +226,12 @@ services:
       # Search tuning
       - MIN_FUSION_SCORE=${MIN_FUSION_SCORE:-0.5}
       - MAX_CANDIDATES=${MAX_CANDIDATES:-50}
-      # SigLIP2 image-image cosine clusters very tightly (~0.85-1.0 across
-      # all person crops). Identity merge needs a strict cutoff — adjust at
-      # runtime without redeploy via this env. Floor 0.97, sweet spot 0.98.
-      - QUERY_MERGE_THRESHOLD=${QUERY_MERGE_THRESHOLD:-0.89}
+      # 2026-05-17: ReID lane swapped to PersonViT-S MSMT17 (384-dim).
+      # PersonViT cosine distribution is much sharper than SigLIP/DINOv2 —
+      # 0.75 is the ingest-side FRAGMENT_MERGE_SIM_THRESHOLD sweet spot and
+      # the query-side should agree. See project_reid_personvit.md.
+      # QUERY_REID_MERGE_THRESHOLD overrides this if set.
+      - QUERY_MERGE_THRESHOLD=${QUERY_MERGE_THRESHOLD:-0.75}
       # AI model cache
       - HF_HOME=/workspace/models/huggingface
       - TORCH_HOME=/workspace/models/torch

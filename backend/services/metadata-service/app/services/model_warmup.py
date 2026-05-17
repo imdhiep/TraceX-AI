@@ -3,12 +3,12 @@
 Loads all models into VRAM once at startup via FastAPI lifespan.
 VRAM budget (metadata-service, A100 80GB):
   - RT-DETR R50 (person detection):                    ~3GB fp16
-  - DINOv2 ViT-L/14 (appearance embedding, 1024-dim):  ~5GB fp16
+  - PersonViT-S (Re-ID embedding, 384-dim, MSMT17):    ~0.1GB fp16
   - SigLIP 2-So400m (image encoder for text search):   ~3GB fp16
   - VideoMAE V2 (action recognition):                  ~3GB fp16
   - Qwen2.5-VL-7B-Instruct (open-vocabulary metadata): ~14GB fp16
   Runtime overhead (KV cache, activations):            ~3GB
-  Total metadata-service:                              ~31GB / 80GB
+  Total metadata-service:                              ~26GB / 80GB
 
 Pre-download models: python scripts/download_models.py --models qwen25vl siglip2 videomae
 
@@ -71,7 +71,7 @@ async def warmup_models() -> None:
         logger.info("A100 flags: TF32=on  cuDNN.benchmark=on  matmul_precision=high")
 
     _load_rtdetr(device)
-    _load_dinov2(device)
+    _load_personvit(device)
     _load_siglip2(device)
     _load_videomae_v2(device)
     _load_qwen25vl(device)
@@ -88,38 +88,46 @@ async def warmup_models() -> None:
         logger.info("=== Warmup complete (CPU) ===")
 
 
-def _load_dinov2(device: torch.device) -> None:
-    """Load DINOv2 ViT-L/14 for 1024-dim appearance embeddings."""
-    logger.info("Loading DINOv2 ViT-L/14...")
+def _load_personvit(device: torch.device) -> None:
+    """Load PersonViT-S (ViT-S/16, MSMT17-trained) for 384-dim Re-ID embeddings.
+
+    Replaces DINOv2 ViT-L (2026-05-17). PersonViT is a ReID-specific model
+    fine-tuned end-to-end on MSMT17 (4101 person IDs, 124k images) with
+    arcface + triplet loss. Benchmark vs DINOv2 on camera_0002:
+      • pair-distribution gap (mean_pos − mean_neg): 0.464 vs 0.121
+      • merged tracklets at zero-overmerge: 200 vs 347 (43% reduction)
+      • inference time: 4s vs 11s for 383 fragments
+    See [[feedback-post-tracker-filter-loose]] and bench files in camera_0002/.
+    """
+    logger.info("Loading PersonViT-S MSMT17...")
     try:
-        from transformers import AutoImageProcessor, AutoModel
+        from transformers import AutoModel
         import numpy as np
-        from PIL import Image
 
         torch_dtype = torch.float16 if device.type == "cuda" else torch.float32
-        model_id = "facebook/dinov2-large"
-        processor = AutoImageProcessor.from_pretrained(model_id)
-        model = AutoModel.from_pretrained(model_id, torch_dtype=torch_dtype)
-        model = model.to(device)
-        model.eval()
+        model_id = "maennyn/personvit-reid-msmt17-vit-s"
+        # trust_remote_code: HF repo ships its own model class
+        # (PersonViTReIDModel with built-in BNNeck + L2-normalize at output).
+        model = AutoModel.from_pretrained(
+            model_id, trust_remote_code=True, torch_dtype=torch_dtype,
+        )
+        model = model.to(device).eval()
 
-        dummy = Image.fromarray(np.zeros((224, 224, 3), dtype=np.uint8))
-        inputs = processor(images=[dummy], return_tensors="pt")
-        inputs = {
-            k: v.to(device=device, dtype=torch_dtype) if v.is_floating_point() else v.to(device)
-            for k, v in inputs.items()
-        }
+        # PersonViT requires 256×128 input (person-aspect crop)
+        dummy = torch.zeros(1, 3, 256, 128, device=device, dtype=torch_dtype)
         with torch.no_grad():
-            feat = model(**inputs).pooler_output  # [1, 1024]
-        logger.info("  DINOv2 output dim: %d", feat.shape[-1])
-        assert feat.shape[-1] == 1024, f"Expected 1024-dim, got {feat.shape[-1]}"
+            out = model(dummy)
+        # Forward returns (embeddings, hidden_states) tuple; embeddings already L2-normalized
+        feat = out[0] if isinstance(out, tuple) else out.embeddings
+        logger.info("  PersonViT-S output dim: %d", feat.shape[-1])
+        assert feat.shape[-1] == 384, f"Expected 384-dim, got {feat.shape[-1]}"
 
-        _MODELS["dinov2"] = model
-        _MODELS["dinov2_processor"] = processor
-        logger.info("  DINOv2 ViT-L/14 loaded OK")
+        _MODELS["personvit"] = model
+        logger.info("  PersonViT-S MSMT17 loaded OK (%.1f MB params)",
+                    sum(p.numel() for p in model.parameters()) * 4 / 1024 / 1024)
 
     except Exception as exc:
-        logger.warning("DINOv2 load failed (non-fatal): %s", exc)
+        logger.warning("PersonViT load failed (non-fatal): %s", exc)
 
 
 

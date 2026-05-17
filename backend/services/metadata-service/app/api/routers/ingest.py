@@ -114,6 +114,11 @@ async def full_pipeline(
                     dataset_root=str(DATASET_ROOT),
                     batch_size=8,
                 )
+                # NOTE 2026-05-17: "dinov2" arg name kept for backward compat
+                # with ground_truth_finetune.py; the underlying ReID lane is
+                # now PersonViT-S — fine-tuning of the new backbone is not yet
+                # wired (still uses pretrained MSMT17 weights). Remove the
+                # "dinov2" entry once finetune is migrated.
                 metrics = await pipeline.run(
                     num_samples=100,
                     models_to_finetune=["rtdetr", "dinov2"],

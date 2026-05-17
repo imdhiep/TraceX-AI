@@ -406,12 +406,18 @@ def _save_tracklets_from_gpu_result(
         )
         session.add(tracklet)
 
-        # Embedding (SigLIP2 1152-dim only)
-        siglip_vec = t.get("siglip_embedding") or []
-        if siglip_vec:
+        # Embeddings:
+        #   - SigLIP2 1152-dim semantic lane (text/image retrieval)
+        #   - Re-ID lane (PersonViT-S 384-dim, MSMT17) for identity association
+        siglip_vec = t.get("siglip_embedding") or None
+        reid_vec = t.get("reid_embedding") or None
+        reid_model_version = str(t.get("reid_model_version") or "") or None
+        if siglip_vec or reid_vec:
             session.add(TrackletEmbedding(
                 tracklet_id=tracklet_id,
                 siglip_embedding=siglip_vec,
+                reid_embedding=reid_vec,
+                reid_model_version=reid_model_version,
             ))
 
         # Action (VideoMAE V2)
