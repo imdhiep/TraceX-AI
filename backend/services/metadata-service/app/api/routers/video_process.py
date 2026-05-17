@@ -136,16 +136,28 @@ VLM_BATCH_MAX_NEW_TOKENS_PER_CROP = _get_positive_env_int(
 # The appearance gate (PersonViT cosine ≥ 0.75, p25 same-person ≈ 0.78) does
 # the hard work; loosening scene gates only lets it score MORE pairs, it does
 # not weaken purity.
-FRAGMENT_MERGE_SIM_THRESHOLD = _get_env_float("FRAGMENT_MERGE_SIM_THRESHOLD", 0.75)
+# 2026-05-17 (gate × thr re-bench after cam_02 production run):
+# bench_personvit_scene_gates.py shows that with the new loose gates
+# (120s/800/1500), 0.75 becomes too lenient — overmerge doubles (7 → 14)
+# because gates now expose appearance pass to many more long-gap pairs.
+# Sweet spot under NEW gates is thr=0.80:
+#   gates+thr   merged  overmerge  impure
+#   OLD+0.75    132     7          7      ← previous default
+#   NEW+0.75    75      14         14     (over-merge!)
+#   NEW+0.80    92      6          6      ★ chosen — beats OLD+0.75 on every metric
+#   NEW+0.78    82      9          9
+# Picking 0.80 keeps purity ≥ what we had at 0.75-OLD while still gaining
+# ~30% fewer tracklets from the looser gates.
+FRAGMENT_MERGE_SIM_THRESHOLD = _get_env_float("FRAGMENT_MERGE_SIM_THRESHOLD", 0.80)
 FRAGMENT_MERGE_MAX_GAP_SECONDS = _get_env_float("FRAGMENT_MERGE_MAX_GAP_SECONDS", 120.0)
 FRAGMENT_MERGE_COMPONENT_MARGIN = _get_env_float("FRAGMENT_MERGE_COMPONENT_MARGIN", 0.02)
 FRAGMENT_MERGE_MAX_SPEED_PX_PER_S = _get_env_float("FRAGMENT_MERGE_MAX_SPEED_PX_PER_S", 800.0)
 FRAGMENT_MERGE_SPATIAL_BYPASS_MARGIN = _get_env_float("FRAGMENT_MERGE_SPATIAL_BYPASS_MARGIN", 0.05)
 FRAGMENT_MERGE_MAX_SPATIAL_DIST_PX = _get_env_float("FRAGMENT_MERGE_MAX_SPATIAL_DIST_PX", 1500.0)
-# Motion-merge appearance floor — sim_thresh − 0.08 (same offset as before,
-# rescues borderline same-person fragments while blocking cross-person merges
-# at coincident spatial points).
-FRAGMENT_MERGE_MOTION_MIN_SIM = _get_env_float("FRAGMENT_MERGE_MOTION_MIN_SIM", 0.67)
+# Motion-merge appearance floor — sim_thresh − 0.08 (same offset; rescues
+# borderline same-person fragments while blocking cross-person merges at
+# coincident spatial points). 0.80 − 0.08 = 0.72.
+FRAGMENT_MERGE_MOTION_MIN_SIM = _get_env_float("FRAGMENT_MERGE_MOTION_MIN_SIM", 0.72)
 # If PersonViT is unavailable, SigLIP is only a degraded fallback lane. It lives
 # in a very different cosine regime, so it MUST keep its own conservative
 # thresholds rather than inheriting PersonViT's 0.75 / 0.67 defaults.
@@ -2888,7 +2900,7 @@ def _process_video_sync(
     # separability gap +0.464 vs DINOv2's +0.121 — bench files in camera_0002/.
     # SigLIP2 is kept ONLY as last-ditch fallback when PersonViT fails to
     # load (e.g. checkpoint missing); under normal operation the merger uses
-    # PersonViT cosine at threshold FRAGMENT_MERGE_SIM_THRESHOLD (default 0.75).
+    # PersonViT cosine at threshold FRAGMENT_MERGE_SIM_THRESHOLD (default 0.80).
     import numpy as _np
 
     _n_raw = len(accepted)
