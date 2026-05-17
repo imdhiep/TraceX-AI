@@ -1224,6 +1224,14 @@ class TrackletFragmentMerger:
         component_similarity_margin: float = 0.03,
         max_speed_px_per_s: float = 800.0,
         spatial_bypass_margin: float = 0.05,
+        # 2026-05-17: absolute upper bound on appearance-pass spatial budget.
+        # Without this, max_dist = gap_t × speed grows linearly with gap; at
+        # gap=30s with speed=300 it reaches 9000 px — wider than any FOV, so
+        # the spatial gate becomes a no-op for long gaps. Cap at the camera's
+        # plausible cross-frame travel for a single appearance (≈1/5 of a 1080p
+        # frame width). Set to 0 to disable the absolute cap and keep purely
+        # gap-scaled behavior.
+        max_spatial_dist_px: float = 400.0,
         # E — motion-only post-merge pass. After SigLIP union-find, run an
         # extra pass merging tracklet pairs with short gap + plausible
         # trajectory continuation, ignoring appearance. Catches over-fragmented
@@ -1245,6 +1253,13 @@ class TrackletFragmentMerger:
         motion_merge_max_velocity_angle_deg: float = 60.0,
         motion_merge_min_velocity_px_per_s: float = 20.0,
         motion_merge_min_obs_each_side: int = 3,
+        # 2026-05-17: appearance floor for the motion-only pass. Without this,
+        # two different people crossing at the same point (cos < 0.85 but
+        # dist≈0px) get merged purely on motion continuity. The floor stays
+        # BELOW sim_thresh so motion-merge can still rescue same-person
+        # fragments whose crops are degraded (backlit/partial body), which
+        # was the whole purpose of this pass.
+        motion_merge_min_appearance_sim: float = 0.85,
     ):
         self.sim_thresh     = similarity_threshold
         self.max_gap_s      = max_gap_seconds
@@ -1257,6 +1272,8 @@ class TrackletFragmentMerger:
         self.motion_merge_max_velocity_angle_rad = math.radians(motion_merge_max_velocity_angle_deg)
         self.motion_merge_min_velocity = motion_merge_min_velocity_px_per_s
         self.motion_merge_min_obs = motion_merge_min_obs_each_side
+        self.motion_merge_min_appearance_sim = float(motion_merge_min_appearance_sim)
+        self.max_spatial_dist_px = float(max_spatial_dist_px)
 
     def merge(
         self,
@@ -1278,6 +1295,9 @@ class TrackletFragmentMerger:
         n = len(tracklets)
         if n == 0:
             return [], []
+
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
 
         # Work in start-frame order for the gap-break optimisation
         order = sorted(range(n), key=lambda i: tracklets[i].observations[0].frame_index)
@@ -1369,9 +1389,23 @@ class TrackletFragmentMerger:
                 dist_px = _dist(ti_end_foot, tj_start_foot)
                 # Floor at 0.25 s so gap≈0 doesn't collapse the budget to 0.
                 max_dist = max(gap_t, 0.25) * self.max_speed_px_per_s
+                # Hard cap: prevent the gap-scaled budget from exceeding any
+                # plausible cross-frame travel for a single appearance.
+                if self.max_spatial_dist_px > 0.0:
+                    max_dist = min(max_dist, self.max_spatial_dist_px)
                 if dist_px > max_dist and sim[i, j] < self.spatial_bypass_thresh:
                     continue
 
+                # Audit log so we can see WHY each pair was merged. Filter by
+                # "[app-merge]" to investigate suspicious group sizes. DEBUG
+                # vì với N tracklet hàng trăm cặp có thể qua gate → log spam.
+                _log.debug(
+                    "[app-merge] %s ↔ %s | cos=%.3f gap=%.2fs dist=%.0fpx max_dist=%.0fpx bypass=%s",
+                    tracklets[order[i]].track_id,
+                    tracklets[order[j]].track_id,
+                    float(sim[i, j]), gap_t, dist_px, max_dist,
+                    "Y" if sim[i, j] >= self.spatial_bypass_thresh else "N",
+                )
                 union(i, j)
 
         # ── E: motion-only post-pass (hardened) ───────────────────────────────
@@ -1386,8 +1420,6 @@ class TrackletFragmentMerger:
         # gate (dist ≤ 0.3 × bbox_height).
         # Mọi merge được log để audit (R7).
         if self.motion_merge_max_gap_s > 0.0:
-            import logging as _logging
-            _log = _logging.getLogger(__name__)
             n_motion_merges = 0
 
             def _foot_velocity_tail(obs: tuple) -> tuple[float, float, float]:
@@ -1462,6 +1494,13 @@ class TrackletFragmentMerger:
                     if raw_dist > max(gap_t, 0.25) * self.max_speed_px_per_s:
                         continue
 
+                    # Appearance floor — block "two different people crossing
+                    # at the same point" (cos ≪ sim_thresh but dist≈0).
+                    # Still BELOW sim_thresh so SigLIP-borderline same-person
+                    # rescues remain possible.
+                    if float(sim[i, j]) < self.motion_merge_min_appearance_sim:
+                        continue
+
                     if speed_i < self.motion_merge_min_velocity:
                         # R3: ti đứng yên — không tin extrapolation, chỉ chấp
                         # nhận khi foot-point gần như chồng nhau (0.3× height)
@@ -1483,11 +1522,15 @@ class TrackletFragmentMerger:
                         if err > max_extrap:
                             continue
 
-                    # R7: log audit — mức INFO để dễ filter ra
+                    # R7: log audit — mức INFO để dễ filter ra.
+                    # cos_ij là cosine sim đã tính ở pass appearance — log để
+                    # phân biệt motion-merge của cùng người (cos cao nhưng <
+                    # 0.89) với gộp nhầm (cos thấp, chỉ bridge bằng motion).
                     _log.info(
-                        "[motion-merge] %s ↔ %s | gap=%.2fs dist=%.0fpx speed_i=%.0fpx/s",
+                        "[motion-merge] %s ↔ %s | cos=%.3f gap=%.2fs dist=%.0fpx speed_i=%.0fpx/s",
                         tracklets[order[i]].track_id,
                         tracklets[order[j]].track_id,
+                        float(sim[i, j]),
                         gap_t, raw_dist, speed_i,
                     )
                     n_motion_merges += 1

@@ -153,6 +153,13 @@ services:
       - PIPELINE_SAMPLE_FPS=${PIPELINE_SAMPLE_FPS:-6}
       # Tracker backend: botsort (default) | adaptive (legacy BodyPartAdaptiveTracker)
       - TRACER_BACKEND=${TRACER_BACKEND:-botsort}
+      # FragmentMerger tuning (2026-05-17 hospital-uniform calibration):
+      #   SIM_THRESHOLD     0.93 — exclude ambiguous-uniform cosine band 0.89-0.92
+      #   MAX_GAP_SECONDS   30   — short of any plausible same-person re-entry
+      #   MAX_SPEED_PX_PER_S 300 — make spatial gate effective at hospital walking speed
+      - FRAGMENT_MERGE_SIM_THRESHOLD=${FRAGMENT_MERGE_SIM_THRESHOLD:-0.93}
+      - FRAGMENT_MERGE_MAX_GAP_SECONDS=${FRAGMENT_MERGE_MAX_GAP_SECONDS:-30}
+      - FRAGMENT_MERGE_MAX_SPEED_PX_PER_S=${FRAGMENT_MERGE_MAX_SPEED_PX_PER_S:-300}
       - QWEN25VL_MODEL_ID=${QWEN25VL_MODEL_ID:-}
       - VLM_BATCH_SIZE=${VLM_BATCH_SIZE:-4}
       - VLM_BATCH_MAX_SIZE=${VLM_BATCH_MAX_SIZE:-8}

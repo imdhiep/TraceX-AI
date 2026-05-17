@@ -101,6 +101,10 @@ services:
       - PIPELINE_SAMPLE_FPS=${PIPELINE_SAMPLE_FPS:-6}
       # Tracker backend: botsort (default) | adaptive (legacy BodyPartAdaptiveTracker)
       - TRACER_BACKEND=${TRACER_BACKEND:-botsort}
+      # FragmentMerger tuning (2026-05-17 hospital-uniform calibration)
+      - FRAGMENT_MERGE_SIM_THRESHOLD=${FRAGMENT_MERGE_SIM_THRESHOLD:-0.93}
+      - FRAGMENT_MERGE_MAX_GAP_SECONDS=${FRAGMENT_MERGE_MAX_GAP_SECONDS:-30}
+      - FRAGMENT_MERGE_MAX_SPEED_PX_PER_S=${FRAGMENT_MERGE_MAX_SPEED_PX_PER_S:-300}
       # Public base URL for metadata-service (used for generating storage URLs)
       - NEXT_PUBLIC_API_GATEWAY_URL=${COOLIFY_PUBLIC_URL:-}
     volumes:
