@@ -7,8 +7,7 @@
 # ─── Traffic flow ────────────────────────────────────────────────────────────
 #   Browser
 #     → VPS: tracex-ai.smartnovi.tech        (frontend, port 443 HTTPS)
-#     → LightningAI: 8002-XXXX.cloudspaces.litng.ai/api/v1  (metadata-service / non-search APIs)
-#     → LightningAI: 8003-XXXX.cloudspaces.litng.ai/api/v1  (query-service / direct search runtime)
+#     → LightningAI: 8002-XXXX.cloudspaces.litng.ai/api/v1  (metadata-service / all browser APIs)
 #
 # ─── Internal service communication ──────────────────────────────────────────
 #   metadata-service  →  query-service (http://query-service:8003)
@@ -18,7 +17,7 @@
 #
 # ─── Ports exposed trên LightningAI ──────────────────────────────────────────
 #   8002  →  metadata-service  (NEXT_PUBLIC_API_BASE_URL trỏ đến port này)
-#   8003  →  query-service     (NEXT_PUBLIC_SEARCH_API_BASE_URL trỏ đến port này)
+#   8003  →  query-service     (internal, metadata-service gọi nội bộ)
 #   8004  →  trace-service     (internal, metadata/query-service gọi nội bộ)
 #   5432  →  postgres          (KHÔNG expose — chỉ dùng nội bộ Docker network)
 #

@@ -62,7 +62,7 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("SeamlessM4T warmup skipped (non-fatal): %s", exc)
 
-    # Independent search runtime:
+    # Internal search runtime:
     # - RT-DETR crops uploaded person images
     # - PersonViT handles same-person image retrieval
     # - SigLIP handles text/image semantic retrieval
@@ -85,11 +85,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Browsers reject `Access-Control-Allow-Origin: *` together with
-# `Allow-Credentials: true`. Frontend sends auth as a Bearer header, not a
-# cookie, so credentials are not required — keep the wildcard origin and turn
-# credentials off so direct browser → query-service search works from any
-# Coolify/VPS hostname without re-listing origins on every move.
+# Keep CORS permissive for operator/debug access, but the normal browser path is
+# still frontend → metadata-service → query-service. Frontend auth uses Bearer
+# headers rather than cookies, so credentials are not required here.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -100,8 +98,8 @@ app.add_middleware(
 
 app.include_router(candidates.router, prefix="/api/v1", tags=["candidates"])
 
-# Query-service can serve search independently of metadata-service, so expose
-# the shared static assets referenced by candidate payloads too.
+# Expose the shared static assets referenced by candidate payloads for internal
+# compatibility and operator/debug access.
 _CROPS_DIR = Path("/workspace/storage/crops")
 _CROPS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static/crops", StaticFiles(directory=str(_CROPS_DIR)), name="crops")

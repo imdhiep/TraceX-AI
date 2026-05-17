@@ -1,7 +1,7 @@
 """Candidates search router for query-service.
 
 Flow:
-1. Direct JSON/multipart search request arrives here (metadata-service proxy remains compatible)
+1. metadata-service forwards the normalized search request here
 2. text-only keeps the historical text/SigLIP path
 3. image-only retrieves the full gallery by PersonViT ReID similarity only
 4. image+text unions PersonViT retrieval with SigLIP/metadata recall, while image keeps rank priority

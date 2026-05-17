@@ -13,9 +13,7 @@ RUN if [ -f package-lock.json ]; then npm ci --ignore-scripts; else npm install 
 # Build stage
 FROM base AS builder
 ARG NEXT_PUBLIC_API_BASE_URL
-ARG NEXT_PUBLIC_SEARCH_API_BASE_URL
 ENV NEXT_PUBLIC_API_BASE_URL=$NEXT_PUBLIC_API_BASE_URL
-ENV NEXT_PUBLIC_SEARCH_API_BASE_URL=$NEXT_PUBLIC_SEARCH_API_BASE_URL
 WORKDIR /app/frontend
 COPY --from=deps /app/frontend/node_modules ./node_modules
 COPY frontend/ ./

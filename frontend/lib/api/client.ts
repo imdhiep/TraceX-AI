@@ -151,18 +151,6 @@ export function getApiBaseUrl(): string {
   return "http://metadata-service:8000";
 }
 
-/** Search can run directly against query-service while the rest of the app stays on metadata-service. */
-export function getSearchApiBaseUrl(): string {
-  const envBase = (process.env.NEXT_PUBLIC_SEARCH_API_BASE_URL ?? "").trim();
-  if (envBase.startsWith("/")) {
-    return envBase.replace(/\/$/, "");
-  }
-  if (envBase.startsWith("http://") || envBase.startsWith("https://")) {
-    return envBase.replace(/\/$/, "");
-  }
-  return getApiBaseUrl();
-}
-
 export function resolveMediaUrl(url: string, apiBaseUrl: string = getApiBaseUrl()): string {
   const raw = (url ?? "").trim();
   if (!raw) {
@@ -232,7 +220,10 @@ export async function searchVideos(
   optionsOrPersistQuery: SearchVideosOptions | boolean = false,
   reuseQueryId?: string | null,
 ): Promise<SearchPage> {
-  const apiBaseUrl = getSearchApiBaseUrl();
+  // Keep a single browser-facing API entrypoint. metadata-service forwards
+  // /search to query-service, which then chooses text_only/image_only/image_text
+  // internally without making the frontend depend on query-service exposure.
+  const apiBaseUrl = getApiBaseUrl();
   const options: SearchVideosOptions =
     typeof optionsOrPersistQuery === "boolean"
       ? { persistQuery: optionsOrPersistQuery, reuseQueryId }

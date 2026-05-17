@@ -7,8 +7,7 @@
 # Traffic flow after deployment:
 #   Browser → Coolify VPS (frontend, port 443)
 #            → LightningAI metadata-service :8002 via NEXT_PUBLIC_API_BASE_URL
-#            → LightningAI query-service :8003 via NEXT_PUBLIC_SEARCH_API_BASE_URL
-#              (trace-service :8004 remains internal)
+#              (query-service :8003 and trace-service :8004 remain internal)
 #
 # IMPORTANT: Set COOLIFY_PUBLIC_URL to your LightningAI public URL:
 #   e.g. https://8000-xxxx.cloudspaces.litng.ai

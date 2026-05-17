@@ -71,9 +71,10 @@ Không phải trọng tâm hiện tại:
 
 ### Runtime rule
 
-- Browser gọi non-search API qua `metadata-service` (`/api-gw` / `NEXT_PUBLIC_API_BASE_URL`).
-- Search gọi thẳng `query-service` qua `/search-gw` / `NEXT_PUBLIC_SEARCH_API_BASE_URL`; query-service tự auth, tự nhận multipart và tự xử lý ảnh query.
-- `metadata-service` vẫn giữ route proxy search để tương thích ngược và gọi nội bộ:
+- Browser chỉ gọi public API qua `metadata-service` (`/api-gw` / `NEXT_PUBLIC_API_BASE_URL`).
+- `metadata-service` nhận `/api/v1/search`, xử lý auth + multipart, rồi proxy nội bộ sang `query-service`.
+- `query-service` tách logic search thành 3 mode nội bộ: `text_only`, `image_only`, `image_text`.
+- `metadata-service` gọi nội bộ:
   - `query-service` qua `http://query-service:8003`;
   - `trace-service` qua `http://trace-service:8004`.
 - PostgreSQL chỉ nằm trong Docker network của LightningAI, không expose public.
@@ -477,7 +478,6 @@ Frontend only needs one base URL:
 
 ```text
 NEXT_PUBLIC_API_BASE_URL=https://8002-<workspace>.cloudspaces.litng.ai/api/v1
-NEXT_PUBLIC_SEARCH_API_BASE_URL=https://8003-<workspace>.cloudspaces.litng.ai/api/v1
 ```
 
 `frontend/next.config.js` rewrites:
@@ -524,7 +524,7 @@ Service ports:
 | ------- | ---- | ------ |
 | frontend | 3000 | via VPS Traefik HTTPS |
 | metadata-service | 8002 | yes, LightningAI public URL |
-| query-service | 8003 | public search runtime + internal compatibility path |
+| query-service | 8003 | internal only |
 | trace-service | 8004 | internal only |
 | PostgreSQL | 5432 | internal only |
 
