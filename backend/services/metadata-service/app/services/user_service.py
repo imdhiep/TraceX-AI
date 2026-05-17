@@ -100,8 +100,12 @@ def authenticate_user(session: Session, identifier: str, password: str) -> User 
     return user
 
 
-def list_users(session: Session) -> list[User]:
+def list_users(session: Session, *, actor: User | None = None) -> list[User]:
     statement = select(User).order_by(User.created_at.desc(), User.id.desc())
+    if actor is not None:
+        actor_rank = role_rank(actor.role)
+        lower_roles = [r for r, rank in ROLE_HIERARCHY.items() if rank < actor_rank]
+        statement = statement.where(User.role.in_(lower_roles), User.id != actor.id)
     return list(session.scalars(statement).all())
 
 

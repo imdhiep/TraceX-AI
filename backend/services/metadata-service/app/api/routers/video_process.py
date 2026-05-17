@@ -1,9 +1,10 @@
 """Video processing pipeline for metadata-service — SOTA 2026 AI.
 
 Production single-video pipeline (`_process_video_sync`):
-  1. VideoFrameSampler (4 fps, Laplacian sharpness scoring)
+  1. VideoFrameSampler (6 fps default, Laplacian sharpness scoring)
   2. RT-DETR R50 person detection (primary) / Grounding DINO 1.6 (fallback)
-  3. BodyPartAdaptiveTracker (head/foot adaptive cost, IoU + velocity)
+  3. BoT-SORT tracker (Kalman + IoU, ReID disabled, GMC disabled) —
+     legacy BodyPartAdaptiveTracker available via TRACER_BACKEND=adaptive
   4. TrackletQualityScorer (min_frames, density, duration, Laplacian)
   5. SigLIP 2-So400m (1152-dim) — multi-frame pool-avg per fragment
   6. TrackletFragmentMerger (cosine ≥ 0.85, max_gap ≤ 60 s, Union-Find)
@@ -107,7 +108,7 @@ VLM_BATCH_MAX_NEW_TOKENS_PER_CROP = _get_positive_env_int(
 # tăng (kỳ vọng 30-50%), nhưng độ tinh khiết group tăng đáng kể.
 # Component margin 0.03 → 0.05 → floor = 0.85 (cùng giá trị threshold cũ),
 # vẫn cho phép expand group qua các fragment trung gian.
-FRAGMENT_MERGE_SIM_THRESHOLD = _get_env_float("FRAGMENT_MERGE_SIM_THRESHOLD", 0.88)
+FRAGMENT_MERGE_SIM_THRESHOLD = _get_env_float("FRAGMENT_MERGE_SIM_THRESHOLD", 0.89)
 FRAGMENT_MERGE_MAX_GAP_SECONDS = _get_env_float("FRAGMENT_MERGE_MAX_GAP_SECONDS", 180.0)
 FRAGMENT_MERGE_COMPONENT_MARGIN = _get_env_float("FRAGMENT_MERGE_COMPONENT_MARGIN", 0.02)
 FRAGMENT_MERGE_MAX_SPEED_PX_PER_S = _get_env_float("FRAGMENT_MERGE_MAX_SPEED_PX_PER_S", 800.0)
@@ -2170,7 +2171,7 @@ def _batch_siglip_embeddings(
                     start = len(siglip_crops)
                     for idx in indices:
                         fr, bbox = obs_pairs[idx]
-                        c = _extract_crop(fr, bbox, 224)
+                        c = _extract_crop(fr, bbox, 384)
                         if c is not None:
                             siglip_crops.append(Image.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB)))
                     siglip_slices.append((start, len(siglip_crops)))
@@ -2183,7 +2184,7 @@ def _batch_siglip_embeddings(
                     indices = np.linspace(0, len(t_frames) - 1, n, dtype=int)
                     start = len(siglip_crops)
                     for idx in indices:
-                        c = _extract_crop(t_frames[idx], rep_bbox, 224)
+                        c = _extract_crop(t_frames[idx], rep_bbox, 384)
                         if c is not None:
                             siglip_crops.append(Image.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB)))
                     siglip_slices.append((start, len(siglip_crops)))
@@ -2233,7 +2234,12 @@ def _process_video_sync(
     presampled_frames=None,
 ) -> ProcessVideoResponse:
     """
-    Sync video processing pipeline using BodyPartAdaptiveTracker + 4fps sampling.
+    Sync video processing pipeline.
+
+    Tracker backend is selected by env var `TRACER_BACKEND`:
+      - `botsort` (default) — BoT-SORT via boxmot, no ReID, no GMC.
+      - `adaptive`         — legacy BodyPartAdaptiveTracker (kept for benchmarks).
+
     presampled_frames: pre-decoded frames from background thread (skips Stage 1).
     """
     import time
@@ -2242,18 +2248,15 @@ def _process_video_sync(
         TrackletFragmentMerger, FrameDetection, _crop_from_bbox,
         _crop_laplacian_variance, _is_low_quality_crop,
     )
+    from .botsort_tracker import BotSortTracker, is_botsort_backend
     start = time.time()
     camera_id = camera_id or "Camera_0000"
 
-    # Stage 1: Sample frames at 3fps (skip if pre-decoded externally).
-    # Counter-intuitive finding from offline benchmark on camera_0002:
-    # purity peaks at 3 FPS (92.6% vs 87.2% at 4 FPS, 82.9% at 6 FPS).
-    # Lower FPS gives larger inter-frame motion, which makes the cost matrix
-    # less ambiguous when multiple people are close together — handoffs drop.
-    # Detection cost also drops 25% vs 4 FPS (1800 frames vs 2400 for 10min).
-    # Trade-off: very short actions (~1s falls) may have fewer frames for
-    # VideoMAE; see PIPELINE_SAMPLE_FPS override for per-camera tuning.
-    sample_fps = int(os.environ.get("PIPELINE_SAMPLE_FPS", "3"))
+    # Stage 1: Sample frames at 6fps (skip if pre-decoded externally).
+    # BoT-SORT relies on Kalman + IoU, so it benefits from smaller inter-frame
+    # motion than the legacy adaptive tracker. Keep PIPELINE_SAMPLE_FPS tunable
+    # for per-camera latency/accuracy trade-offs.
+    sample_fps = int(os.environ.get("PIPELINE_SAMPLE_FPS", "6"))
     if presampled_frames is not None:
         sampled_frames = presampled_frames
     else:
@@ -2304,10 +2307,9 @@ def _process_video_sync(
     total_raw = 0
     total_low_quality = 0
     for sf_idx, sf in enumerate(sampled_frames):
-        items = per_frame.get(sf_idx)
-        if not items:
-            continue
-        items.sort(key=lambda x: x[0])  # restore original detection order
+        items = per_frame.get(sf_idx) or []
+        if items:
+            items.sort(key=lambda x: x[0])  # restore original detection order
         frame_dets: list[FrameDetection] = []
         for _d_idx, bbox, crop, crop_lap, low_q, score in items:
             if low_q:
@@ -2331,11 +2333,11 @@ def _process_video_sync(
                        video_id, total_low_quality, total_raw,
                        100.0 * total_low_quality / total_raw)
 
-    logger.warning("[pipeline] %s: %d detections across %d frames", video_id, total_raw, len(detections_by_frame))
+    logger.warning("[pipeline] %s: %d detections across %d sampled frames", video_id, total_raw, len(detections_by_frame))
 
     import torch as _torch
 
-    if not detections_by_frame:
+    if total_raw == 0:
         logger.warning("[pipeline] %s: no persons detected", video_id)
         return ProcessVideoResponse(
             video_id=video_id, camera_id=camera_id,
@@ -2343,38 +2345,57 @@ def _process_video_sync(
             processing_time_s=time.time() - start,
         )
 
-    # Stage 3: Track with BodyPartAdaptiveTracker.
-    # Pixel-per-frame thresholds scale with FPS (lower FPS → people move more
-    # between frames → larger gate). Buffer counts scale to keep wall-clock
-    # seconds constant. Defaults below correspond to the legacy 4 FPS config.
-    # min_track_frames=2 (the legacy value) — benchmark on camera_0002 showed
-    # G6 (raising to 3) does not improve purity once G4 post-hoc split is on.
-    _fps_ratio_4 = 4.0 / max(sample_fps, 1)        # 3fps→1.33, 4fps→1.0, 6fps→0.67
+    # Stage 3: Tracking.
+    # Default backend is BoT-SORT (boxmot, no ReID, no GMC). Set
+    # TRACER_BACKEND=adaptive to fall back to the legacy BodyPartAdaptiveTracker
+    # (kept in tracking_pipeline.py for camera_0002 benchmarks).
     _fps_ratio_self = sample_fps / 4.0             # 3fps→0.75, 4fps→1.0, 6fps→1.5
-    tracker = BodyPartAdaptiveTracker(
-        track_thresh=0.30,
-        low_thresh=0.10,
-        new_track_threshold=0.30,
-        min_track_frames=2,
-        min_track_density=0.03,
-        # Bench cam_0002 (sweep margin 0.10 → 0.30 trên 25 GT person):
-        #   0.10 → impurity 4.81%, contam 19.87%, IDS 580, frag/GT 83.12
-        #   0.20 → impurity 2.01%, contam 10.58%, IDS 265, frag/GT 82.44  ★
-        #   0.30 → impurity 0.59% nhưng max track length -83%, concurrency -51%
-        # 0.20 là sweet spot: giảm merge nhầm 58%, IDS 54%, frag/GT gần như
-        # giữ nguyên, không phá vỡ track dài (max length giữ ở 648 frame).
-        discriminative_margin=0.15,
-        # FPS-scaled pixel thresholds
-        max_head_center_distance=120.0 * _fps_ratio_4,
-        max_foot_distance=150.0 * _fps_ratio_4,
-        max_predicted_distance=180.0 * _fps_ratio_4,
-        max_center_jump_ratio=2.0 * _fps_ratio_4,
-        # IoU expectation grows with FPS (adjacent frames more similar)
-        min_active_iou_short_gap=min(0.05 * _fps_ratio_4, 0.20),
-        # Buffer counts scaled to ~5s short / ~75s long at any FPS
-        track_buffer=max(int(round(20 * _fps_ratio_self)), 8),
-        max_buffer_frames=max(int(round(300 * _fps_ratio_self)), 100),
-    )
+    _track_buffer = max(int(round(20 * _fps_ratio_self)), 8)
+    if is_botsort_backend():
+        tracker = BotSortTracker(
+            track_thresh=0.30,
+            low_thresh=0.10,
+            new_track_threshold=0.30,
+            match_thresh=0.80,                # bench-selected IoU association
+            track_buffer=_track_buffer,
+            frame_rate=max(sample_fps, 1),
+            min_track_frames=2,
+            min_track_density=0.03,
+            max_center_jump_ratio=1.60,
+            max_speed_px_per_s=800.0,
+            min_short_gap_iou=0.02,
+        )
+        logger.warning("[pipeline] %s: tracker backend = BoT-SORT (no-ReID, no-GMC)", video_id)
+    else:
+        # Pixel-per-frame thresholds scale with FPS (lower FPS → people move more
+        # between frames → larger gate). Buffer counts scale to keep wall-clock
+        # seconds constant. Defaults below correspond to the legacy 4 FPS config.
+        # min_track_frames=2 (the legacy value) — benchmark on camera_0002 showed
+        # G6 (raising to 3) does not improve purity once G4 post-hoc split is on.
+        _fps_ratio_4 = 4.0 / max(sample_fps, 1)    # 3fps→1.33, 4fps→1.0, 6fps→0.67
+        tracker = BodyPartAdaptiveTracker(
+            track_thresh=0.30,
+            low_thresh=0.10,
+            new_track_threshold=0.30,
+            min_track_frames=2,
+            min_track_density=0.03,
+            # Bench cam_0002 (sweep margin 0.10 → 0.30 trên 25 GT person):
+            #   0.10 → impurity 4.81%, contam 19.87%, IDS 580, frag/GT 83.12
+            #   0.20 → impurity 2.01%, contam 10.58%, IDS 265, frag/GT 82.44  ★
+            #   0.30 → impurity 0.59% nhưng max track length -83%, concurrency -51%
+            # 0.20 là sweet spot: giảm merge nhầm 58%, IDS 54%, frag/GT gần như
+            # giữ nguyên, không phá vỡ track dài (max length giữ ở 648 frame).
+            discriminative_margin=0.15,
+            max_head_center_distance=120.0 * _fps_ratio_4,
+            max_foot_distance=150.0 * _fps_ratio_4,
+            max_predicted_distance=180.0 * _fps_ratio_4,
+            max_center_jump_ratio=2.0 * _fps_ratio_4,
+            min_active_iou_short_gap=0.0,
+            max_phantom_frames=1,
+            track_buffer=_track_buffer,
+            max_buffer_frames=max(int(round(300 * _fps_ratio_self)), 100),
+        )
+        logger.warning("[pipeline] %s: tracker backend = BodyPartAdaptiveTracker (legacy)", video_id)
     local_tracklets = tracker.track(video_id, camera_id, detections_by_frame)
     logger.warning("[pipeline] %s: %d raw tracklets from tracker", video_id, len(local_tracklets))
 
@@ -2384,9 +2405,9 @@ def _process_video_sync(
     # noise/false-positive.
     scorer = TrackletQualityScorer(
         min_confidence=0.35,
-        min_frames=2,           # ≥1s ở 3 FPS — đủ cho 1 cử động ngắn
+        min_frames=2,           # require at least two detections before embedding
         min_density=0.15,       # 1 obs / 6.6 frames = ~2.2s — tracklet liên tục
-        min_duration_s=0.4,     # bỏ tracklet < 0.65s (thường là FP detection burst)
+        min_duration_s=0.4,     # drop very short FP detection bursts
         min_laplacian=25.0,
     )
     quality_results = {t.track_id: scorer.score(t) for t in local_tracklets}
@@ -2458,8 +2479,9 @@ def _process_video_sync(
             return arr.tolist()
         return (arr / n).tolist()
 
-    # Pool the multi-frame SigLIP features (5 crops/fragment, richer signal)
-    # for the DB-stored embedding, instead of the single-crop variant.
+    # Pool the multi-frame SigLIP features (5 crops/fragment @ 384px, richer
+    # signal -- matches SigLIP-2 so400m-patch14-384 native resolution) for the
+    # DB-stored embedding, instead of the single-crop variant.
     all_siglip_embeddings = [
         _pool_avg_normalized([siglip_multi_feats[i] for i in g]) for g in _groups
     ]

@@ -147,14 +147,12 @@ services:
       # Bit-equality verified on synthetic + structured frames (max diff 0.003
       # in fp16). Set to 0 to fall back to legacy CPU path if needed.
       - RTDETR_GPU_PREPROCESS=${RTDETR_GPU_PREPROCESS:-1}
-      # Pipeline frame-sampling rate. Offline benchmark on camera_0002 GT
-      # showed purity peaks at 3 FPS (92.6%) vs 4 FPS (87.2%) and 6 FPS
-      # (82.9%) — counter-intuitive but consistent: lower FPS = larger
-      # inter-frame motion = less ambiguous cost matrix when people are
-      # close together. Tracker thresholds auto-scale to this value.
-      # Caveat: very short actions (<1.5s falls) may lose VideoMAE frames;
-      # raise to 4-6 if fall-detection accuracy matters more than raw purity.
-      - PIPELINE_SAMPLE_FPS=${PIPELINE_SAMPLE_FPS:-3}
+      # Pipeline frame-sampling rate. BoT-SORT uses Kalman + IoU, so
+      # default to 6 FPS for smaller inter-frame motion while keeping the
+      # value tunable per run.
+      - PIPELINE_SAMPLE_FPS=${PIPELINE_SAMPLE_FPS:-6}
+      # Tracker backend: botsort (default) | adaptive (legacy BodyPartAdaptiveTracker)
+      - TRACER_BACKEND=${TRACER_BACKEND:-botsort}
       - QWEN25VL_MODEL_ID=${QWEN25VL_MODEL_ID:-}
       - VLM_BATCH_SIZE=${VLM_BATCH_SIZE:-4}
       - VLM_BATCH_MAX_SIZE=${VLM_BATCH_MAX_SIZE:-8}
@@ -217,7 +215,7 @@ services:
       - PREVIEW_ROOT=/workspace/storage/candidate-previews
       - PUBLIC_API_BASE_URL=${LIGHTNINGAI_PUBLIC_URL:-}
       # Search tuning
-      - MIN_FUSION_SCORE=${MIN_FUSION_SCORE:-0.55}
+      - MIN_FUSION_SCORE=${MIN_FUSION_SCORE:-0.5}
       - MAX_CANDIDATES=${MAX_CANDIDATES:-50}
       # SigLIP2 image-image cosine clusters very tightly (~0.85-1.0 across
       # all person crops). Identity merge needs a strict cutoff — adjust at
