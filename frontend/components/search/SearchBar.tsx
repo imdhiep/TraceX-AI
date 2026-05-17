@@ -30,6 +30,8 @@ export function SearchBar({ className = "" }: SearchBarProps) {
   const [imagePreviewOpen, setImagePreviewOpen] = useState(false);
   const locationRef = useRef<HTMLDivElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const imageButtonRef = useRef<HTMLButtonElement | null>(null);
+  const queryInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     function onClickOutside(event: MouseEvent) {
@@ -68,6 +70,8 @@ export function SearchBar({ className = "" }: SearchBarProps) {
       type: file.type,
       previewUrl: URL.createObjectURL(file),
     });
+    imageButtonRef.current?.blur();
+    queryInputRef.current?.focus();
   }
 
   function handleRemoveImage() {
@@ -111,6 +115,7 @@ export function SearchBar({ className = "" }: SearchBarProps) {
     >
       <div className="flex w-full flex-wrap gap-2">
         <input
+          ref={queryInputRef}
           type="text"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
@@ -126,6 +131,7 @@ export function SearchBar({ className = "" }: SearchBarProps) {
           onChange={handleImageChange}
         />
         <button
+          ref={imageButtonRef}
           type="button"
           onClick={() => imageInputRef.current?.click()}
           title="Tải ảnh mẫu (tối đa 5MB)"
