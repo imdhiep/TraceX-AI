@@ -1,6 +1,7 @@
 "use client";
 
 import { type ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { DayPicker, type DateRange } from "react-day-picker";
 import { vi } from "date-fns/locale";
 import { CalendarRange, ImagePlus, MapPin, X } from "lucide-react";
@@ -69,11 +70,43 @@ export function SearchBar({ className = "" }: SearchBarProps) {
   const [imageError, setImageError] = useState<string | null>(null);
   const [imagePreviewOpen, setImagePreviewOpen] = useState(false);
   const [dateOpen, setDateOpen] = useState(false);
+  const [datePos, setDatePos] = useState<{ top: number; left: number }>({ top: 0, left: 0 });
+  const [mounted, setMounted] = useState(false);
   const locationRef = useRef<HTMLDivElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const imageButtonRef = useRef<HTMLButtonElement | null>(null);
   const queryInputRef = useRef<HTMLInputElement | null>(null);
   const dateRef = useRef<HTMLDivElement | null>(null);
+  const datePopoverRef = useRef<HTMLDivElement | null>(null);
+  const dateButtonRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  function recomputeDatePos() {
+    if (!dateButtonRef.current) return;
+    const rect = dateButtonRef.current.getBoundingClientRect();
+    setDatePos({ top: rect.bottom + 8, left: rect.left });
+  }
+
+  function toggleDateOpen() {
+    if (!dateOpen) recomputeDatePos();
+    setDateOpen((prev) => !prev);
+  }
+
+  useEffect(() => {
+    if (!dateOpen) return;
+    function onScrollOrResize() {
+      recomputeDatePos();
+    }
+    window.addEventListener("scroll", onScrollOrResize, true);
+    window.addEventListener("resize", onScrollOrResize);
+    return () => {
+      window.removeEventListener("scroll", onScrollOrResize, true);
+      window.removeEventListener("resize", onScrollOrResize);
+    };
+  }, [dateOpen]);
 
   useEffect(() => {
     function onClickOutside(event: MouseEvent) {
@@ -81,7 +114,9 @@ export function SearchBar({ className = "" }: SearchBarProps) {
       if (locationRef.current && !locationRef.current.contains(target)) {
         setLocationOpen(false);
       }
-      if (dateRef.current && !dateRef.current.contains(target)) {
+      const insideDateTrigger = dateRef.current?.contains(target) ?? false;
+      const insideDatePopover = datePopoverRef.current?.contains(target) ?? false;
+      if (!insideDateTrigger && !insideDatePopover) {
         setDateOpen(false);
       }
     }
@@ -282,18 +317,63 @@ export function SearchBar({ className = "" }: SearchBarProps) {
           ) : null}
         </div>
 
-        <div className="relative z-40" ref={dateRef}>
+        <div className="relative" ref={dateRef}>
           <button
+            ref={dateButtonRef}
             type="button"
-            onClick={() => setDateOpen((prev) => !prev)}
+            onClick={toggleDateOpen}
             className="inline-flex min-h-[44px] cursor-pointer items-center gap-2 rounded-xl border border-slate-200/90 bg-white/85 px-4 text-sm font-medium text-slate-700 shadow-[0_8px_20px_rgba(15,23,42,0.06)] transition duration-200 hover:border-sky-300 hover:text-slate-900 dark:border-slate-700/90 dark:bg-slate-900/85 dark:text-slate-200 dark:shadow-[0_12px_26px_rgba(2,6,23,0.32)] dark:hover:border-sky-500 dark:hover:text-white"
             aria-label="Chọn khoảng thời gian"
           >
             <CalendarRange className="h-4 w-4" strokeWidth={1.9} />
             {formatRangeLabel(filters.timeFrom, filters.timeTo)}
           </button>
-          {dateOpen ? (
-            <div className="absolute left-0 top-[calc(100%+8px)] z-[100] w-max max-w-[calc(100vw-2rem)] rounded-2xl border border-slate-200/90 bg-white/95 p-3 shadow-[0_18px_36px_rgba(15,23,42,0.16)] backdrop-blur-md dark:border-slate-700/90 dark:bg-slate-950/95 dark:shadow-[0_24px_50px_rgba(2,6,23,0.45)]">
+        </div>
+        <button
+          type="button"
+          onClick={clearFilters}
+          className="min-h-[44px] cursor-pointer rounded-xl border border-slate-200/90 bg-white/85 px-4 text-sm font-medium text-slate-600 transition duration-200 hover:border-slate-300 hover:text-slate-800 dark:border-slate-700/90 dark:bg-slate-900/85 dark:text-slate-300 dark:hover:border-slate-600 dark:hover:text-white"
+        >
+          Xóa lọc
+        </button>
+      </div>
+      {image ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="group relative inline-flex items-center gap-2 rounded-2xl border border-slate-200/90 bg-white/85 p-1.5 pr-3 shadow-[0_8px_20px_rgba(15,23,42,0.06)] dark:border-slate-700/90 dark:bg-slate-900/85 dark:shadow-[0_12px_26px_rgba(2,6,23,0.32)]">
+            <button
+              type="button"
+              onClick={() => setImagePreviewOpen(true)}
+              title="Xem ảnh phóng to"
+              className="relative h-12 w-12 shrink-0 overflow-hidden rounded-xl border border-slate-200 bg-slate-100 dark:border-slate-700 dark:bg-slate-800"
+            >
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={image.previewUrl} alt={image.name} className="h-full w-full object-cover" />
+            </button>
+            <div className="flex min-w-0 flex-col">
+              <span className="max-w-[180px] truncate text-sm font-medium text-slate-800 dark:text-slate-100">{image.name}</span>
+              <span className="text-[11px] text-slate-500 dark:text-slate-400">{(image.size / 1024).toFixed(0)} KB</span>
+            </div>
+            <button
+              type="button"
+              onClick={handleRemoveImage}
+              title="Xóa ảnh"
+              className="ml-1 flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded-full border border-slate-200 bg-white text-slate-500 transition hover:border-red-300 hover:bg-red-50 hover:text-red-600 dark:border-slate-700 dark:bg-slate-950/60 dark:text-slate-400 dark:hover:border-red-500/60 dark:hover:bg-red-950/40 dark:hover:text-red-300"
+            >
+              <X className="h-3.5 w-3.5" strokeWidth={2.5} />
+            </button>
+          </div>
+        </div>
+      ) : null}
+      {filterError ? <p className="text-xs font-medium text-red-600 dark:text-red-400">{filterError}</p> : null}
+      {imageError ? <p className="text-xs font-medium text-red-600 dark:text-red-400">{imageError}</p> : null}
+
+      {mounted && dateOpen
+        ? createPortal(
+            <div
+              ref={datePopoverRef}
+              style={{ position: "fixed", top: datePos.top, left: datePos.left, zIndex: 9999 }}
+              className="w-max max-w-[calc(100vw-2rem)] rounded-2xl border border-slate-200/90 bg-white/95 p-3 shadow-[0_18px_36px_rgba(15,23,42,0.16)] backdrop-blur-md dark:border-slate-700/90 dark:bg-slate-950/95 dark:shadow-[0_24px_50px_rgba(2,6,23,0.45)]"
+            >
               <DayPicker
                 mode="range"
                 numberOfMonths={2}
@@ -343,46 +423,10 @@ export function SearchBar({ className = "" }: SearchBarProps) {
                   </button>
                 </div>
               </div>
-            </div>
-          ) : null}
-        </div>
-        <button
-          type="button"
-          onClick={clearFilters}
-          className="min-h-[44px] cursor-pointer rounded-xl border border-slate-200/90 bg-white/85 px-4 text-sm font-medium text-slate-600 transition duration-200 hover:border-slate-300 hover:text-slate-800 dark:border-slate-700/90 dark:bg-slate-900/85 dark:text-slate-300 dark:hover:border-slate-600 dark:hover:text-white"
-        >
-          Xóa lọc
-        </button>
-      </div>
-      {image ? (
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="group relative inline-flex items-center gap-2 rounded-2xl border border-slate-200/90 bg-white/85 p-1.5 pr-3 shadow-[0_8px_20px_rgba(15,23,42,0.06)] dark:border-slate-700/90 dark:bg-slate-900/85 dark:shadow-[0_12px_26px_rgba(2,6,23,0.32)]">
-            <button
-              type="button"
-              onClick={() => setImagePreviewOpen(true)}
-              title="Xem ảnh phóng to"
-              className="relative h-12 w-12 shrink-0 overflow-hidden rounded-xl border border-slate-200 bg-slate-100 dark:border-slate-700 dark:bg-slate-800"
-            >
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={image.previewUrl} alt={image.name} className="h-full w-full object-cover" />
-            </button>
-            <div className="flex min-w-0 flex-col">
-              <span className="max-w-[180px] truncate text-sm font-medium text-slate-800 dark:text-slate-100">{image.name}</span>
-              <span className="text-[11px] text-slate-500 dark:text-slate-400">{(image.size / 1024).toFixed(0)} KB</span>
-            </div>
-            <button
-              type="button"
-              onClick={handleRemoveImage}
-              title="Xóa ảnh"
-              className="ml-1 flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded-full border border-slate-200 bg-white text-slate-500 transition hover:border-red-300 hover:bg-red-50 hover:text-red-600 dark:border-slate-700 dark:bg-slate-950/60 dark:text-slate-400 dark:hover:border-red-500/60 dark:hover:bg-red-950/40 dark:hover:text-red-300"
-            >
-              <X className="h-3.5 w-3.5" strokeWidth={2.5} />
-            </button>
-          </div>
-        </div>
-      ) : null}
-      {filterError ? <p className="text-xs font-medium text-red-600 dark:text-red-400">{filterError}</p> : null}
-      {imageError ? <p className="text-xs font-medium text-red-600 dark:text-red-400">{imageError}</p> : null}
+            </div>,
+            document.body,
+          )
+        : null}
 
       {imagePreviewOpen && image ? (
         <div

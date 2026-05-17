@@ -37,7 +37,6 @@ export default function GuidePage() {
         <section className="rounded-2xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-950">
           <h2 className="text-base font-semibold text-slate-900 dark:text-white">Mẹo nhanh</h2>
           <ul className="mt-3 list-disc space-y-1.5 pl-5 text-sm text-slate-700 dark:text-slate-300">
-            <li>Mô tả càng cụ thể (màu áo, phụ kiện, hành vi) thì kết quả càng chính xác.</li>
             <li>Kết hợp ảnh + mô tả để tăng độ tin cậy của ranking.</li>
             <li>Có thể loại tracklet sai khỏi candidate trước khi build trace.</li>
             <li>
