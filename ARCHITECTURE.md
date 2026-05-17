@@ -145,13 +145,16 @@ Routers chính:
 - `/api/v1/history`
 - `/api/v1/trace`
 
-GPU model warmup hiện nằm ở `metadata-service`:
+GPU model warmup hiện nằm ở `metadata-service` (xem `app/services/model_warmup.py`):
 
-- RT-DETR R50: person detection;
-- DINOv2 ViT-L/14: appearance/ReID features;
-- SigLIP/SigLIP2 fallback: image-text embedding;
-- VideoMAE V2: action recognition;
-- Qwen2-VL-7B-Instruct: open-vocabulary person metadata.
+- RT-DETR R50: person detection (load fine-tuned weights từ `/workspace/models/weights/rtdetr_person` nếu có, fallback `PekingU/rtdetr_r50vd`);
+- BoT-SORT (boxmot, không ReID, GMC neutralized): multi-object tracking, mặc định `TRACER_BACKEND=botsort`. `BodyPartAdaptiveTracker` được giữ lại làm legacy/benchmark khi `TRACER_BACKEND=adaptive`;
+- PersonViT-S MSMT17 (384-dim, L2-normalized): Re-ID embedding cho fragment merge và cross-camera grouping. Đã thay thế DINOv2 ViT-L/14;
+- SigLIP 2-So400m (1152-dim, fallback SigLIP-So400m): image/text embedding cho search;
+- VideoMAE V2 (Kinetics-400 fine-tuned): action recognition;
+- Qwen2.5-VL-7B-Instruct: open-vocabulary person metadata (load từ `/workspace/models/weights/qwen2_5_vl` nếu có, override qua `QWEN25VL_MODEL_ID`).
+
+Cấm dùng trong pipeline hiện tại: YOLO (mọi phiên bản), ByteTrack, Grounding DINO.
 
 ### 3.3 query-service
 
@@ -239,9 +242,9 @@ Video source
   -> metadata-service /api/v1/video/process hoặc /api/v1/ingest/*
   -> decode/sample frames
   -> RT-DETR person detection
-  -> tracking + tracklet observations
-  -> Qwen/SigLIP/DINOv2/VideoMAE feature extraction
-  -> merge/filter tracklets
+  -> BoT-SORT tracking + tracklet observations (post-association split guard)
+  -> Qwen2.5-VL / SigLIP 2 / PersonViT / VideoMAE V2 feature extraction
+  -> loose stage-4 quality filter, fragment merge by PersonViT cosine (thr ≈ 0.80, gates 120s / 800px / 1500px)
   -> write DB:
        videos
        tracklets
@@ -385,11 +388,13 @@ Important tracklet fields:
 - `quality_score`;
 - BEV coordinates.
 
-Embedding:
+Embeddings — `tracklets_embeddings` giữ hai lane song song trên cùng row, đều L2-normalized lúc write:
 
-- table: `tracklets_embeddings`;
-- field: `siglip_embedding`;
-- dimension: 1152 when pgvector is available.
+- `siglip_embedding` (`vector(1152)` khi pgvector có sẵn) — lane semantic text↔image dùng cho search.
+- `reid_embedding` (`vector(384)`) — lane identity, PersonViT-S MSMT17, dùng cho fragment merge và cross-camera grouping.
+- `reid_model_version` — string track lại model đã sinh ra vector hiện tại, để invalidate khi swap model.
+
+Migration `infra/postgres/migrations/2026-05-17-add-reid-embedding.sql` thực hiện swap dimension 1024 → 384 và set NULL các vector DINOv2 cũ (không tương thích với PersonViT).
 
 ### Query/candidate
 
@@ -503,6 +508,7 @@ Primary public APIs:
 - `GET /api/v1/trace/status/{evidence_id}`
 - `GET /api/v1/trace/timeline/{evidence_id}`
 - `POST /api/v1/trace/candidate-tracklet/remove`
+- `POST /api/v1/finetune/run`, `GET /api/v1/finetune/scenes`, `GET /api/v1/finetune/scenes/{scene}/...` — RT-DETR fine-tune / ground-truth review endpoints
 
 ---
 

@@ -308,7 +308,7 @@ Ghi lại hành trình xây dựng sản phẩm mỗi tuần — những gì đ�
 - **Bùi Văn Đạt - 2A202600355:** update thêm data cho DB query; thêm và tối ưu trang hiển thị toàn bộ tracklet của candidate; hoàn thiện các chức năng cơ bản; sửa luồng lịch sử không lưu nhiều video; test hoàn chỉnh các luồng; fix time UTC ở bộ lọc thời gian.
 - **Cao Diệu Ly - 2A202600356:** kiểm tra DB mới và test trace; tiếp tục xây DB và sửa trace; tối ưu pipeline/query; thêm trang description; chạy full luồng trace; sửa merge tracklet bị ghép nhầm; sinh lại DB; thêm trace nhiều candidate, xóa tracklet khỏi candidate và dịch tiếng Việt; sửa full luồng detect, track, merge tracklet, similarity; fix trọng số tìm kiếm.
 - Nhóm tập trung tuần này vào việc đưa search → candidate → trace → history về trạng thái đủ ổn định để submit, ưu tiên DB đúng schema, trace chạy được, candidate hiển thị rõ và query/search có trọng số hợp lý hơn.
-- Nguồn tổng hợp chính: daily submissions trong tuần 11/05 → 16/05/2026, đối chiếu thêm với commit về DB/query, trace, history, timezone, merge tracklet và search threshold.
+
 
 ### Chi tiết daily standup
 - **11/05/2026:** Hiệp hoàn thiện DB và query; Đạt update thêm data cho DB query; Ly kiểm tra DB mới và test luồng trace.
@@ -317,6 +317,7 @@ Ghi lại hành trình xây dựng sản phẩm mỗi tuần — những gì đ�
 - **14/05/2026:** Hiệp tiếp tục hoàn thiện trace; Đạt hoàn thiện các chức năng cơ bản và sửa luồng lịch sử không lưu nhiều video; Ly sửa logic merge tracklet do bị ghép nhầm quá nhiều, sinh lại DB để test hiệu quả, thêm lựa chọn trace nhiều candidate, thêm lựa chọn xóa tracklet khỏi candidate và dịch tiếng Việt cho hiển thị.
 - **15/05/2026:** Ly sửa lại toàn bộ full luồng logic detect, track, merge tracklet và tính similarity, sau đó sinh lại DB; Hiệp hoàn chỉnh luồng để submit; Đạt test hoàn chỉnh các luồng.
 - **16/05/2026:** Hiệp hoàn thiện DB cuối; Ly sửa logic query và fix trọng số tìm kiếm; Đạt fix time UTC ở bộ lọc time.
+- **17/05/2026:** Ly chuyển tracker sang BoT-SORT, cập nhật fragment merge với PersonViT, giảm quyết merge sai, sửa nhầm frame trong tracklet, cập nhật luồng tìm bằng ảnh và tinh chỉnh hệ số ranking; Hiệp chuẩn bị slide thuyết trình, quay video demo sản phẩm và sửa luồng history bypass; Đạt hoàn thiện bộ docs nộp bài (README, evaluation, docs), fix bug port khi chạy compose và cập nhật favicon/icon UI.
 
 ### Khó nhất tuần này
 - Search và trace phụ thuộc nhiều lớp: ranking, threshold, timezone, candidate merge, evidence render và history; sửa một lớp có thể làm lệch lớp khác.

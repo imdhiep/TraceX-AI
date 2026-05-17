@@ -92,7 +92,7 @@ services:
 
   # ──────────────────────────────────────────────────────────────────────────
   # metadata-service — port 8002 (LightningAI cloudspace exposes 8002)
-  # GPU models: Grounding DINO 1.6 + EVA-02 ViT-L/14 + SigLIP 2 + VideoMAE V2
+  # GPU models: RT-DETR R50 + BoT-SORT (boxmot) + PersonViT-S MSMT17 + SigLIP 2 + VideoMAE V2 + Qwen2.5-VL-7B-Instruct
   # ──────────────────────────────────────────────────────────────────────────
   metadata-service:
     build:

@@ -1,6 +1,6 @@
 # TraceX-AI
 
-> Hệ thống tìm kiếm và truy vết người trong mạng lưới camera bằng mô tả tự nhiên, dữ liệu tracklet, AI embedding và luồng xác nhận của người vận hành.
+> Hệ thống tìm kiếm và truy vết đối tượng trong mạng lưới camera bằng mô tả tự nhiên và hình ảnh đầu vào có hỗ trợ phản hồi từ người dùng.
 
 TraceX-AI hiện được tổ chức theo hướng **frontend tách riêng khỏi backend GPU**:
 
@@ -95,17 +95,18 @@ TraceX-AI hiện được tổ chức theo hướng **frontend tách riêng kh�
 │                                                                  │
 │  metadata-service GPU models:                                    │
 │  ├── RT-DETR R50           ← person detection                    │
-│  ├── DINOv2 ViT-L/14       ← appearance / ReID features          │
-│  ├── SigLIP / SigLIP2      ← image-text embedding                │
+│  ├── BoT-SORT (boxmot)     ← multi-object tracking, no-ReID      │
+│  ├── PersonViT-S MSMT17    ← Re-ID embedding (384-dim)           │
+│  ├── SigLIP 2-So400m       ← image-text embedding (1152-dim)     │
 │  ├── VideoMAE V2           ← action recognition                  │
-│  └── Qwen2-VL-7B           ← open-vocabulary metadata            │
+│  └── Qwen2.5-VL-7B-Instruct← open-vocabulary metadata            │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
 Public frontend calls should point to:
 
 ```text
-https://8002-<LIGHTNINGAI-WORKSPACE>.cloudspaces.litng.ai/api/v1
+https://8002-<LIGHTNINGAI-WORK@SPACE>.cloudspaces.litng.ai/api/v1
 ```
 
 Frontend `next.config.js` rewrites browser calls through `/api-gw` when `NEXT_PUBLIC_API_BASE_URL` is an external LightningAI URL. Search vẫn đi qua cùng cổng này; `query-service` tự chia 3 mode nội bộ: `text_only`, `image_only`, `image_text`.
@@ -202,7 +203,14 @@ TraceX-AI/
 | Public API | FastAPI metadata-service |
 | Search | FastAPI query-service, SigLIP, SeamlessM4T |
 | Trace | FastAPI trace-service, ffmpeg/evidence rendering |
-| AI video processing | PyTorch, Transformers, RT-DETR, DINOv2, SigLIP, VideoMAE, Qwen2-VL |
+| AI - Person detection | RT-DETR R50 (PyTorch, Transformers) |
+| AI - Multi-object tracking | BoT-SORT (boxmot, no-ReID, GMC neutralized) |
+| AI - Re-ID embedding | PersonViT-S MSMT17 (384-dim, L2-normalized) — dùng để merge tracklet & cross-camera grouping |
+| AI - Image/Text embedding (search) | SigLIP 2-So400m (1152-dim), fallback SigLIP-So400m — dùng cho text/image search |
+| AI - Action recognition | VideoMAE V2 (Kinetics-400 fine-tuned) |
+| AI - Open-vocab metadata/caption | Qwen2.5-VL-7B-Instruct |
+| AI - Translation (VI ↔ EN) | SeamlessM4T v2 large (trong query-service) |
+| AI runtime | PyTorch, Transformers, CUDA (A100 80GB) |
 | Database | PostgreSQL 16, SQLAlchemy 2, pgvector |
 | Deploy | Docker Compose, Coolify VPS, LightningAI |
 | Storage | `/workspace/storage`, optional Google Drive OAuth |
@@ -217,17 +225,20 @@ TraceX-AI/
 
 | Model | Vai trò |
 | ----- | ------- |
-| RT-DETR R50 | Person detection |
-| DINOv2 ViT-L/14 | Appearance embedding / ReID features |
-| SigLIP / SigLIP2 fallback | Image/text embedding cho search |
-| VideoMAE V2 | Action recognition theo tracklet |
-| Qwen2-VL-7B-Instruct | Open-vocabulary appearance metadata/caption |
+| RT-DETR R50 | Person detection (fine-tune optional tại `/workspace/models/weights/rtdetr_person`) |
+| BoT-SORT (boxmot, no-ReID, GMC neutralized) | Multi-object tracking nội-camera (`TRACER_BACKEND=botsort`, mặc định) |
+| PersonViT-S MSMT17 (384-dim) | Re-ID embedding cho fragment merge và cross-camera grouping |
+| SigLIP 2-So400m (1152-dim), fallback SigLIP-So400m | Image/text embedding cho search |
+| VideoMAE V2 (Kinetics-400 fine-tuned) | Action recognition theo tracklet |
+| Qwen2.5-VL-7B-Instruct | Open-vocabulary appearance metadata/caption |
+
+> Re-ID lane đã chuyển từ DINOv2 ViT-L (1024-dim) sang PersonViT-S MSMT17 (384-dim) trong migration `2026-05-17-add-reid-embedding.sql`. Vector DINOv2 cũ được set NULL khi đổi chiều — chúng không tương thích với PersonViT và phải re-embed lại. Tracker mặc định là BoT-SORT; `BodyPartAdaptiveTracker` chỉ còn dùng cho benchmark khi đặt `TRACER_BACKEND=adaptive`.
 
 Output được lưu thành:
 
 - `videos`: metadata video, camera, thời điểm ghi hình, đường dẫn storage.
 - `tracklets`: người được detect/tracking trong video.
-- `tracklets_embeddings`: SigLIP embedding 1152-dim, dùng cho text/image search.
+- `tracklets_embeddings`: hai lane song song trên cùng một row — `siglip_embedding` (1152-dim) cho text/image search và `reid_embedding` (384-dim, PersonViT-S, kèm `reid_model_version`) cho fragment merge/cross-camera grouping. Cả hai đều L2-normalized lúc write.
 - `tracklets_actions`: action classification.
 - `tracklet_observations`: bbox theo frame/timestamp để xem chi tiết tracklet.
 
@@ -279,7 +290,8 @@ Migrations hiện có:
 infra/postgres/migrations/
 ├── 2026-05-12-add-tracklet-observations.sql
 ├── 2026-05-12-refactor-tracklets-schema.sql
-└── 2026-05-13-add-video-drive-file-id.sql
+├── 2026-05-13-add-video-drive-file-id.sql
+└── 2026-05-17-add-reid-embedding.sql   # PersonViT 384-dim Re-ID lane + reid_model_version
 ```
 
 ---
@@ -311,6 +323,8 @@ Frontend gọi qua metadata-service public prefix `/api/v1`.
 | `GET /api/v1/trace/status/{evidence_id}` | Trạng thái evidence |
 | `GET /api/v1/trace/timeline/{evidence_id}` | Timeline evidence |
 | `POST /api/v1/trace/candidate-tracklet/remove` | Xóa tracklet khỏi candidate |
+| `POST /api/v1/finetune/run` | Trigger fine-tune RT-DETR từ ground-truth scenes |
+| `GET /api/v1/finetune/scenes` | Liệt kê scenes ground-truth phục vụ fine-tune/evaluation |
 
 Health checks:
 
@@ -447,7 +461,10 @@ Khi LightningAI URL đổi, phải cập nhật `NEXT_PUBLIC_API_BASE_URL` và r
 | `MAX_CANDIDATES` | Số candidate tối đa |
 | `QUERY_MERGE_THRESHOLD` | Ngưỡng merge candidate/identity ở query-service |
 | `PIPELINE_SAMPLE_FPS` | FPS sampling khi xử lý video |
-| `QWEN2VL_MODEL_ID` | Override path/model Qwen2-VL |
+| `QWEN25VL_MODEL_ID` | Override path/model Qwen2.5-VL (mặc định `Qwen/Qwen2.5-VL-7B-Instruct`, fallback về `/workspace/models/weights/qwen2_5_vl` nếu có) |
+| `TRACER_BACKEND` | `botsort` (mặc định, prod) hoặc `adaptive` (BodyPartAdaptiveTracker, chỉ dùng để benchmark) |
+| `SEAMLESS_MODEL` | Model dịch tiếng Việt ↔ tiếng Anh trong query-service (mặc định `facebook/seamless-m4t-v2-large`) |
+| `TRANSFORMERS_OFFLINE` | `1` để chạy hoàn toàn từ cache `/workspace/models/huggingface`, `0` để cho phép tải khi thiếu |
 
 ### Frontend
 
@@ -542,4 +559,4 @@ bash scripts/setup_hooks.sh
 | --- | --- | --- |
 | Dương Văn Hiệp | 2A202600052 | AI Engineer, Backend, Data Pipeline |
 | Bùi Văn Đạt | 2A202600355 | Backend, Frontend |
-| Cao Diệu Ly | 2A202600356 | Leader, PM, AI Research |
+| Cao Diệu Ly | 2A202600356 | Leader, PM, AI Engineer, Solution Architect|

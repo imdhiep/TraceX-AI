@@ -149,6 +149,14 @@ Ghi lại các quyết định kỹ thuật, phân công, và brainstorming củ
 | Hoàn thiện DB cuối cho bản submit | Dương Văn Hiệp | 16/05 | ✅ Xong |
 | Fix time UTC ở bộ lọc thời gian | Bùi Văn Đạt | 16/05 | ✅ Xong |
 | Sửa logic query và fix trọng số tìm kiếm | Cao Diệu Ly | 16/05 | ✅ Xong |
+| Đổi tracker mặc định sang BoT-SORT (boxmot, no-ReID) và cập nhật fragment merge với PersonViT-S MSMT17 | Cao Diệu Ly | 17/05 | ✅ Xong |
+| Giảm tỉ lệ merge tracklet nhầm, sửa lỗi nhầm frame trong tracklet observations | Cao Diệu Ly | 17/05 | ✅ Xong |
+| Cập nhật luồng tìm kiếm bằng ảnh và tinh chỉnh hệ số ranking cho search | Cao Diệu Ly | 17/05 | ✅ Xong |
+| Chuẩn bị slide thuyết trình và video demo sản phẩm cho bản nộp | Dương Văn Hiệp | 17/05 | ✅ Xong |
+| Sửa luồng history bypass để lịch sử query hiển thị đúng | Dương Văn Hiệp | 17/05 | ✅ Xong |
+| Hoàn thiện bộ docs nộp bài (README, evaluation, docs nội bộ) | Bùi Văn Đạt | 17/05 | ✅ Xong |
+| Fix bug port khi chạy docker compose, đồng bộ port giữa frontend và metadata-service | Bùi Văn Đạt | 17/05 | ✅ Xong |
+| Cập nhật favicon, icon UI và dọn icon rác | Bùi Văn Đạt | 17/05 | ✅ Xong |
 
 ---
 
